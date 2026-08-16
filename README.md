@@ -17,7 +17,8 @@ provisionan desde Cloudflare R2 y las imágenes se suben ahí mismo.
 | `wf.json` | Workflow en formato **API** de ComfyUI. Es lo que se envía en cada request. |
 | `serverless_provision.sh` | Provisioning del worker. Copia de la que corre en R2 (`comfy-stack/scripts/serverless_provision.sh`). |
 | `renew_provisioning.py` | Sube el provisioning a R2, regenera la URL presignada y actualiza template + workergroup. |
-| `reproducir-resultados-desde-cero.md` | Receta de parámetros y prompts que dan buenos resultados. |
+| `reproducir-resultados-desde-cero.md` | Receta de parámetros y hallazgos de prompt. |
+| `loras.md` | LoRAs de personaje: candidatas, cómo añadirlas y cómo probarlas. |
 | `.env` | Configuración y credenciales. **No se versiona, no compartir.** |
 | `last_response.json` | Respuesta completa del último request (lo escribe el cliente). |
 
@@ -389,7 +390,8 @@ Dos parámetros importantes de la máscara:
 A denoise alto el modelo reinterpreta la pose dentro de la máscara, así que el
 collage funciona como boceto y no hace falta colocar el recorte al píxel. El
 precio es que la ropa y la cara derivan. **La LoRA del personaje es lo único que
-tapa ese hueco.**
+tapa ese hueco** — ver [`loras.md`](loras.md), aunque antes conviene probar a
+reforzar los tags de atuendo con pesos, que es gratis.
 
 ### Detalle: el doble inpaint
 
