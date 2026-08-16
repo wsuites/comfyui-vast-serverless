@@ -30,3 +30,10 @@ __pycache__/
 
 # volcado de esquemas del worker (3 MB, se regenera con sondear_nodos.py)
 nodos.json
+
+# logs y sondas temporales del A/B
+*.log
+res_*.json
+probe_*.py
+ab_res*/
+ab_vb/
