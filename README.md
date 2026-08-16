@@ -673,7 +673,7 @@ Dos partidas independientes:
 Medido en el worker real (2026-08-16): con `VAST_DISK_SPACE=16` la imagen + venv
 + los modelos ocupaban **14 GB de 16**, o sea 2,9 GB libres, y tras bajar los
 pesos de MeshGraphormer quedaban **1,6 GB (91% usado)**. Demasiado justo, así que
-`VAST_DISK_SPACE` está ahora en **24**.
+`VAST_DISK_SPACE` está ahora en **18**, donde el worker se queda sobre el 78%.
 
 **Cuánto disco pedir no afecta a la disponibilidad.** Las máquinas del pool
 ofrecen entre 288 y 1.352 GB, así que `disk_space>=16`, `>=24` o `>=60` devuelven
@@ -683,12 +683,13 @@ factura, que es `storage_cost × GB`:
 | `VAST_DISK_SPACE` | Coste al precio actual ($0,0267/GB/mes) | Tope con `storage_cost<=0.11` |
 |---|---|---|
 | 16 GB | $0,43/mes | $1,76/mes |
-| 18 GB | $0,48/mes | $1,98/mes |
-| **24 GB** | **$0,64/mes** | **$2,64/mes** |
+| **18 GB** | **$0,48/mes** | **$1,98/mes** |
+| 24 GB | $0,64/mes | $2,64/mes |
 | 32 GB | $0,85/mes | $3,52/mes |
 
-Se descartó 18 GB: solo da 2 GB extra y MeshGraphormer se come 1,37 GB. Por 16
-céntimos más al mes, 24 GB deja 8 GB de holgura real.
+18 GB deja el tope de disco en **$1,98/mes** sin perder ninguna oferta, y con
+los 14 GB que ocupa el stack completo (MeshGraphormer incluido) quedan ~4 GB
+libres. Si se añaden más modelos, subir a 24 cuesta 16 céntimos más al mes.
 
 > No hay escalón de **VRAM** entre 16 y 24 GB: el mercado salta de una a otra sin
 > nada en medio, así que pedir `gpu_ram>=18` es pedir `>=24`. Y ahí sí duele:
@@ -701,20 +702,20 @@ céntimos más al mes, 24 GB deja 8 GB de holgura real.
 
 #### El techo de `storage_cost`
 
-Está en **`0.11`**, que a 24 GB topa la factura de disco en $2,64/mes. No se baja
+Está en **`0.11`**, que a 18 GB topa la factura de disco en $1,98/mes. No se baja
 más a propósito:
 
 | `storage_cost<=` | Ofertas | Tope a 24 GB |
 |---|---|---|
-| 0.0625 | **1** ⚠️ | $1,50/mes |
-| 0.0834 | 2 | $2,00/mes |
-| **0.11** | **7** | **$2,64/mes** |
-| 0.125 (el anterior) | 7 | $3,00/mes |
+| 0.0625 | **1** ⚠️ | $1,13/mes |
+| 0.0834 | 2 | $1,50/mes |
+| **0.11** | **7** | **$1,98/mes** |
+| 0.125 (el anterior) | 7 | $2,25/mes |
 
 Con **una sola oferta viable el autoscaler relaja el tope de precio y alquila por
 encima de `dph_total`** (ver [El `verified=true` fantasma](#el-verifiedtrue-fantasma)),
 que es justo la sorpresa que se quiere evitar. `0.11` mantiene las mismas 7
-ofertas que el `0.125` anterior y baja el techo 36 céntimos: no cuesta nada.
+ofertas que el `0.125` anterior y baja el techo 27 céntimos: no cuesta nada.
 
 `storage_cost` va en **$/GB/mes** y la mediana del mercado es **0.20**, o sea
 $3.20/mes a 16 GB (y $12/mes a los 60 GB de antes). El filtro
@@ -736,8 +737,8 @@ barato hay H100 a $4.26/h, y sin techo el autoscaler puede cogerlas.
 
 | | Antes | Ahora |
 |---|---|---|
-| Disco asignado | 60 GB | 24 GB |
-| Coste de disco | $12.00/mes | ~$0.64/mes |
+| Disco asignado | 60 GB | 18 GB |
+| Coste de disco | $12.00/mes | ~$0.48/mes |
 | GPU | $0.190/h | $0.136–0.201/h |
 | Total a 60 h/mes | $23.40 | ~$12.90 |
 
@@ -747,27 +748,61 @@ barato hay H100 a $4.26/h, y sin techo el autoscaler puede cogerlas.
 > parado la mayor parte del tiempo, prioriza el disco. Si le vas a meter muchas
 > horas, baja `dph_total` y acepta pagar más de disco.
 
-### El `verified=true` fantasma
+### `verified=true`: quitarlo salía carísimo
 
-`--no-default` en el **template** no basta: al actualizar el workergroup, Vast
-vuelve a inyectar `verified=true` en su `search_query`. Y ese filtro es
-demoledor con presupuestos ajustados:
+Durante un tiempo este repo **quitaba** `verified=true` del filtro, porque con el
+presupuesto de entonces dejaba una sola oferta:
 
 | | Ofertas ≤$0.15/h |
 |---|---|
-| con `verified=true` | **1** |
-| sin él | **7** (mejor a $0.109/h) |
+| con `verified=true` y `storage_cost<=0.11` | **1** ⚠️ |
+| sin `verified=true` | 7 (mejor a $0.109/h) |
 
-Con una sola oferta viable el autoscaler **relaja el tope de precio** y alquila
-máquinas por encima de `dph_total`. Así entró un worker a $0.201/h teniendo el
-tope en $0.15.
+El razonamiento era correcto en su mecanismo — **con una sola oferta viable el
+autoscaler relaja el tope de precio** y alquila por encima de `dph_total`; así
+entró un worker a $0.201/h teniendo el tope en $0.15 — pero la conclusión
+trataba el síntoma. El daño lo hacía **quedarse sin abanico de ofertas**, no la
+verificación.
 
-Por eso `renew_provisioning.py` pasa `--search_params ... -n` **también** al
-workergroup, no solo al template. Para comprobar que la query quedó limpia:
+**Y quitar `verified` tenía un coste oculto mucho peor: workers inservibles.**
+Medido el 2026-08-16 con dos máquinas no verificadas seguidas (139268 y 147722):
+ambas anunciaban puertos directos (`direct_port_count` 100 y 200) que en
+realidad estaban **filtrados**. El worker provisiona bien, el pyworker arranca,
+el autoscaler lo marca `idle` y enruta a `https://<ip>:<puerto>`… pero ese
+puerto da *timeout* desde cualquier red externa, así que **el pyworker recibe
+cero requests** (`num_requests_recieved: 0`) y cada llamada muere por timeout.
+
+La palanca buena es `storage_cost`, que cuesta céntimos:
+
+| Configuración | Ofertas | GPU más barata | Tope disco a 18 GB |
+|---|---|---|---|
+| sin `verified`, `storage<=0.11` | 7 | $0.107/h | $1.98/mes |
+| **`verified`, `storage<=0.20`** ← actual | **11** | **$0.108/h** | $3.60/mes |
+| `verified`, `storage<=0.11` | **1** ⚠️ | $0.134/h | $1.98/mes |
+
+Aflojando el disco se recupera el abanico **y** el precio de GPU queda igual
+($0.108 vs $0.107). Se paga como mucho $1.62/mes más de disco a cambio de que
+las máquinas funcionen.
+
+#### Cómo se diagnostica esto rápido
+
+El síntoma es un request que se cuelga y muere con
+`TimeoutError: Timed out after 61.4s waiting for worker`, con el worker en
+`idle`. Comprobaciones, en orden:
 
 ```powershell
-vastai show workergroups --raw    # 'verified' no debe aparecer en search_query
+# 1. que URL entrega el autoscaler, y esta abierto ese puerto?
+python -c "import socket;socket.create_connection(('<ip>',<puerto>),10)"
+
+# 2. desde fuera de tu red, por si el bloqueo es tuyo
+curl -s "https://check-host.net/check-tcp?host=<ip>:<puerto>&max_nodes=3"
 ```
+
+Dentro del worker, el pyworker habla **HTTPS**, no HTTP: `curl -k
+https://127.0.0.1:3000/health` devuelve **404** cuando está sano (esa ruta no
+existe, pero responder ya prueba que vive). Con `http://` da *Empty reply from
+server* y parece caído sin estarlo. Y `/workspace/pyworker.log` trae un
+`num_requests_recieved` que dice si le llega algo.
 
 ### Interruptible: no está soportado
 
