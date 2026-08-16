@@ -17,6 +17,7 @@ provisionan desde Cloudflare R2 y las imágenes se suben ahí mismo.
 | `wf.json` | Workflow en formato **API** de ComfyUI. Es lo que se envía en cada request. |
 | `serverless_provision.sh` | Provisioning del worker. Copia de la que corre en R2 (`comfy-stack/scripts/serverless_provision.sh`). |
 | `renew_provisioning.py` | Sube el provisioning a R2, regenera la URL presignada y actualiza template + workergroup. |
+| `sondear_nodos.py` | Vuelca el esquema real de nodos del worker vivo (`object_info` por SSH). Para cablear un nodo nuevo sin adivinar. |
 | `reproducir-resultados-desde-cero.md` | Receta de parámetros y hallazgos de prompt. |
 | `loras.md` | LoRAs de personaje: candidatas, cómo añadirlas y cómo probarlas. |
 | `.env` | Configuración y credenciales. **No se versiona, no compartir.** |
@@ -438,6 +439,7 @@ PERSONAJE ──► KSampler ──► BiRefNet ──► escalar ────�
 | `construir_wf.py` | **Arma el workflow** encendiendo/apagando cada parte |
 | `escena.py` | Runner con `--sweep` de denoise |
 | `ab_detalle.py` | A/B de la segunda pasada, con tiempos |
+| `ab_resolucion.py` | A/B de las palancas de resolución (`--vertical`, `--lienzo`, `--upscale`), con hojas de comparación |
 | `frames.py` | Secuencia de poses en un set fijo |
 | `correr.py` | Secuencia de movimiento (personaje cruzando la escena) |
 | `wf_v_<pose>_<variante>.json` | La matriz pregenerada, para el A/B y para inspeccionar a mano |
@@ -456,6 +458,16 @@ mismo en `construir_wf.py`, `escena.py` y `correr.py`:
 | `--sin-mascara` | flag | off | Quita `SetLatentNoiseMask` (deforma el escenario) |
 | `--variante` | ver abajo | — | Atajo con nombre |
 | `--workflow` | ruta | — | Usa un `.json` ya hecho e ignora todo lo anterior |
+
+Y las palancas de **resolución del personaje**, que son ortogonales a las de
+arriba (se aplican también cuando usas `--variante`):
+
+| Flag | Default | Qué hace |
+|---|---|---|
+| `--vertical` | off | Genera el personaje en `832x1216` (ratio nativo SDXL) en vez de `1024x1024` |
+| `--lienzo N` | `1024` | Lado del escenario/composición. `1536` duplica los elementos del grafo |
+| `--upscale` | off | `UltimateSDUpscale` 2x sobre el compuesto final |
+| `--bbox` | off | **No implementado**, ver abajo |
 
 El **escenario → personaje → collage** es la base del pipeline y no se apaga:
 es lo que hace el propio grafo. Lo que sí se apaga es la máscara que protege el
@@ -623,6 +635,61 @@ mismo detector encuentra 2 manos a 0.6.
 **Recomendación: `hd3y`.** Detecta en los dos escenarios, cuesta 7 s y no tiene
 el modo de fallo mudo. Reserva `hd3m`/`hd3ym` para cuando veas manos rotas *y*
 bien visibles.
+
+### Resolución del personaje: dónde se pierde y qué la recupera
+
+El personaje se genera en su propio lienzo, se recorta con BiRefNet y se escala a
+una caja dentro del escenario. Se pierde resolución en **dos sitios distintos**, y
+cada palanca ataca uno:
+
+| Dónde | Qué pasa | Palanca |
+|---|---|---|
+| En la generación | Un cuerpo entero en `1024x1024` cuadrado solo ocupa una franja vertical; el resto son píxeles de fondo que BiRefNet tira después | `--vertical` (`832x1216`, ratio nativo SDXL) |
+| Al pegarlo | La caja de destino mide `640` sobre un lienzo de `1024` | `--lienzo 1536` |
+| Al final | — | `--upscale` (UltimateSDUpscale 2x sobre el compuesto) |
+
+Toda la geometría vive en **una sola función**, `aplicar_caja()` de
+`construir_wf.py`: coloca la caja del personaje sobre el escenario y devuelve la
+geometría resultante, para que quien tenga que recortar después (la 2ª pasada) no
+la recalcule por su cuenta y se desincronice. Antes esto estaba escrito en dos
+sitios —`escena.py` pisaba lo que hacía `construir_wf.py`— y la última escritura
+borraba a la anterior.
+
+Las 8 combinaciones, verificadas sobre el grafo (`python ab_resolucion.py`):
+
+| combo | generación | caja | lienzo | nodos | px de caja |
+|---|---|---|---|---|---|
+| base | 1024x1024 | 640x640 | 1024 | 59 | 409 600 |
+| `v` | 832x1216 | 440x640 | 1024 | 59 | 281 600 |
+| `l` | 1024x1024 | 960x960 | 1536 | 59 | 921 600 |
+| `vl` | 832x1216 | 656x960 | 1536 | 59 | 629 760 |
+| `u` | 1024x1024 | 640x640 | 1024 | 62 | 409 600 |
+| `vu` | 832x1216 | 440x640 | 1024 | 62 | 281 600 |
+| `lu` | 1024x1024 | 960x960 | 1536 | 62 | 921 600 |
+| `vlu` | 832x1216 | 656x960 | 1536 | 62 | 629 760 |
+
+**Cuidado al leer la columna de px:** en vertical la caja tiene *menos* píxeles
+(281k vs 409k) y aun así es la mejora. Lo que importa no son los píxeles de la
+caja sino los que caen **sobre la figura**: antes la silueta ocupaba una franja de
+un cuadrado, ahora llena la caja. No juzgues los combos por el tamaño de la caja.
+
+**`--bbox` no está implementado**, y el builder lanza `SystemExit` a propósito en
+vez de generar un grafo mudo. La idea: BiRefNet devuelve el recorte sobre el
+lienzo entero con alfa transparente, así que ese padding viaja hasta la caja de
+destino y se lleva buena parte de los píxeles útiles. Recortando a la silueta, la
+figura aprovecha la caja completa.
+
+Sondeado el worker vivo (`python sondear_nodos.py`), el nodo que lo hace es
+**`AILab_CropObject`** (de `ComfyUI-RMBG`, que ya instalamos con `FEAT_RMBG`):
+
+```
+AILab_CropObject   in: image:IMAGE, mask:MASK, padding:INT   out: IMAGE, MASK
+```
+
+Es el único candidato cableable tal cual. Los demás (`CropByBBoxes`,
+`ImageCropV2`) exigen un tipo `BOUNDING_BOX` que solo produce un detector
+(`rtdetr`/`sdpose`) o el editor manual del canvas, y `AILab_ImageCrop` recorta a
+coordenadas fijas, no al objeto.
 
 ### Coste de cada variante
 
@@ -838,6 +905,51 @@ Y desde fuera: `image_runtype` en `vastai show instances --raw` dice
 Arreglo: que el `onstart` del template llame a `entrypoint.sh &` y luego a
 `start_server.sh`, como arriba.
 
+**La otra causa, y la que de verdad muerde: el host tiene la red mala.** Mismo
+script, mismo template, misma imagen — y sale bucle infinito o ciclo limpio según
+la máquina que te toque. Medido el 2026-08-16 con dos instancias seguidas:
+
+| | host malo (`47857982`) | host bueno (`47861232`) |
+|---|---|---|
+| Velocidad real | ~350 KB/s | ~45 MB/s |
+| `pip install` del Impact-Pack | ~15 min | segundos |
+| Modelos de R2 (10 GB) | nunca llegó | 3,7 min |
+| Resultado | 3 timeouts → `destroying` | `PROVISIONING_OK` en 14 min |
+
+El autoscaler tiene un **timeout de carga fijo de 791 s** (~13,2 min) que no
+aparece en la config del endpoint y no es configurable desde ahí. Al agotarse hace
+`restart_instance` (no `destroy`), así que el contenedor se reinicia y el
+provisioning **vuelve a empezar desde cero**. Tres fallos seguidos y sí destruye la
+máquina. Con 350 KB/s el pip solo ya come 15 min: bucle infinito garantizado.
+
+Cómo distinguir "colgado" de "lento", desde el worker:
+
+```bash
+ps -eo pid,ppid,etime,stat,args --forest       # ¿hay un hijo de pip vivo?
+ls -l /proc/<pid>/fd                           # ¿qué .whl está bajando?
+stat -c %s <whl>; sleep 20; stat -c %s <whl>   # velocidad real
+cat /proc/net/dev                              # bytes totales de la instancia
+```
+
+El log parece congelado porque `PIP_ARGS` llevaba `-q`: en modo silencioso pip no
+escribe nada durante minutos aunque esté progresando. Ahora usa `--progress-bar off`
+y el `watch_progress` reporta cada 2 min al canal de Discord.
+
+**Lo que sí ayuda** (aplicado): caché de pip persistente en
+`$WORKSPACE_DIR/.cache/pip` vía `PIP_CACHE_DIR`, en vez de `--no-cache-dir`. Como
+`restart_instance` conserva `/workspace`, el 2º intento reaprovecha los wheels ya
+bajados y entra de sobra en el timeout. Da tres oportunidades (~45 min) para
+converger antes de que el autoscaler destruya la máquina.
+
+**Lo que NO ayuda, comprobado:** mover los wheels a R2. R2 va a 361 KB/s desde el
+worker malo — *exactamente igual de lento que PyPI* (320 KB/s), y con 4 conexiones
+en paralelo suma ~730 KB/s (~2x, no 4x). El cuello es el ancho de banda de la
+instancia, no el origen. Tampoco lo arregla el filtro del workergroup:
+`search_query` filtra por `inet_down_cost<=0.005` (precio de la red, no velocidad)
+y las 10 ofertas del pool ya anuncian `inet_down` entre 190 y 1368 Mbit/s. El host
+malo anunciaba **1376 Mbit/s** y entregaba 3. El dato es autodeclarado y no hay
+filtro que te salve.
+
 ### `HF_TOKEN must be set when BACKEND is set!`
 
 Validación de `start_server.sh` del pyworker. Exige que exista `HF_TOKEN` si
@@ -848,6 +960,47 @@ env del template.
 
 Normal, no es un fallo. Con `min_load=0` el autoscaler apaga los workers cuando
 no hay carga y los deja en frío. El siguiente request lo despierta.
+
+**Y sale muy barato dejarlo así.** Una instancia parada solo paga el disco:
+
+| Estado | Coste | Al mes |
+|---|---|---|
+| Encendida | `dph_total` 0,125 $/h | ~90 $ |
+| Parada (solo disco) | `storage_total_cost` 0,005 $/h | ~3,60 $ |
+
+25 veces más barato, y conserva `/workspace` entero: los modelos en
+`/workspace/ComfyUI/models` y la caché de pip. Un arranque desde parada se salta
+los ~22 GB de descarga y los minutos de pip. Eso es exactamente lo que hace el
+autoscaler con `cold_workers=1`; el problema es que para conservar una máquina
+parada primero tiene que haberla dado por buena una vez — es la recompensa de que
+el provisioning termine bien, no una alternativa a arreglarlo.
+
+Avisos: una instancia parada **no reserva la GPU**. El host puede alquilar ese
+hardware a otro y entonces no arranca cuando la quieras encender. Es barato
+precisamente porque no garantiza nada.
+
+### Avisos de Discord
+
+El provisioning reporta al canal por webhook: arranque, cada hito de las 5 fases,
+progreso cada 2 min (tamaño de la caché de pip, de los modelos, disco libre y la
+última línea viva del log), `PROVISIONING_OK`, fallo con el bloque de log, y un
+centinela que sigue vivo después para avisar de encendido, caída y apagado.
+
+Se configura con `DISCORD_WEBHOOK` en el `.env`. **Viaja por el env del template**,
+no dentro del `.sh`: ese fichero se sirve desde una URL pública de R2 y cualquiera
+podría leerlo. `renew_provisioning.py` lo mete en el `template_env` al publicar; si
+no está definido, el provisioning no notifica y funciona igual (todo el bloque es
+un no-op).
+
+Dos detalles que costaron sangre:
+
+- **Discord devuelve `403 Forbidden` al `User-Agent` por defecto de urllib**
+  (`Python-urllib/3.x`). Hay que mandar cabecera propia:
+  `headers={"User-Agent": "mizuki-provision/1.0"}` → `204`. Mismo patrón que
+  Cloudflare/R2, donde se usa `curl/8.0`.
+- **El webhook nunca puede tumbar el provisioning.** El script corre con
+  `set -euo pipefail`; todos los emisores acaban en `|| true` y con timeout corto,
+  probado con webhook roto y con webhook vacío (`exit 0` en ambos casos).
 
 ### `invalid template hash or id`
 
@@ -874,14 +1027,24 @@ súbelo a R2 y lanza `vastai update workers $VAST_WORKERGROUP_ID`.
 
 ## Mantenimiento pendiente
 
-- [ ] **`PROVISIONING_SCRIPT` es una presigned que caduca a los 7 días** (máximo
-      que permite SigV4). Mitigado: `python renew_provisioning.py` renueva el
-      ciclo entero en un comando, pero hay que acordarse cada semana.
-      Para quitarse el problema del todo: dashboard de Cloudflare → R2 → bucket
-      `mizuki` → Settings → *Public Development URL* → Enable, y cambiar
-      `PROVISIONING_SCRIPT` por
-      `https://pub-XXXX.r2.dev/comfy-stack/scripts/serverless_provision.sh`
-      (permanente y sin query string).
+- [x] ~~`PROVISIONING_SCRIPT` es una presigned que caduca a los 7 días.~~
+      Resuelto: el bucket sirve por *Public Development URL* y la URL es
+      permanente. `renew_provisioning.py` sigue siendo el comando para publicar
+      (sube a R2, verifica el contenido y re-apunta template + workergroup), pero
+      ya no hay nada que renovar por calendario.
+- [ ] **Paralelizar el provisioning.** Hoy las 5 fases van en serie. La fase 3
+      (custom nodes: PyPI + GitHub) y la fase 4 (modelos de R2) no dependen una de
+      otra y usan recursos distintos; solaparlas quita del camino crítico la más
+      corta. El bucle de `URL_FILES` (pesos sueltos de HuggingFace) son `curl` uno
+      detrás de otro y se paraleliza en cuatro líneas. Techo real medido: **~2x**,
+      no 4x — el cuello es el ancho de banda de la instancia, no el número de
+      flujos. **No paralelizar dos `pip install` sobre el mismo venv**: se pisan en
+      `site-packages` y dan entornos corruptos de forma intermitente. Y el
+      `trap on_err` con procesos en segundo plano necesita `wait` explícito, o los
+      fallos dejan de avisar.
+- [ ] **`--bbox` sin implementar.** Ya está identificado el nodo
+      (`AILab_CropObject`, ver *Resolución del personaje*); falta cablearlo entre
+      BiRefNet y el escalado a la caja.
 - [ ] **`HF_TOKEN=hf_placeholder_not_used`** en el template. Sustituir por uno
       real si algún día se añaden descargas desde HuggingFace.
 - [ ] Las URLs de las imágenes generadas caducan a los 7 días. Si hay que

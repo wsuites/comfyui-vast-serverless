@@ -23,7 +23,7 @@ from vastai import Serverless
 
 HERE = Path(__file__).parent
 from config import ENDPOINT_NAME as ENDPOINT
-from construir_wf import (escalado, LIENZO, MARGEN, DETALLE_RES2,
+from construir_wf import (escalado, aplicar_caja, LIENZO, MARGEN, DETALLE_RES2,
                           anadir_flags, desde_flags)
 
 
@@ -49,19 +49,16 @@ def construir(a) -> dict:
     wf["23"]["inputs"]["seed"] = a.seed_personaje
     wf["43"]["inputs"]["seed"] = a.seed_fusion
     wf["43"]["inputs"]["denoise"] = a.denoise
-    for n in ("26", "28"):
-        wf[n]["inputs"]["width"] = a.tam
-        wf[n]["inputs"]["height"] = a.tam
-    wf["30"]["inputs"]["x"] = a.x
-    wf["30"]["inputs"]["y"] = a.y
-    if "51" in wf:                      # variante enmascarada
-        wf["51"]["inputs"]["x"] = a.x
-        wf["51"]["inputs"]["y"] = a.y
+    # una sola fuente para la geometria: la misma que uso construir_wf al
+    # montar el grafo, para que --vertical/--lienzo no queden pisados aqui
+    g = aplicar_caja(wf, tam=a.tam, x=a.x, y=a.y,
+                     lienzo=getattr(a, "lienzo", LIENZO),
+                     vertical=getattr(a, "vertical", False))
     if "80" in wf:                      # variantes hd/hd2/hd3: recorte de detalle
-        cx = max(0, a.x - MARGEN)
-        cy = max(0, a.y - MARGEN)
-        cw = min(LIENZO - cx, a.tam + 2 * MARGEN)
-        ch = min(LIENZO - cy, a.tam + 2 * MARGEN)
+        cx = max(0, g["x"] - MARGEN)
+        cy = max(0, g["y"] - MARGEN)
+        cw = min(g["lienzo"] - cx, g["cw"] + 2 * MARGEN)
+        ch = min(g["lienzo"] - cy, g["ch"] + 2 * MARGEN)
         for n in ("80", "81"):
             wf[n]["inputs"].update(x=cx, y=cy, width=cw, height=ch)
         wf["91"]["inputs"].update(x=cx, y=cy)

@@ -28,6 +28,22 @@ DETALLE_RES = 1024   # a que resolucion se re-difunde el recorte ('hd')
 DETALLE_RES2 = 1536  # lo mismo para 'hd2'/'hd3'
 DETALLE_DENOISE = 0.45
 
+# --- Resolucion del personaje sobre el escenario -----------------------------
+# El personaje se genera en su propio lienzo, se recorta con BiRefNet y se
+# escala a una caja dentro del escenario. Ahi se pierde resolucion por dos
+# sitios distintos, y cada palanca ataca uno:
+#
+#   vertical  el personaje se genera en 1024x1024 CUADRADO, pero una figura de
+#             cuerpo entero solo ocupa una franja vertical: el resto son
+#             pixeles de fondo que BiRefNet borra despues. En 832x1216 (ratio
+#             nativo de SDXL) la figura llena mucho mas el encuadre.
+#   lienzo    subir todo a 1536. SDXL esta entrenado a 1024 y por encima tiende
+#             a duplicar elementos, asi que es el ultimo recurso.
+#   upscale   UltimateSDUpscale sobre el compuesto final.
+PERSONAJE_VERTICAL = (832, 1216)   # ratio nativo SDXL para figura de pie
+LIENZO_GRANDE = 1536
+UPSCALE_MODELO = "4x_NMKD-Siax_200k.pth"
+
 # El prompt de la segunda pasada no debe describir el escenario: el recorte ya
 # esta cerrado sobre el personaje y pedir "bedroom, window light" hace que el
 # modelo gaste capacidad repintando fondo en vez de piel, pelo y manos.
@@ -68,6 +84,118 @@ def escalado(cw: int, ch: int, res: int) -> tuple[int, int]:
     factor = res / max(cw, ch)
     return (max(8, round(cw * factor / 8) * 8),
             max(8, round(ch * factor / 8) * 8))
+
+
+def aplicar_caja(wf: dict, tam: int = 640, x: int = 200, y: int = 380,
+                 lienzo: int = LIENZO, vertical: bool = False) -> dict:
+    """Unica funcion que coloca la caja del personaje sobre el escenario.
+
+    Toca los nodos de escala (26/28) y de pegado (30/51) y devuelve la
+    geometria que sale, para que quien tenga que recortar despues (la 2a
+    pasada) no la recalcule por su cuenta y se desincronice.
+
+    Las palancas interactuan: 'vertical' cambia el ASPECTO de la caja y
+    'lienzo' cambia su ESCALA. Antes cada una escribia 26/28 por su lado y la
+    ultima en correr borraba a la anterior; ahora se combinan aqui.
+    """
+    f = lienzo / LIENZO
+    tam = max(8, round(tam * f / 8) * 8)
+    x, y = int(x * f), int(y * f)
+    if vertical:
+        pw, ph = PERSONAJE_VERTICAL
+        wf["22"]["inputs"]["width"] = pw
+        wf["22"]["inputs"]["height"] = ph
+        # la caja conserva el aspecto: alto = tam, ancho proporcional. Si se
+        # sigue forzando tam x tam cuadrado la figura se aplasta y se pierde
+        # justo lo que se gana.
+        cw, ch = max(8, round(tam * pw / ph / 8) * 8), tam
+    else:
+        cw = ch = tam
+    for n in ("26", "28"):
+        wf[n]["inputs"]["width"] = cw
+        wf[n]["inputs"]["height"] = ch
+    for n in ("30", "51"):
+        if n in wf:
+            wf[n]["inputs"]["x"] = x
+            wf[n]["inputs"]["y"] = y
+    return {"x": x, "y": y, "cw": cw, "ch": ch, "lienzo": lienzo}
+
+
+def con_vertical(wf: dict, tam: int = 640) -> dict:
+    """El personaje se genera en vertical en vez de en un cuadrado."""
+    aplicar_caja(wf, tam=tam, x=wf["30"]["inputs"]["x"],
+                 y=wf["30"]["inputs"]["y"], vertical=True)
+    return wf
+
+
+def con_bbox(wf: dict) -> dict:
+    """Recorta el personaje a su bounding box antes de escalarlo a la caja.
+
+    BiRefNet devuelve el recorte sobre el lienzo entero, con alfa transparente
+    alrededor. Ese padding viaja hasta la caja de destino y se lleva buena parte
+    de los pixeles utiles. Recortando a la silueta, la figura aprovecha la caja
+    completa.
+
+    Necesita un nodo que calcule el bbox EN EJECUCION: el recorte depende de la
+    imagen generada, no se puede precalcular aqui.
+
+    Esquema ya verificado contra el worker vivo (python sondear_nodos.py):
+
+        AILab_CropObject   (custom_nodes.ComfyUI-RMBG)
+            opt: image:IMAGE, mask:MASK, padding:INT
+            out: IMAGE, MASK
+
+    Es el unico candidato cableable tal cual, y su pack ya se instala con
+    FEAT_RMBG. Va entre BiRefNet (25) y el escalado de la caja (26/28), y hay
+    que pasarle tambien la mascara para que 27/29 sigan cuadrando.
+
+    Descartados: CropByBBoxes e ImageCropV2 exigen un tipo BOUNDING_BOX que solo
+    produce un detector (rtdetr/sdpose) o el editor manual del canvas;
+    AILab_ImageCrop recorta a coordenadas fijas, no al objeto.
+
+    PENDIENTE: cablearlo y medir. Un nodo mal cableado tumba el request entero,
+    asi que la primera prueba va contra un worker vivo, no a ciegas.
+    """
+    raise SystemExit(
+        "--bbox todavia no esta implementado. El nodo es AILab_CropObject "
+        "(image, mask, padding -> IMAGE, MASK); falta cablearlo entre BiRefNet "
+        "(25) y el escalado de la caja (26/28).")
+
+
+def con_lienzo(wf: dict, lado: int, tam: int = 640, x: int = 200, y: int = 380,
+               vertical: bool = False) -> dict:
+    """Sube el lienzo de escenario y composicion. Escala posiciones y mascara."""
+    wf["12"]["inputs"]["width"] = lado
+    wf["12"]["inputs"]["height"] = lado
+    wf["50"]["inputs"]["width"] = lado
+    wf["50"]["inputs"]["height"] = lado
+    aplicar_caja(wf, tam=tam, x=x, y=y, lienzo=lado, vertical=vertical)
+    return wf
+
+
+def con_upscale(wf: dict, origen: list) -> dict:
+    """UltimateSDUpscale sobre el compuesto final (2x)."""
+    wf["130"] = {"class_type": "UpscaleModelLoader",
+                 "inputs": {"model_name": UPSCALE_MODELO}}
+    wf["131"] = {"class_type": "UltimateSDUpscale",
+                 "inputs": {"image": origen, "model": ["2", 0],
+                            "positive": ["40", 0], "negative": ["41", 0],
+                            "vae": ["1", 2], "upscale_model": ["130", 0],
+                            "upscale_by": 2.0, "seed": 888888, "steps": 18,
+                            "cfg": 5.0, "sampler_name": "dpmpp_2m",
+                            "scheduler": "karras", "denoise": 0.2,
+                            "mode_type": "Linear", "tile_width": 1024,
+                            "tile_height": 1024, "mask_blur": 8,
+                            "tile_padding": 32, "seam_fix_mode": "None",
+                            "seam_fix_denoise": 1.0, "seam_fix_width": 64,
+                            "seam_fix_mask_blur": 8, "seam_fix_padding": 16,
+                            "force_uniform_tiles": True,
+                            "tiled_decode": False},
+                 "_meta": {"title": "UltimateSDUpscale 2x del compuesto"}}
+    wf["132"] = {"class_type": "SaveImage",
+                 "inputs": {"filename_prefix": "h_upscale", "images": ["131", 0]},
+                 "_meta": {"title": "SALIDA: compuesto ampliado 2x"}}
+    return wf
 
 
 def con_pose(wf: dict, detector: str) -> dict:
@@ -360,7 +488,9 @@ def sin_mascara(wf: dict) -> dict:
 
 
 def construir(pose: str = "dwpose", detalle: str = "hd2", cara: bool = True,
-              manos: str | None = None, mascara: bool = True) -> dict:
+              manos: str | None = None, mascara: bool = True,
+              vertical: bool = False, lienzo: int = LIENZO,
+              bbox: bool = False, upscale: bool = False) -> dict:
     """Arma el workflow encendiendo y apagando cada funcionalidad.
 
     pose     none | openpose | dwpose   guia de pose por ControlNet
@@ -368,6 +498,12 @@ def construir(pose: str = "dwpose", detalle: str = "hd2", cara: bool = True,
     cara     bool                       FaceDetailer dentro de la 2a pasada
     manos    None | yolo | mesh | ambas pasada de manos dentro de la 2a pasada
     mascara  bool                       SetLatentNoiseMask en la fusion
+
+    Resolucion del personaje (ver comentario de PERSONAJE_VERTICAL):
+    vertical bool    generar el personaje en 832x1216 en vez de 1024 cuadrado
+    lienzo   int     lado del escenario/composicion (1024 por defecto)
+    bbox     bool    recortar el personaje a su bounding box antes de escalar
+    upscale  bool    UltimateSDUpscale 2x sobre el compuesto final
     """
     if pose not in ("none", "openpose", "dwpose"):
         raise SystemExit(f"pose desconocida: {pose}")
@@ -383,6 +519,12 @@ def construir(pose: str = "dwpose", detalle: str = "hd2", cara: bool = True,
                          "('hd' se conserva solo como baseline de la comparacion)")
 
     wf = json.loads(json.dumps(BASE))               # copia profunda
+    # lienzo y vertical se resuelven de una vez (una escribe la escala y la
+    # otra el aspecto de la MISMA caja: aplicadas por separado se pisaban)
+    if lienzo != LIENZO or vertical:
+        wf = con_lienzo(wf, lienzo, vertical=vertical)
+    if bbox:
+        wf = con_bbox(wf)
     if pose != "none":
         wf = con_pose(wf, pose)
     if detalle == "hd":
@@ -391,6 +533,9 @@ def construir(pose: str = "dwpose", detalle: str = "hd2", cara: bool = True,
         wf = con_detalle2(wf, cara=cara, manos=manos)
     if not mascara:
         wf = sin_mascara(wf)
+    if upscale:
+        # cuelga de la ultima salida que exista: 2a pasada > fusion
+        wf = con_upscale(wf, ["91", 0] if "91" in wf else ["44", 0])
     return wf
 
 
@@ -426,6 +571,15 @@ def anadir_flags(p) -> None:
     g.add_argument("--variante", choices=tuple(VARIANTES),
                    help="atajo con nombre; ignora --detalle/--cara/--manos")
     g.add_argument("--workflow", help="usar este .json en vez de armarlo con los flags")
+    r = p.add_argument_group("resolucion del personaje")
+    r.add_argument("--vertical", action="store_true",
+                   help=f"generar el personaje en {PERSONAJE_VERTICAL[0]}x{PERSONAJE_VERTICAL[1]}")
+    r.add_argument("--lienzo", type=int, default=LIENZO,
+                   help=f"lado del escenario (default {LIENZO}; {LIENZO_GRANDE} duplica elementos)")
+    r.add_argument("--bbox", action="store_true",
+                   help="recortar el personaje a su bounding box")
+    r.add_argument("--upscale", action="store_true",
+                   help="UltimateSDUpscale 2x del compuesto final")
 
 
 def desde_flags(a) -> dict:
@@ -434,6 +588,10 @@ def desde_flags(a) -> dict:
         return json.loads((HERE / a.workflow).read_text(encoding="utf-8"))
     opts = dict(VARIANTES[a.variante]) if getattr(a, "variante", None) else \
         dict(detalle=a.detalle, cara=a.cara, manos=a.manos)
+    # las palancas de resolucion son ortogonales a la variante: se aplican
+    # siempre, tambien cuando se usa --variante como atajo
+    for k in ("vertical", "lienzo", "bbox", "upscale"):
+        opts[k] = getattr(a, k, LIENZO if k == "lienzo" else False)
     return construir(pose=a.pose, mascara=not a.sin_mascara, **opts)
 
 

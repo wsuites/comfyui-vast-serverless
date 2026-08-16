@@ -151,10 +151,93 @@ MODEL_LOG="${MODEL_LOG:-/var/log/portal/comfyui.log}"
 mkdir -p "$(dirname "$MODEL_LOG")"
 
 log() { echo "[$(date '+%Y-%m-%d %H:%M:%S')] provision: $1" | tee -a "$MODEL_LOG"; }
-on_err() { log "[ERROR] fallo en la linea $1 (exit $2) - el worker NO se marcara ready"; }
+
+# --- notificaciones a Discord ------------------------------------------------
+# El webhook NO se escribe aqui: este fichero se publica en una URL R2 publica.
+# Llega por el entorno del template (-e DISCORD_WEBHOOK=...). Si no esta, todo
+# lo de abajo es un no-op y el provisioning sigue igual.
+DISCORD_WEBHOOK="${DISCORD_WEBHOOK:-}"
+T0=$(date +%s)
+WHO="${CONTAINER_ID:-${VAST_CONTAINERLABEL:-$(hostname)}}"
+GPU=$(nvidia-smi --query-gpu=name --format=csv,noheader 2>/dev/null | head -1)
+IP=$(curl -s -m 5 https://api.ipify.org 2>/dev/null || echo "?")
+
+elapsed() { printf '%dm%02ds' $(( ($(date +%s) - T0) / 60 )) $(( ($(date +%s) - T0) % 60 )); }
+
+# manda un mensaje. Blindado: red mala, 429 o webhook borrado nunca pueden
+# tumbar el provisioning (de ahi el || true y el timeout corto).
+dc() {
+    [ -n "$DISCORD_WEBHOOK" ] || return 0
+    python3 - "$DISCORD_WEBHOOK" "$1" <<'PY' >/dev/null 2>&1 || true
+import json, sys, urllib.request
+url, content = sys.argv[1], sys.argv[2][:1900]
+body = json.dumps({"content": content, "username": "mizuki-provision",
+                   "allowed_mentions": {"parse": []}}).encode()
+try:
+    urllib.request.urlopen(urllib.request.Request(
+        url, data=body, headers={"Content-Type": "application/json",
+                                 # sin User-Agent propio Discord devuelve 403
+                                 "User-Agent": "mizuki-provision/1.0"}), timeout=10).read()
+except Exception:
+    pass
+PY
+}
+
+# hito = al log del worker Y al canal
+hito() { log "$1"; dc "[$WHO $(elapsed)] $1"; }
+
+# vuelca las ultimas lineas del log dentro de un bloque de codigo
+dc_log() {
+    [ -n "$DISCORD_WEBHOOK" ] || return 0
+    local n="${1:-40}" cola
+    cola=$(tail -n "$n" "$MODEL_LOG" 2>/dev/null | tail -c 1500)
+    dc "\`\`\`$(printf '%s' "$cola")\`\`\`"
+}
+
+on_err() {
+    log "[ERROR] fallo en la linea $1 (exit $2) - el worker NO se marcara ready"
+    dc ":x: **provisioning FALLO** \`$WHO\` linea $1 (exit $2) tras $(elapsed) - el worker no se marca ready"
+    dc_log 40
+    ERR_YA_AVISADO=1
+}
 trap 'on_err $LINENO $?' ERR
 
+# --- poll de progreso ---------------------------------------------------------
+# pip y las descargas de R2 pasan minutos sin escribir nada; sin esto el canal
+# (y el log) parecen colgados cuando en realidad hay trabajo. Reporta cada 2 min
+# el tamano de la cache de pip, de models/ y la ultima linea viva del log.
+watch_progress() {
+    local prev="" ahora
+    while sleep 120; do
+        ahora="pip:$(du -sm "${PIP_CACHE_DIR:-/tmp}" 2>/dev/null | cut -f1)MB"
+        ahora="$ahora models:$(du -sm "${MODELS_DIR:-/tmp}" 2>/dev/null | cut -f1)MB"
+        ahora="$ahora libre:$(df -h "$WORKSPACE_DIR" 2>/dev/null | awk 'NR==2{print $4}')"
+        if [ "$ahora" = "$prev" ]; then
+            dc ":hourglass: [$WHO $(elapsed)] $ahora _(sin cambios)_ · $(tail -n 1 "$MODEL_LOG" 2>/dev/null | tail -c 200)"
+        else
+            dc ":arrow_forward: [$WHO $(elapsed)] $ahora · $(tail -n 1 "$MODEL_LOG" 2>/dev/null | tail -c 200)"
+        fi
+        prev="$ahora"
+    done
+}
+
+dc ":rocket: **provisioning ARRANCA** \`$WHO\` · ${GPU:-GPU?} · IP $IP"
 log "=== inicio ==="
+watch_progress & WATCH_PID=$!
+
+# Los 'exit 1' explicitos (credenciales, ComfyUI no encontrado, pip) NO disparan
+# el trap ERR, solo el EXIT. Aqui se cierra ese hueco: cualquier salida != 0 que
+# no venga ya de on_err se reporta con su cola de log.
+ERR_YA_AVISADO=0
+on_exit() {
+    local st=$?
+    kill "$WATCH_PID" 2>/dev/null || true
+    if [ "$st" != 0 ] && [ "$ERR_YA_AVISADO" = 0 ]; then
+        dc ":x: **provisioning ABORTADO** \`$WHO\` (exit $st) tras $(elapsed)"
+        dc_log 40
+    fi
+}
+trap on_exit EXIT
 
 # --- venv de la imagen -------------------------------------------------------
 if [ -f /venv/main/bin/activate ]; then
@@ -162,7 +245,16 @@ if [ -f /venv/main/bin/activate ]; then
     . /venv/main/bin/activate
     log "venv /venv/main activado"
 fi
-PIP_ARGS="--no-cache-dir -q"
+# Cache de pip en disco persistente. El autoscaler mata la carga a los ~791s y
+# hace restart_instance; con --no-cache-dir cada reinicio volvia a bajar los
+# mismos wheels desde cero (142 MB directos, ~15 min en un host a 350 KB/s) y
+# nunca cabia en el timeout: bucle infinito. Con cache, el 2o intento reaprovecha
+# lo ya bajado y converge aunque el host tenga la red mala.
+export PIP_CACHE_DIR="$WORKSPACE_DIR/.cache/pip"
+mkdir -p "$PIP_CACHE_DIR"
+# sin -q: en modo silencioso pip no escribe nada durante minutos y el log parece
+# colgado cuando en realidad esta progresando.
+PIP_ARGS="--cache-dir $PIP_CACHE_DIR --progress-bar off"
 [ -n "${VIRTUAL_ENV:-}" ] || PIP_ARGS="$PIP_ARGS --break-system-packages"
 
 # --- [1/5] localizar ComfyUI -------------------------------------------------
@@ -177,7 +269,7 @@ fi
 MODELS_DIR="$COMFY_DIR/models"
 NODES_DIR="$COMFY_DIR/custom_nodes"
 mkdir -p "$MODELS_DIR"/{checkpoints,loras,upscale_models} "$MODELS_DIR/ultralytics/bbox" "$NODES_DIR"
-log "[1/5] COMFY_DIR=$COMFY_DIR"
+hito "[1/5] COMFY_DIR=$COMFY_DIR"
 
 # --- [2/5] validar credenciales S3 antes de nada ------------------------------
 missing=""
@@ -188,7 +280,7 @@ if [ -n "$missing" ]; then
     log "[ERROR] faltan variables de entorno S3:$missing"
     exit 1
 fi
-log "[2/5] credenciales S3 presentes (bucket=$S3_BUCKET_NAME)"
+hito "[2/5] credenciales S3 presentes (bucket=$S3_BUCKET_NAME)"
 
 # --- [3/5] custom nodes ------------------------------------------------------
 install_node() {
@@ -221,7 +313,7 @@ done
 # shellcheck disable=SC2086
 pip install $PIP_ARGS --no-build-isolation "${PIP_EXTRA[@]}" \
     || { log "[ERROR] fallo instalando dependencias de nodos"; exit 1; }
-log "[3/5] custom nodes listos (${#NODES[@]})"
+hito "[3/5] custom nodes listos (${#NODES[@]})"
 
 # --- [4/5] modelos desde R2 --------------------------------------------------
 export COMFY_MODELS_DIR="$MODELS_DIR"
@@ -325,7 +417,7 @@ for e in "${URL_FILES[@]:-}"; do
     fi
 done
 
-log "[4/5] modelos listos"
+hito "[4/5] modelos listos"
 
 # --- [5/5] workflow de benchmark para el pyworker -----------------------------
 # El pyworker (BACKEND=comfyui-json) usa este JSON para medir el rendimiento de
@@ -363,7 +455,7 @@ for _ in $(seq 1 120); do
 done
 if [ -d "$BENCH_DIR" ]; then
     echo "$BENCH_JSON" > "$BENCH_DIR/benchmark.json"
-    log "[5/5] benchmark.json escrito en $BENCH_DIR"
+    hito "[5/5] benchmark.json escrito en $BENCH_DIR"
 else
     log "[WARN] $BENCH_DIR no aparecio en 120s; se usara el benchmark por defecto"
 fi
@@ -375,4 +467,72 @@ if [ -d /opt/comfyui-api-wrapper/payloads ]; then
     log "payload de smoke test en /opt/comfyui-api-wrapper/payloads/mizuki_smoke.json"
 fi
 
-log "=== PROVISIONING_OK ==="
+hito "=== PROVISIONING_OK ==="
+
+# --- centinela de ciclo de vida ----------------------------------------------
+# El provisioning termina aqui, pero ComfyUI tarda todavia en abrir el 18188 y
+# el contenedor puede morir despues (el autoscaler hace restart_instance a los
+# ~791s de carga). Este proceso sobrevive al script para avisar de encendido,
+# caida y apagado. El webhook se escribe en disco del worker, nunca en el .sh
+# publico de R2.
+if [ -n "$DISCORD_WEBHOOK" ]; then
+    cat > "$WORKSPACE_DIR/discord_sentinel.sh" <<'SENT'
+#!/bin/bash
+# arg1: webhook  arg2: etiqueta del worker
+W="$1"; WHO="$2"; T0=$(date +%s)
+el() { printf '%dm%02ds' $(( ($(date +%s)-T0)/60 )) $(( ($(date +%s)-T0)%60 )); }
+send() {
+    python3 - "$W" "$1" <<'PY' >/dev/null 2>&1 || true
+import json, sys, urllib.request
+url, content = sys.argv[1], sys.argv[2][:1900]
+body = json.dumps({"content": content, "username": "mizuki-worker",
+                   "allowed_mentions": {"parse": []}}).encode()
+try:
+    urllib.request.urlopen(urllib.request.Request(
+        url, data=body, headers={"Content-Type": "application/json",
+                                 # sin User-Agent propio Discord devuelve 403
+                                 "User-Agent": "mizuki-provision/1.0"}), timeout=10).read()
+except Exception:
+    pass
+PY
+}
+vivo() { [ "$(curl -s -m 8 -o /dev/null -w '%{http_code}' http://127.0.0.1:18188/object_info)" = "200" ]; }
+bye() { send ":octagonal_sign: **worker APAGANDOSE** \`$WHO\` (senal recibida tras $(el) de vida)"; exit 0; }
+trap bye TERM HUP INT
+
+# 1) esperar a que ComfyUI abra (hasta 60 min)
+arriba=0
+for _ in $(seq 1 240); do
+    if vivo; then arriba=1; break; fi
+    sleep 15
+done
+if [ "$arriba" = 1 ]; then
+    send ":white_check_mark: **ComfyUI ARRIBA** \`$WHO\` en $(el) desde el fin del provisioning"
+else
+    send ":warning: **ComfyUI no abrio el 18188** \`$WHO\` tras $(el)"
+    tail -n 25 /var/log/portal/comfyui.log 2>/dev/null | { c=$(cat); send "\`\`\`${c: -1400}\`\`\`"; }
+    exit 0
+fi
+
+# 2) vigilar caidas (3 fallos seguidos = caido; se avisa una sola vez por estado)
+fallos=0; estado=ok
+while sleep 60; do
+    if vivo; then
+        fallos=0
+        [ "$estado" = caido ] && { send ":arrows_counterclockwise: **ComfyUI recuperado** \`$WHO\`"; estado=ok; }
+    else
+        fallos=$((fallos+1))
+        if [ "$fallos" -ge 3 ] && [ "$estado" = ok ]; then
+            estado=caido
+            send ":x: **ComfyUI dejo de responder** \`$WHO\` (3 sondeos seguidos)"
+            tail -n 25 /var/log/portal/comfyui.log 2>/dev/null | { c=$(cat); send "\`\`\`${c: -1400}\`\`\`"; }
+        fi
+    fi
+done
+SENT
+    chmod +x "$WORKSPACE_DIR/discord_sentinel.sh"
+    setsid nohup "$WORKSPACE_DIR/discord_sentinel.sh" "$DISCORD_WEBHOOK" "$WHO" \
+        >/dev/null 2>&1 < /dev/null &
+    disown 2>/dev/null || true
+    log "centinela de Discord lanzado"
+fi

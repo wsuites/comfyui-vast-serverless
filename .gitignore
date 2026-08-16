@@ -27,3 +27,6 @@ poses/
 # python
 __pycache__/
 *.pyc
+
+# volcado de esquemas del worker (3 MB, se regenera con sondear_nodos.py)
+nodos.json
