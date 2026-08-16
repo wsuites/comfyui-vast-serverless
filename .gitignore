@@ -1,0 +1,29 @@
+# secretos y config del despliegue
+.env
+config.json
+.presigned_url.txt
+
+# salidas generadas
+*.png
+*.gif
+last_response.json
+bg_*.json
+verif_final.json
+escena_out/
+escena_sweep/
+escena_mask/
+escena_pose/
+cmp_*/
+frames_out/
+correr_out/
+sprites_out/
+sprites_pose/
+sprites_pose2/
+sprites_norm/
+muestras_bg/
+poses/
+*.zip
+
+# python
+__pycache__/
+*.pyc
