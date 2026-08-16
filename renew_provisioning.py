@@ -131,6 +131,14 @@ def main() -> int:
                      "(cache de R2?). Reintenta en unos segundos o usa --presigned.")
         print(f"URL publica verificada ({len(served)} bytes): {url}")
 
+    # El webhook viaja por el entorno del template, NO dentro del .sh: ese fichero
+    # se sirve desde una URL publica de R2 y cualquiera podria leerlo (y escribir
+    # en el canal). Si no esta definido, el provisioning no notifica y ya esta.
+    # config.var() aborta si falta; este es opcional, asi que se lee del ENV crudo
+    webhook = config.ENV.get("DISCORD_WEBHOOK", "").strip()
+    env_webhook = f' -e DISCORD_WEBHOOK="{webhook}"' if webhook else ""
+    print("webhook de Discord:", "activo" if webhook else "NO definido (sin avisos)")
+
     template_env = (
         '-p 3000:3000 '
         '-e COMFYUI_ARGS="--disable-auto-launch --port 18188" '
@@ -138,6 +146,7 @@ def main() -> int:
         '-e BENCHMARK_TEST_WIDTH=512 -e BENCHMARK_TEST_HEIGHT=512 '
         '-e BENCHMARK_TEST_STEPS=20 '
         f'-e PROVISIONING_SCRIPT="{url}"'
+        f'{env_webhook}'
     )
 
     # ojo: update template cambia el hash_id, hay que releerlo despues

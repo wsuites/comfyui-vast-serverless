@@ -17,6 +17,7 @@ provisionan desde Cloudflare R2 y las imágenes se suben ahí mismo.
 | `wf.json` | Workflow en formato **API** de ComfyUI. Es lo que se envía en cada request. |
 | `serverless_provision.sh` | Provisioning del worker. Copia de la que corre en R2 (`comfy-stack/scripts/serverless_provision.sh`). |
 | `renew_provisioning.py` | Sube el provisioning a R2, regenera la URL presignada y actualiza template + workergroup. |
+| `sondear_nodos.py` | Vuelca el esquema real de nodos del worker vivo (`object_info` por SSH). Para cablear un nodo nuevo sin adivinar. |
 | `reproducir-resultados-desde-cero.md` | Receta de parámetros y hallazgos de prompt. |
 | `loras.md` | LoRAs de personaje: candidatas, cómo añadirlas y cómo probarlas. |
 | `.env` | Configuración y credenciales. **No se versiona, no compartir.** |
@@ -230,6 +231,48 @@ distintos en requests consecutivos sin tocar nada del despliegue.
 El único límite es que los modelos y nodos que use ese workflow tienen que estar
 en el worker. Si no, ComfyUI falla con el nombre del que falta.
 
+### Encender y apagar funcionalidades del worker
+
+Arriba de `serverless_provision.sh` hay un toggle `true`/`false` por
+característica. Cada uno arrastra **sus modelos, sus custom nodes y sus paquetes
+pip**, así que apagar lo que no uses ahorra disco y arranque en frío:
+
+| Toggle | Flag del cliente | Tamaño | Estado |
+|---|---|---|---|
+| `FEAT_UPSCALE` | `UltimateSDUpscale` de `wf.json` | 67 MB | `true` |
+| `FEAT_RMBG` | BiRefNet, recorta al personaje | ~1 GB | `true` |
+| `FEAT_CONTROLNET` | lo pide cualquier `--pose` y `--manos mesh` | 2,5 GB | `true` |
+| `FEAT_POSE_DWPOSE` | `--pose dwpose` | 351 MB | `true` |
+| `FEAT_POSE_OPENPOSE` | `--pose openpose` | ~430 MB | **`false`** |
+| `FEAT_CARA` | `--cara` | 52 MB | `true` |
+| `FEAT_MANOS_YOLO` | `--manos yolo` | 22 MB | `true` |
+| `FEAT_MANOS_MESH` | `--manos mesh` | 1,37 GB | `true` |
+
+`FEAT_POSE_OPENPOSE` está en `false` porque `OpenposePreprocessor` falla con
+anime y empeora la pose — ver la tabla de [Lo que funciona y lo que
+no](#lo-que-funciona-y-lo-que-no-todo-medido). Apagarlo ahorra los tres
+anotadores de `lllyasviel/Annotators`.
+
+> ⚠️ Apagar un toggle **no cambia los workflows**. Si mandas un workflow que usa
+> algo apagado, ComfyUI falla con el nombre del modelo o del nodo que falta.
+
+**Dos cosas que estaban colgando de una descarga en pleno request** y ahora se
+pre-bajan en el provisioning:
+
+- Los modelos de **DWPose** (`yolox_l.onnx` + `dw-ll_ucoco_384.onnx`, 351 MB) no
+  estaban en ningún array; el nodo se los bajaba de HuggingFace en el primer
+  request. Se descubrió al inventariar un worker vivo: estaban en disco sin
+  estar en el provisioning.
+- `mediapipe` y `trimesh`, que el nodo de MeshGraphormer instala **por pip** si
+  no los encuentra, también en pleno request.
+
+> 🐛 **Cuidado al añadir toggles**: un `[ -n "$k" ] && echo ...` como última
+> sentencia de un `for` hace que la sustitución `$( ... )` entera salga con
+> código 1 cuando el array queda vacío, y con `set -euo pipefail` eso **mata el
+> provisioning** y el worker nunca se marca listo. Usa `if ... then ... fi`.
+> Los bucles sobre arrays llevan además `"${ARR[@]:-}"` y un `continue` de
+> guardia.
+
 ### Añadir un modelo o un LoRA
 
 1. Súbelo a R2 bajo `comfy-stack/models/<tipo>/`.
@@ -247,6 +290,53 @@ en el worker. Si no, ComfyUI falla con el nombre del que falta.
 
 Los modelos ya descargados se saltan comparando tamaño con el de R2, así que
 añadir uno nuevo no vuelve a bajar los 7 GB.
+
+### Probar un modelo sin reprovisionar
+
+Para **pruebas**, no merece la pena tocar `serverless_provision.sh`: eso dispara
+el reemplazo del worker, un arranque en frío y volver a bajar los ~7 GB. Se baja
+el modelo directamente al worker vivo por SSH:
+
+```bash
+ssh -i ~/.ssh/xcl -o IdentitiesOnly=yes -p <puerto> root@<ip>
+curl -sL -o /workspace/ComfyUI/models/ultralytics/bbox/hand_yolov8s.pt \
+  https://huggingface.co/Bingsu/adetailer/resolve/main/hand_yolov8s.pt
+```
+
+**ComfyUI recoge el fichero nuevo sin reiniciar**; se comprueba con
+`curl -s http://127.0.0.1:18188/object_info/UltralyticsDetectorProvider`.
+
+El puerto y la IP salen de `vastai show instances --raw` (campo `ports`); ojo
+que el `ssh_host`/`ssh_port` que muestra la CLI es el proxy, y el mapeo directo
+del 22 suele ser otro. La clave que funciona es `~/.ssh/xcl`.
+
+> Dos callejones sin salida ya comprobados: `vastai attach ssh` sobre una
+> instancia **ya corriendo** devuelve `success` pero **no propaga la clave**, y
+> `vastai execute` solo funciona con instancias **paradas**.
+
+> ⚠️ Lo bajado así **no sobrevive al reemplazo del worker**. Cuando la prueba
+> convenza, hazlo permanente y lanza `renew_provisioning.py --update-workers`.
+
+Para hacerlo permanente hay tres sitios en `serverless_provision.sh`, todos
+colgando del toggle de su característica:
+
+- **`MODELS`** / **`EXTRA_FILES`** — ficheros espejados en R2. Verifican tamaño
+  contra el origen y se saltan si ya están.
+- **`URL_FILES`** — descarga directa por URL, para pesos públicos de HuggingFace
+  que no merece la pena espejar. Formato `<url>|<ruta relativa a COMFY_DIR>`.
+  Solo se salta si el fichero ya existe; no compara tamaños.
+
+Lo que hace falta para las variantes de manos, si se quieren hacer permanentes:
+
+| Ruta | Ficheros | Tamaño |
+|---|---|---|
+| `hd3y` (yolo) | `Bingsu/adetailer` → `hand_yolov8s.pt` | 22 MB |
+| `hd3m` (MeshGraphormer) | `hr16/ControlNet-HandRefiner-pruned` → `graphormer_hand_state_dict.bin` + `hrnetv2_w64_imagenet_pretrained.pth` | 856 + 513 MB |
+
+El tercer fichero de ese repo, `control_sd15_inpaint_depth_hand_fp16.safetensors`
+(722 MB), **no hace falta**: es el ControlNet de SD1.5 y aquí se usa el union
+SDXL en modo depth. `mediapipe` y `trimesh` ya están en la imagen; si no
+estuvieran, el nodo los instala por pip **en pleno request**.
 
 ### Añadir un custom node
 
@@ -346,11 +436,74 @@ PERSONAJE ──► KSampler ──► BiRefNet ──► escalar ────�
 
 | | |
 |---|---|
-| `construir_wf.py` | Genera las variantes del workflow |
-| `wf_v_dwpose_hd.json` | **La configuración recomendada** |
+| `construir_wf.py` | **Arma el workflow** encendiendo/apagando cada parte |
 | `escena.py` | Runner con `--sweep` de denoise |
+| `ab_detalle.py` | A/B de la segunda pasada, con tiempos |
+| `ab_resolucion.py` | A/B de las palancas de resolución (`--vertical`, `--lienzo`, `--upscale`), con hojas de comparación |
 | `frames.py` | Secuencia de poses en un set fijo |
 | `correr.py` | Secuencia de movimiento (personaje cruzando la escena) |
+| `wf_v_<pose>_<variante>.json` | La matriz pregenerada, para el A/B y para inspeccionar a mano |
+
+### Interruptores
+
+Todo el pipeline se enciende y se apaga con los mismos flags, y significan lo
+mismo en `construir_wf.py`, `escena.py` y `correr.py`:
+
+| Flag | Valores | Default | Qué hace |
+|---|---|---|---|
+| `--pose` | `none` / `openpose` / `dwpose` | `dwpose` | Guía de pose por ControlNet |
+| `--detalle` | `no` / `hd` / `hd2` | `hd2` | 2ª pasada sobre el recorte del personaje |
+| `--cara` | flag | off | `FaceDetailer` **dentro** de la 2ª pasada |
+| `--manos` | `yolo` / `mesh` / `ambas` | off | Pasada de manos **dentro** de la 2ª pasada |
+| `--sin-mascara` | flag | off | Quita `SetLatentNoiseMask` (deforma el escenario) |
+| `--variante` | ver abajo | — | Atajo con nombre |
+| `--workflow` | ruta | — | Usa un `.json` ya hecho e ignora todo lo anterior |
+
+Y las palancas de **resolución del personaje**, que son ortogonales a las de
+arriba (se aplican también cuando usas `--variante`):
+
+| Flag | Default | Qué hace |
+|---|---|---|
+| `--vertical` | off | Genera el personaje en `832x1216` (ratio nativo SDXL) en vez de `1024x1024` |
+| `--lienzo N` | `1024` | Lado del escenario/composición. `1536` duplica los elementos del grafo |
+| `--upscale` | off | `UltimateSDUpscale` 2x sobre el compuesto final |
+| `--bbox` | off | **No implementado**, ver abajo |
+
+El **escenario → personaje → collage** es la base del pipeline y no se apaga:
+es lo que hace el propio grafo. Lo que sí se apaga es la máscara que protege el
+escenario en la fusión.
+
+```powershell
+# escribir un workflow concreto
+python construir_wf.py --pose dwpose --detalle hd2 --cara --manos yolo -o mi_wf.json
+
+# lo mismo, con el atajo
+python construir_wf.py --variante hd3y -o mi_wf.json
+
+# sin escribir fichero: los runners lo arman en memoria
+python escena.py --pose dwpose --detalle hd2 --cara --manos yolo --denoise 0.85
+python correr.py --variante hd3y --frames 8
+
+# regenerar la matriz entera (3 poses x 7 variantes)
+python construir_wf.py --matriz
+```
+
+Los atajos de `--variante` son combinaciones con nombre de los flags de arriba:
+
+| Variante | Equivale a |
+|---|---|
+| `sd` | `--detalle no` |
+| `hd` | `--detalle hd` (la versión original, solo como baseline) |
+| `hd2` | `--detalle hd2` |
+| `hd3` | `--detalle hd2 --cara` |
+| `hd3y` | `--detalle hd2 --cara --manos yolo` |
+| `hd3m` | `--detalle hd2 --cara --manos mesh` |
+| `hd3ym` | `--detalle hd2 --cara --manos ambas` |
+
+El builder rechaza las combinaciones imposibles en vez de generar un grafo roto:
+`--cara` y `--manos` viven **dentro** de la 2ª pasada, así que necesitan
+`--detalle hd2`; y `--sin-mascara` no es compatible con la 2ª pasada, porque el
+recorte reutiliza esa misma máscara (nodo `53`).
 
 ### Lo que funciona y lo que no (todo medido)
 
@@ -361,7 +514,9 @@ PERSONAJE ──► KSampler ──► BiRefNet ──► escalar ────�
 | img2img **con** máscara | ✅ Escenario intacto a cualquier denoise |
 | `OpenposePreprocessor` | ❌ Falla con anime, empeora la pose |
 | `DWPreprocessor` | ✅ La mejor pose de las tres |
-| Doble inpaint a 1024 | ✅ Mejora leve pero real |
+| Doble inpaint a 1024 (`hd`) | ⚠️ Mejora leve: deformaba el aspecto y usaba el prompt de escena |
+| Doble inpaint a 1536 con prompt propio (`hd2`) | ✅ La ganancia grande. Cara y pelo dibujados de verdad |
+| `FaceDetailer` sobre el recorte (`hd3`) | ✅ Mejora fina de ojos y pestañas, +3,5 s |
 | Identidad entre frames | ⚠️ Sin resolver sin LoRA |
 
 ### Por qué la máscara es obligatoria
@@ -397,12 +552,178 @@ reforzar los tags de atuendo con pesos, que es gratis.
 
 Si el personaje ocupa 640 px de un lienzo de 1024, en el latente son ~80×80
 posiciones para toda la figura: cara, manos y pies se quedan sin píxeles. La
-segunda pasada recorta la zona, la amplía a 1024, re-difunde a `denoise 0.35` y
-la pega de vuelta. Mismo principio que el `FaceDetailer` pero para el cuerpo
-entero.
+segunda pasada recorta la zona, la amplía, re-difunde y la pega de vuelta.
+Mismo principio que el `FaceDetailer` pero para el cuerpo entero.
 
-La ganancia es visible al 100% (mechones de pelo definidos, pliegues de tela)
-pero **modesta**. Cuanto menor sea el personaje dentro del plano, más compensa.
+Hay tres variantes, que genera `construir_wf.py`:
+
+| | Recorte ampliado a | Prompt | Denoise | Extra |
+|---|---|---|---|---|
+| `hd` | 1024×1024 **fijo** | el de la escena (nodos `40`/`41`) | 0.35 | — |
+| `hd2` | 1536 por el lado largo, **aspecto intacto** | propio del recorte (nodos `93`/`94`) | 0.45 | — |
+| `hd3` | igual que `hd2` | igual que `hd2` | 0.45 | `FaceDetailer` sobre el recorte |
+
+**`hd` daba poco por tres razones, y las tres eran arreglables:**
+
+1. **Deformaba.** El recorte real es `704×676` y se escalaba a `1024×1024`
+   fijo: se estiraba un 4% de ancho, se re-difundía deformado y se devolvía
+   estirado. `escalado()` en `construir_wf.py` lo escala ahora proporcional,
+   redondeando a múltiplo de 8.
+2. **Ampliaba poco.** 704→1024 es 1.45×; la cara seguía midiendo ~130 px. A
+   1536 son 2.2× y la cara pasa de 300 px, que ya es territorio donde el modelo
+   dibuja iris, pestañas y mechones separados.
+3. **Prompt equivocado.** Usaba el positivo de la escena
+   (*"sitting on the edge of the bed, bedroom, soft window light"*). En un
+   recorte ya cerrado sobre el personaje, eso gasta capacidad repintando fondo.
+   `hd2` usa un prompt propio, solo de personaje y detalle.
+
+`hd3` mete además un `FaceDetailer` **después** de ampliar el recorte, que es
+donde sale rentable: en el lienzo de 1024 la cara mide ~90 px y el detector
+tiene poco con lo que trabajar; sobre el recorte a 1536 mide ~300 px. Toca
+17k píxeles, todos dentro del bbox de la cara.
+
+### Manos: `hd3y`, `hd3m`, `hd3ym`
+
+Tres variantes más, todas encima de `hd3` y actuando sobre el recorte ya ampliado:
+
+| | Cómo encuentra la mano | Qué guía la re-difusión | Denoise |
+|---|---|---|---|
+| `hd3y` | detector `bbox/hand_yolov8s.pt` | solo el prompt | 0.30 |
+| `hd3m` | malla 3D de MeshGraphormer | **depth de la malla** por ControlNet union | 0.65 |
+| `hd3ym` | las dos, malla primero y detector después | — | — |
+
+`FaceDetailer` **no es específico de caras**: recorta lo que le marque el
+`bbox_detector`. Con el detector de manos hace exactamente lo mismo. Por eso
+`hd3y` son solo dos nodos.
+
+MeshGraphormer (el pipeline **HandRefiner**) ajusta una malla 3D a la mano y
+devuelve **dos** salidas: el mapa de profundidad y la máscara de la zona. Es una
+**guía de geometría, no un corrector**: la pasada de inpaint hace falta igual.
+Lo que sustituye es el detector, no la pasada.
+
+#### Los dos detectores fallan de forma distinta
+
+Medido sobre dos escenas, una con un puño pequeño y medio ocluido y otra con la
+mano abierta y grande:
+
+| | puño pequeño ocluido | mano abierta y grande |
+|---|---|---|
+| `hand_yolov8s` | detecta | detecta 2 manos, conf 0.87 |
+| MeshGraphormer | **no detecta a ningún umbral** (0.6 / 0.3 / 0.15) | detecta ya a 0.6 |
+
+> ⚠️ **MeshGraphormer falla en silencio.** Si no detecta, `get_depth` devuelve
+> `None` y el nodo rellena con `np.zeros_like`: **depth negro y máscara vacía**,
+> sin error ni aviso. La pasada entera se convierte en un ida y vuelta por el
+> VAE que solo cuesta tiempo. Si usas esta ruta, mira siempre la salida
+> `g_depth`: negra = no ha hecho nada.
+
+El umbral por defecto del nodo (`detect_thr=0.6`) es además demasiado estricto
+para anime — sobre la imagen completa detectaba 0 manos a 0.6 y 1 a 0.3 — así
+que `construir_wf.py` lo baja a `MESH_DETECT_THR = 0.3`. Aun así no salva el
+caso del puño ocluido. No es un problema de montaje: sobre una foto real el
+mismo detector encuentra 2 manos a 0.6.
+
+#### Qué elegir
+
+- La mano **borrosa por falta de píxeles** ya la arregla en gran parte `hd2`/`hd3`,
+  porque la re-difusión del cuerpo entero a 1536 también le toca. `hd3y` añade
+  contraste y separación entre dedos.
+- La mano **rota de anatomía** (dedos de más, fusionados) es el caso de
+  MeshGraphormer. Pero si la geometría ya era correcta, el depth no tiene nada
+  que corregir y solo cambia ligeramente la forma.
+
+**Recomendación: `hd3y`.** Detecta en los dos escenarios, cuesta 7 s y no tiene
+el modo de fallo mudo. Reserva `hd3m`/`hd3ym` para cuando veas manos rotas *y*
+bien visibles.
+
+### Resolución del personaje: dónde se pierde y qué la recupera
+
+El personaje se genera en su propio lienzo, se recorta con BiRefNet y se escala a
+una caja dentro del escenario. Se pierde resolución en **dos sitios distintos**, y
+cada palanca ataca uno:
+
+| Dónde | Qué pasa | Palanca |
+|---|---|---|
+| En la generación | Un cuerpo entero en `1024x1024` cuadrado solo ocupa una franja vertical; el resto son píxeles de fondo que BiRefNet tira después | `--vertical` (`832x1216`, ratio nativo SDXL) |
+| Al pegarlo | La caja de destino mide `640` sobre un lienzo de `1024` | `--lienzo 1536` |
+| Al final | — | `--upscale` (UltimateSDUpscale 2x sobre el compuesto) |
+
+Toda la geometría vive en **una sola función**, `aplicar_caja()` de
+`construir_wf.py`: coloca la caja del personaje sobre el escenario y devuelve la
+geometría resultante, para que quien tenga que recortar después (la 2ª pasada) no
+la recalcule por su cuenta y se desincronice. Antes esto estaba escrito en dos
+sitios —`escena.py` pisaba lo que hacía `construir_wf.py`— y la última escritura
+borraba a la anterior.
+
+Las 8 combinaciones, verificadas sobre el grafo (`python ab_resolucion.py`):
+
+| combo | generación | caja | lienzo | nodos | px de caja |
+|---|---|---|---|---|---|
+| base | 1024x1024 | 640x640 | 1024 | 59 | 409 600 |
+| `v` | 832x1216 | 440x640 | 1024 | 59 | 281 600 |
+| `l` | 1024x1024 | 960x960 | 1536 | 59 | 921 600 |
+| `vl` | 832x1216 | 656x960 | 1536 | 59 | 629 760 |
+| `u` | 1024x1024 | 640x640 | 1024 | 62 | 409 600 |
+| `vu` | 832x1216 | 440x640 | 1024 | 62 | 281 600 |
+| `lu` | 1024x1024 | 960x960 | 1536 | 62 | 921 600 |
+| `vlu` | 832x1216 | 656x960 | 1536 | 62 | 629 760 |
+
+**Cuidado al leer la columna de px:** en vertical la caja tiene *menos* píxeles
+(281k vs 409k) y aun así es la mejora. Lo que importa no son los píxeles de la
+caja sino los que caen **sobre la figura**: antes la silueta ocupaba una franja de
+un cuadrado, ahora llena la caja. No juzgues los combos por el tamaño de la caja.
+
+**`--bbox` no está implementado**, y el builder lanza `SystemExit` a propósito en
+vez de generar un grafo mudo. La idea: BiRefNet devuelve el recorte sobre el
+lienzo entero con alfa transparente, así que ese padding viaja hasta la caja de
+destino y se lleva buena parte de los píxeles útiles. Recortando a la silueta, la
+figura aprovecha la caja completa.
+
+Sondeado el worker vivo (`python sondear_nodos.py`), el nodo que lo hace es
+**`AILab_CropObject`** (de `ComfyUI-RMBG`, que ya instalamos con `FEAT_RMBG`):
+
+```
+AILab_CropObject   in: image:IMAGE, mask:MASK, padding:INT   out: IMAGE, MASK
+```
+
+Es el único candidato cableable tal cual. Los demás (`CropByBBoxes`,
+`ImageCropV2`) exigen un tipo `BOUNDING_BOX` que solo produce un detector
+(`rtdetr`/`sdpose`) o el editor manual del canvas, y `AILab_ImageCrop` recorta a
+coordenadas fijas, no al objeto.
+
+### Coste de cada variante
+
+Medido con `ab_detalle.py`, worker caliente y una seed distinta por variante
+(con la misma seed ComfyUI cachea el grafo y los tiempos salen sin sentido):
+
+| Variante | Tiempo | Sobre `sd` |
+|---|---|---|
+| `sd` (sin segunda pasada) | 9,0 s | — |
+| `hd` | 12,5 s | +3,5 s |
+| `hd2` | 18,5 s | +9,5 s |
+| `hd3` | 22,0 s | +13,0 s |
+| `hd3y` | 29,0 s | +20,0 s |
+| `hd3m` | 35,2 s | +26,2 s |
+| `hd3ym` | 43,0 s | +34,0 s |
+
+**`hd2` es el que compensa** y es el default de `correr.py`: se lleva casi toda
+la ganancia por 9,5 s. `hd3` añade una mejora fina en ojos y pestañas por 3,5 s
+más — vale la pena en una imagen suelta, no tanto en una secuencia de 8 frames.
+
+Para reproducir la comparación:
+
+```powershell
+python ab_detalle.py                                     # hd, hd2, hd3
+python ab_detalle.py --variantes hd3,hd3y,hd3m,hd3ym --out ab_manos
+```
+
+> ⚠️ **Al cronometrar, dale una seed distinta a cada variante.** Con la misma
+> seed ComfyUI cachea los nodos cuyos inputs no cambian y los tiempos salen sin
+> sentido: en una tanda llegó a salir `hd3` en 4,5 s porque reusaba el grafo
+> entero de la anterior.
+
+Deja `ab_detalle_full.png` (imagen entera) y `ab_detalle_zoom.png` (cara al
+200%), que es donde de verdad se ve la diferencia.
 
 ---
 
@@ -416,13 +737,56 @@ Dos partidas independientes:
 
 ### Disco
 
-Medido en un worker real: la imagen + venv + 7 GB de modelos ocupan **22 GB**.
-Por eso `DISK_SPACE=32` (10 GB de holgura para outputs y descargas). Pedir 60 GB
-era pagar el triple de lo necesario.
+Medido en el worker real (2026-08-16): con `VAST_DISK_SPACE=16` la imagen + venv
++ los modelos ocupaban **14 GB de 16**, o sea 2,9 GB libres, y tras bajar los
+pesos de MeshGraphormer quedaban **1,6 GB (91% usado)**. Demasiado justo, así que
+`VAST_DISK_SPACE` está ahora en **18**, donde el worker se queda sobre el 78%.
+
+**Cuánto disco pedir no afecta a la disponibilidad.** Las máquinas del pool
+ofrecen entre 288 y 1.352 GB, así que `disk_space>=16`, `>=24` o `>=60` devuelven
+exactamente las mismas 7 ofertas a los mismos precios. Lo único que cambia es la
+factura, que es `storage_cost × GB`:
+
+| `VAST_DISK_SPACE` | Coste al precio actual ($0,0267/GB/mes) | Tope con `storage_cost<=0.11` |
+|---|---|---|
+| 16 GB | $0,43/mes | $1,76/mes |
+| **18 GB** | **$0,48/mes** | **$1,98/mes** |
+| 24 GB | $0,64/mes | $2,64/mes |
+| 32 GB | $0,85/mes | $3,52/mes |
+
+18 GB deja el tope de disco en **$1,98/mes** sin perder ninguna oferta, y con
+los 14 GB que ocupa el stack completo (MeshGraphormer incluido) quedan ~4 GB
+libres. Si se añaden más modelos, subir a 24 cuesta 16 céntimos más al mes.
+
+> No hay escalón de **VRAM** entre 16 y 24 GB: el mercado salta de una a otra sin
+> nada en medio, así que pedir `gpu_ram>=18` es pedir `>=24`. Y ahí sí duele:
+> con `storage_cost<=0.125` la 24 GB más barata se va a **$0,288/h** frente a
+> $0,107/h. Esto es sobre **disco**, no sobre VRAM.
+
+> ⚠️ **Comprueba siempre el disco real con `df -h /` en el worker antes de
+> decidir**, no te fíes de este número. El README ya se quedó obsoleto una vez
+> (decía 32 GB cuando la instancia tenía 16).
+
+#### El techo de `storage_cost`
+
+Está en **`0.11`**, que a 18 GB topa la factura de disco en $1,98/mes. No se baja
+más a propósito:
+
+| `storage_cost<=` | Ofertas | Tope a 24 GB |
+|---|---|---|
+| 0.0625 | **1** ⚠️ | $1,13/mes |
+| 0.0834 | 2 | $1,50/mes |
+| **0.11** | **7** | **$1,98/mes** |
+| 0.125 (el anterior) | 7 | $2,25/mes |
+
+Con **una sola oferta viable el autoscaler relaja el tope de precio y alquila por
+encima de `dph_total`** (ver [El `verified=true` fantasma](#el-verifiedtrue-fantasma)),
+que es justo la sorpresa que se quiere evitar. `0.11` mantiene las mismas 7
+ofertas que el `0.125` anterior y baja el techo 27 céntimos: no cuesta nada.
 
 `storage_cost` va en **$/GB/mes** y la mediana del mercado es **0.20**, o sea
-$6.40/mes a 32 GB (y $12/mes a 60 GB). El filtro `storage_cost<=0.0625` lo topa
-en $2/mes.
+$3.20/mes a 16 GB (y $12/mes a los 60 GB de antes). El filtro
+`storage_cost<=0.0625` lo topa en $1/mes.
 
 ### Red
 
@@ -440,8 +804,8 @@ barato hay H100 a $4.26/h, y sin techo el autoscaler puede cogerlas.
 
 | | Antes | Ahora |
 |---|---|---|
-| Disco asignado | 60 GB | 32 GB |
-| Coste de disco | $12.00/mes | ~$0.85/mes |
+| Disco asignado | 60 GB | 18 GB |
+| Coste de disco | $12.00/mes | ~$0.48/mes |
 | GPU | $0.190/h | $0.136–0.201/h |
 | Total a 60 h/mes | $23.40 | ~$12.90 |
 
@@ -451,27 +815,61 @@ barato hay H100 a $4.26/h, y sin techo el autoscaler puede cogerlas.
 > parado la mayor parte del tiempo, prioriza el disco. Si le vas a meter muchas
 > horas, baja `dph_total` y acepta pagar más de disco.
 
-### El `verified=true` fantasma
+### `verified=true`: quitarlo salía carísimo
 
-`--no-default` en el **template** no basta: al actualizar el workergroup, Vast
-vuelve a inyectar `verified=true` en su `search_query`. Y ese filtro es
-demoledor con presupuestos ajustados:
+Durante un tiempo este repo **quitaba** `verified=true` del filtro, porque con el
+presupuesto de entonces dejaba una sola oferta:
 
 | | Ofertas ≤$0.15/h |
 |---|---|
-| con `verified=true` | **1** |
-| sin él | **7** (mejor a $0.109/h) |
+| con `verified=true` y `storage_cost<=0.11` | **1** ⚠️ |
+| sin `verified=true` | 7 (mejor a $0.109/h) |
 
-Con una sola oferta viable el autoscaler **relaja el tope de precio** y alquila
-máquinas por encima de `dph_total`. Así entró un worker a $0.201/h teniendo el
-tope en $0.15.
+El razonamiento era correcto en su mecanismo — **con una sola oferta viable el
+autoscaler relaja el tope de precio** y alquila por encima de `dph_total`; así
+entró un worker a $0.201/h teniendo el tope en $0.15 — pero la conclusión
+trataba el síntoma. El daño lo hacía **quedarse sin abanico de ofertas**, no la
+verificación.
 
-Por eso `renew_provisioning.py` pasa `--search_params ... -n` **también** al
-workergroup, no solo al template. Para comprobar que la query quedó limpia:
+**Y quitar `verified` tenía un coste oculto mucho peor: workers inservibles.**
+Medido el 2026-08-16 con dos máquinas no verificadas seguidas (139268 y 147722):
+ambas anunciaban puertos directos (`direct_port_count` 100 y 200) que en
+realidad estaban **filtrados**. El worker provisiona bien, el pyworker arranca,
+el autoscaler lo marca `idle` y enruta a `https://<ip>:<puerto>`… pero ese
+puerto da *timeout* desde cualquier red externa, así que **el pyworker recibe
+cero requests** (`num_requests_recieved: 0`) y cada llamada muere por timeout.
+
+La palanca buena es `storage_cost`, que cuesta céntimos:
+
+| Configuración | Ofertas | GPU más barata | Tope disco a 18 GB |
+|---|---|---|---|
+| sin `verified`, `storage<=0.11` | 7 | $0.107/h | $1.98/mes |
+| **`verified`, `storage<=0.20`** ← actual | **11** | **$0.108/h** | $3.60/mes |
+| `verified`, `storage<=0.11` | **1** ⚠️ | $0.134/h | $1.98/mes |
+
+Aflojando el disco se recupera el abanico **y** el precio de GPU queda igual
+($0.108 vs $0.107). Se paga como mucho $1.62/mes más de disco a cambio de que
+las máquinas funcionen.
+
+#### Cómo se diagnostica esto rápido
+
+El síntoma es un request que se cuelga y muere con
+`TimeoutError: Timed out after 61.4s waiting for worker`, con el worker en
+`idle`. Comprobaciones, en orden:
 
 ```powershell
-vastai show workergroups --raw    # 'verified' no debe aparecer en search_query
+# 1. que URL entrega el autoscaler, y esta abierto ese puerto?
+python -c "import socket;socket.create_connection(('<ip>',<puerto>),10)"
+
+# 2. desde fuera de tu red, por si el bloqueo es tuyo
+curl -s "https://check-host.net/check-tcp?host=<ip>:<puerto>&max_nodes=3"
 ```
+
+Dentro del worker, el pyworker habla **HTTPS**, no HTTP: `curl -k
+https://127.0.0.1:3000/health` devuelve **404** cuando está sano (esa ruta no
+existe, pero responder ya prueba que vive). Con `http://` da *Empty reply from
+server* y parece caído sin estarlo. Y `/workspace/pyworker.log` trae un
+`num_requests_recieved` que dice si le llega algo.
 
 ### Interruptible: no está soportado
 
@@ -507,6 +905,51 @@ Y desde fuera: `image_runtype` en `vastai show instances --raw` dice
 Arreglo: que el `onstart` del template llame a `entrypoint.sh &` y luego a
 `start_server.sh`, como arriba.
 
+**La otra causa, y la que de verdad muerde: el host tiene la red mala.** Mismo
+script, mismo template, misma imagen — y sale bucle infinito o ciclo limpio según
+la máquina que te toque. Medido el 2026-08-16 con dos instancias seguidas:
+
+| | host malo (`47857982`) | host bueno (`47861232`) |
+|---|---|---|
+| Velocidad real | ~350 KB/s | ~45 MB/s |
+| `pip install` del Impact-Pack | ~15 min | segundos |
+| Modelos de R2 (10 GB) | nunca llegó | 3,7 min |
+| Resultado | 3 timeouts → `destroying` | `PROVISIONING_OK` en 14 min |
+
+El autoscaler tiene un **timeout de carga fijo de 791 s** (~13,2 min) que no
+aparece en la config del endpoint y no es configurable desde ahí. Al agotarse hace
+`restart_instance` (no `destroy`), así que el contenedor se reinicia y el
+provisioning **vuelve a empezar desde cero**. Tres fallos seguidos y sí destruye la
+máquina. Con 350 KB/s el pip solo ya come 15 min: bucle infinito garantizado.
+
+Cómo distinguir "colgado" de "lento", desde el worker:
+
+```bash
+ps -eo pid,ppid,etime,stat,args --forest       # ¿hay un hijo de pip vivo?
+ls -l /proc/<pid>/fd                           # ¿qué .whl está bajando?
+stat -c %s <whl>; sleep 20; stat -c %s <whl>   # velocidad real
+cat /proc/net/dev                              # bytes totales de la instancia
+```
+
+El log parece congelado porque `PIP_ARGS` llevaba `-q`: en modo silencioso pip no
+escribe nada durante minutos aunque esté progresando. Ahora usa `--progress-bar off`
+y el `watch_progress` reporta cada 2 min al canal de Discord.
+
+**Lo que sí ayuda** (aplicado): caché de pip persistente en
+`$WORKSPACE_DIR/.cache/pip` vía `PIP_CACHE_DIR`, en vez de `--no-cache-dir`. Como
+`restart_instance` conserva `/workspace`, el 2º intento reaprovecha los wheels ya
+bajados y entra de sobra en el timeout. Da tres oportunidades (~45 min) para
+converger antes de que el autoscaler destruya la máquina.
+
+**Lo que NO ayuda, comprobado:** mover los wheels a R2. R2 va a 361 KB/s desde el
+worker malo — *exactamente igual de lento que PyPI* (320 KB/s), y con 4 conexiones
+en paralelo suma ~730 KB/s (~2x, no 4x). El cuello es el ancho de banda de la
+instancia, no el origen. Tampoco lo arregla el filtro del workergroup:
+`search_query` filtra por `inet_down_cost<=0.005` (precio de la red, no velocidad)
+y las 10 ofertas del pool ya anuncian `inet_down` entre 190 y 1368 Mbit/s. El host
+malo anunciaba **1376 Mbit/s** y entregaba 3. El dato es autodeclarado y no hay
+filtro que te salve.
+
 ### `HF_TOKEN must be set when BACKEND is set!`
 
 Validación de `start_server.sh` del pyworker. Exige que exista `HF_TOKEN` si
@@ -517,6 +960,47 @@ env del template.
 
 Normal, no es un fallo. Con `min_load=0` el autoscaler apaga los workers cuando
 no hay carga y los deja en frío. El siguiente request lo despierta.
+
+**Y sale muy barato dejarlo así.** Una instancia parada solo paga el disco:
+
+| Estado | Coste | Al mes |
+|---|---|---|
+| Encendida | `dph_total` 0,125 $/h | ~90 $ |
+| Parada (solo disco) | `storage_total_cost` 0,005 $/h | ~3,60 $ |
+
+25 veces más barato, y conserva `/workspace` entero: los modelos en
+`/workspace/ComfyUI/models` y la caché de pip. Un arranque desde parada se salta
+los ~22 GB de descarga y los minutos de pip. Eso es exactamente lo que hace el
+autoscaler con `cold_workers=1`; el problema es que para conservar una máquina
+parada primero tiene que haberla dado por buena una vez — es la recompensa de que
+el provisioning termine bien, no una alternativa a arreglarlo.
+
+Avisos: una instancia parada **no reserva la GPU**. El host puede alquilar ese
+hardware a otro y entonces no arranca cuando la quieras encender. Es barato
+precisamente porque no garantiza nada.
+
+### Avisos de Discord
+
+El provisioning reporta al canal por webhook: arranque, cada hito de las 5 fases,
+progreso cada 2 min (tamaño de la caché de pip, de los modelos, disco libre y la
+última línea viva del log), `PROVISIONING_OK`, fallo con el bloque de log, y un
+centinela que sigue vivo después para avisar de encendido, caída y apagado.
+
+Se configura con `DISCORD_WEBHOOK` en el `.env`. **Viaja por el env del template**,
+no dentro del `.sh`: ese fichero se sirve desde una URL pública de R2 y cualquiera
+podría leerlo. `renew_provisioning.py` lo mete en el `template_env` al publicar; si
+no está definido, el provisioning no notifica y funciona igual (todo el bloque es
+un no-op).
+
+Dos detalles que costaron sangre:
+
+- **Discord devuelve `403 Forbidden` al `User-Agent` por defecto de urllib**
+  (`Python-urllib/3.x`). Hay que mandar cabecera propia:
+  `headers={"User-Agent": "mizuki-provision/1.0"}` → `204`. Mismo patrón que
+  Cloudflare/R2, donde se usa `curl/8.0`.
+- **El webhook nunca puede tumbar el provisioning.** El script corre con
+  `set -euo pipefail`; todos los emisores acaban en `|| true` y con timeout corto,
+  probado con webhook roto y con webhook vacío (`exit 0` en ambos casos).
 
 ### `invalid template hash or id`
 
@@ -543,14 +1027,24 @@ súbelo a R2 y lanza `vastai update workers $VAST_WORKERGROUP_ID`.
 
 ## Mantenimiento pendiente
 
-- [ ] **`PROVISIONING_SCRIPT` es una presigned que caduca a los 7 días** (máximo
-      que permite SigV4). Mitigado: `python renew_provisioning.py` renueva el
-      ciclo entero en un comando, pero hay que acordarse cada semana.
-      Para quitarse el problema del todo: dashboard de Cloudflare → R2 → bucket
-      `mizuki` → Settings → *Public Development URL* → Enable, y cambiar
-      `PROVISIONING_SCRIPT` por
-      `https://pub-XXXX.r2.dev/comfy-stack/scripts/serverless_provision.sh`
-      (permanente y sin query string).
+- [x] ~~`PROVISIONING_SCRIPT` es una presigned que caduca a los 7 días.~~
+      Resuelto: el bucket sirve por *Public Development URL* y la URL es
+      permanente. `renew_provisioning.py` sigue siendo el comando para publicar
+      (sube a R2, verifica el contenido y re-apunta template + workergroup), pero
+      ya no hay nada que renovar por calendario.
+- [ ] **Paralelizar el provisioning.** Hoy las 5 fases van en serie. La fase 3
+      (custom nodes: PyPI + GitHub) y la fase 4 (modelos de R2) no dependen una de
+      otra y usan recursos distintos; solaparlas quita del camino crítico la más
+      corta. El bucle de `URL_FILES` (pesos sueltos de HuggingFace) son `curl` uno
+      detrás de otro y se paraleliza en cuatro líneas. Techo real medido: **~2x**,
+      no 4x — el cuello es el ancho de banda de la instancia, no el número de
+      flujos. **No paralelizar dos `pip install` sobre el mismo venv**: se pisan en
+      `site-packages` y dan entornos corruptos de forma intermitente. Y el
+      `trap on_err` con procesos en segundo plano necesita `wait` explícito, o los
+      fallos dejan de avisar.
+- [ ] **`--bbox` sin implementar.** Ya está identificado el nodo
+      (`AILab_CropObject`, ver *Resolución del personaje*); falta cablearlo entre
+      BiRefNet y el escalado a la caja.
 - [ ] **`HF_TOKEN=hf_placeholder_not_used`** en el template. Sustituir por uno
       real si algún día se añaden descargas desde HuggingFace.
 - [ ] Las URLs de las imágenes generadas caducan a los 7 días. Si hay que

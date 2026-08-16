@@ -18,50 +18,126 @@ set -euo pipefail
 # CONFIGURACION - esto es lo unico que normalmente hay que tocar
 # =============================================================================
 
-# Modelos a bajar de R2.   "<clave en el bucket>|<ruta relativa dentro de models/>"
+# --- FUNCIONALIDADES ---------------------------------------------------------
+# true/false por caracteristica. Cada una arrastra sus modelos, sus custom nodes
+# y sus paquetes pip; apagar la que no uses ahorra disco y arranque en frio.
+# El flag del cliente que activa cada una va en el comentario.
+#
+#   IMPORTANTE: apagar una aqui NO cambia los workflows. Si mandas un workflow
+#   que usa algo apagado, ComfyUI falla con el nombre del modelo o del nodo.
+FEAT_UPSCALE=true          # UltimateSDUpscale de wf.json            67 MB
+FEAT_RMBG=true             # BiRefNet, recorta al personaje         ~1 GB
+FEAT_CONTROLNET=true       # ControlNet union, lo pide cualquier --pose  2,5 GB
+FEAT_POSE_DWPOSE=true      # --pose dwpose                          351 MB
+FEAT_POSE_OPENPOSE=false   # --pose openpose: FALLA con anime       ~430 MB
+FEAT_CARA=true             # --cara (FaceDetailer)                   52 MB
+FEAT_MANOS_YOLO=true       # --manos yolo                            22 MB
+FEAT_MANOS_MESH=true       # --manos mesh (MeshGraphormer)         1,37 GB
+
+on() { [ "${1:-false}" = "true" ]; }
+
+# --- Modelos de R2.  "<clave en el bucket>|<ruta relativa dentro de models/>" --
 MODELS=(
   "comfy-stack/models/checkpoints/waiIllustriousSDXL_v170.safetensors|checkpoints/waiIllustriousSDXL_v170.safetensors"
   "comfy-stack/models/loras/stuffy_ai_style_ilxl_v2_goofy.safetensors|loras/stuffy_ai_style_ilxl_v2_goofy.safetensors"
-  "comfy-stack/models/ultralytics/bbox/face_yolov8m.pt|ultralytics/bbox/face_yolov8m.pt"
-  "comfy-stack/models/upscale_models/4x_NMKD-Siax_200k.pth|upscale_models/4x_NMKD-Siax_200k.pth"
-  # Quitado de fondo con BiRefNet (nodo BiRefNetRMBG). Espejados en R2 para no
-  # depender de HuggingFace, que si no se bajarian en el primer request.
-  # Los .py y el config.json son obligatorios: sin ellos el modelo no carga.
-  "comfy-stack/models/RMBG/BiRefNet/BiRefNet-general.safetensors|RMBG/BiRefNet/BiRefNet-general.safetensors"
-  "comfy-stack/models/RMBG/BiRefNet/BiRefNet_config.py|RMBG/BiRefNet/BiRefNet_config.py"
-  "comfy-stack/models/RMBG/BiRefNet/birefnet.py|RMBG/BiRefNet/birefnet.py"
-  "comfy-stack/models/RMBG/BiRefNet/birefnet_lite.py|RMBG/BiRefNet/birefnet_lite.py"
-  "comfy-stack/models/RMBG/BiRefNet/config.json|RMBG/BiRefNet/config.json"
-  # ControlNet Union: openpose, depth, canny... todo en un modelo
-  "comfy-stack/models/controlnet/controlnet-union-sdxl-1.0.safetensors|controlnet/controlnet-union-sdxl-1.0.safetensors"
 )
+if on "$FEAT_CARA"; then
+  MODELS+=("comfy-stack/models/ultralytics/bbox/face_yolov8m.pt|ultralytics/bbox/face_yolov8m.pt")
+fi
+if on "$FEAT_UPSCALE"; then
+  MODELS+=("comfy-stack/models/upscale_models/4x_NMKD-Siax_200k.pth|upscale_models/4x_NMKD-Siax_200k.pth")
+fi
+if on "$FEAT_RMBG"; then
+  # Espejados en R2 para no depender de HuggingFace, que si no se bajarian en el
+  # primer request. Los .py y el config.json son obligatorios: sin ellos no carga.
+  MODELS+=(
+    "comfy-stack/models/RMBG/BiRefNet/BiRefNet-general.safetensors|RMBG/BiRefNet/BiRefNet-general.safetensors"
+    "comfy-stack/models/RMBG/BiRefNet/BiRefNet_config.py|RMBG/BiRefNet/BiRefNet_config.py"
+    "comfy-stack/models/RMBG/BiRefNet/birefnet.py|RMBG/BiRefNet/birefnet.py"
+    "comfy-stack/models/RMBG/BiRefNet/birefnet_lite.py|RMBG/BiRefNet/birefnet_lite.py"
+    "comfy-stack/models/RMBG/BiRefNet/config.json|RMBG/BiRefNet/config.json"
+  )
+fi
+if on "$FEAT_CONTROLNET"; then
+  # Union: openpose, depth, canny... todo en un modelo. La pasada de manos
+  # 'mesh' lo usa en modo depth, asi que tambien lo necesita.
+  MODELS+=("comfy-stack/models/controlnet/controlnet-union-sdxl-1.0.safetensors|controlnet/controlnet-union-sdxl-1.0.safetensors")
+fi
 
-# Ficheros que NO van bajo models/. Ruta relativa a COMFY_DIR.
-# Los anotadores de controlnet_aux viven dentro del propio custom node; si no
-# se pre-bajan aqui, el nodo los descarga de HuggingFace en pleno request.
-EXTRA_FILES=(
-  "comfy-stack/custom_nodes/comfyui_controlnet_aux/ckpts/lllyasviel/Annotators/body_pose_model.pth|custom_nodes/comfyui_controlnet_aux/ckpts/lllyasviel/Annotators/body_pose_model.pth"
-  "comfy-stack/custom_nodes/comfyui_controlnet_aux/ckpts/lllyasviel/Annotators/hand_pose_model.pth|custom_nodes/comfyui_controlnet_aux/ckpts/lllyasviel/Annotators/hand_pose_model.pth"
-  "comfy-stack/custom_nodes/comfyui_controlnet_aux/ckpts/lllyasviel/Annotators/facenet.pth|custom_nodes/comfyui_controlnet_aux/ckpts/lllyasviel/Annotators/facenet.pth"
-)
+# --- Ficheros de R2 que NO van bajo models/. Ruta relativa a COMFY_DIR. -------
+EXTRA_FILES=()
+if on "$FEAT_POSE_OPENPOSE"; then
+  EXTRA_FILES+=(
+    "comfy-stack/custom_nodes/comfyui_controlnet_aux/ckpts/lllyasviel/Annotators/body_pose_model.pth|custom_nodes/comfyui_controlnet_aux/ckpts/lllyasviel/Annotators/body_pose_model.pth"
+    "comfy-stack/custom_nodes/comfyui_controlnet_aux/ckpts/lllyasviel/Annotators/hand_pose_model.pth|custom_nodes/comfyui_controlnet_aux/ckpts/lllyasviel/Annotators/hand_pose_model.pth"
+    "comfy-stack/custom_nodes/comfyui_controlnet_aux/ckpts/lllyasviel/Annotators/facenet.pth|custom_nodes/comfyui_controlnet_aux/ckpts/lllyasviel/Annotators/facenet.pth"
+  )
+fi
 
-# Custom nodes.  "<repo git>|<directorio>|<recursive>|<norequirements>"
+# --- Descargas por URL directa.  "<url>|<ruta relativa a COMFY_DIR>" ----------
+# Para pesos publicos de HuggingFace que no merece la pena espejar en R2. A
+# diferencia de MODELS/EXTRA_FILES no se comprueba el tamano contra un origen,
+# solo se salta si el fichero ya existe.
+AUX_CKPTS="custom_nodes/comfyui_controlnet_aux/ckpts"
+URL_FILES=()
+if on "$FEAT_POSE_DWPOSE"; then
+  # Sin esto el nodo se los baja de HuggingFace EN PLENO REQUEST (medido: el
+  # worker los tenia sin estar en el provisioning).
+  URL_FILES+=(
+    "https://huggingface.co/yzd-v/DWPose/resolve/main/yolox_l.onnx|$AUX_CKPTS/yzd-v/DWPose/yolox_l.onnx"
+    "https://huggingface.co/yzd-v/DWPose/resolve/main/dw-ll_ucoco_384.onnx|$AUX_CKPTS/yzd-v/DWPose/dw-ll_ucoco_384.onnx"
+  )
+fi
+if on "$FEAT_MANOS_YOLO"; then
+  URL_FILES+=("https://huggingface.co/Bingsu/adetailer/resolve/main/hand_yolov8s.pt|models/ultralytics/bbox/hand_yolov8s.pt")
+fi
+if on "$FEAT_MANOS_MESH"; then
+  # El tercer fichero de ese repo (control_sd15_inpaint_depth_hand, 722MB) NO
+  # hace falta: es el ControlNet de SD1.5 y aqui se usa el union SDXL en depth.
+  URL_FILES+=(
+    "https://huggingface.co/hr16/ControlNet-HandRefiner-pruned/resolve/main/graphormer_hand_state_dict.bin|$AUX_CKPTS/hr16/ControlNet-HandRefiner-pruned/graphormer_hand_state_dict.bin"
+    "https://huggingface.co/hr16/ControlNet-HandRefiner-pruned/resolve/main/hrnetv2_w64_imagenet_pretrained.pth|$AUX_CKPTS/hr16/ControlNet-HandRefiner-pruned/hrnetv2_w64_imagenet_pretrained.pth"
+  )
+fi
+
+# --- Custom nodes.  "<repo git>|<directorio>|<recursive>|<norequirements>" ----
 #   recursive       -> clonar con submodulos
 #   norequirements  -> NO instalar su requirements.txt; las deps van en PIP_EXTRA
-NODES=(
-  "https://github.com/ltdrdata/ComfyUI-Impact-Pack.git|ComfyUI-Impact-Pack||"
-  "https://github.com/ltdrdata/ComfyUI-Impact-Subpack.git|ComfyUI-Impact-Subpack||"
-  "https://github.com/ssitu/ComfyUI_UltimateSDUpscale.git|ComfyUI_UltimateSDUpscale|recursive|"
+NODES=()
+if on "$FEAT_CARA" || on "$FEAT_MANOS_YOLO"; then
+  # FaceDetailer y UltralyticsDetectorProvider. FaceDetailer NO es especifico de
+  # caras: con un bbox_detector de manos hace la pasada de manos.
+  NODES+=(
+    "https://github.com/ltdrdata/ComfyUI-Impact-Pack.git|ComfyUI-Impact-Pack||"
+    "https://github.com/ltdrdata/ComfyUI-Impact-Subpack.git|ComfyUI-Impact-Subpack||"
+  )
+fi
+if on "$FEAT_UPSCALE"; then
+  NODES+=("https://github.com/ssitu/ComfyUI_UltimateSDUpscale.git|ComfyUI_UltimateSDUpscale|recursive|")
+fi
+if on "$FEAT_RMBG"; then
   # El requirements.txt de RMBG arrastra onnxruntime-gpu, groundingdino-py,
   # decord y SAM2/SAM3: ~2GB que no usamos. Solo queremos BiRefNet.
-  "https://github.com/1038lab/ComfyUI-RMBG.git|ComfyUI-RMBG||norequirements"
-  # anotadores de pose/depth para ControlNet
-  "https://github.com/Fannovel16/comfyui_controlnet_aux.git|comfyui_controlnet_aux||"
-)
+  NODES+=("https://github.com/1038lab/ComfyUI-RMBG.git|ComfyUI-RMBG||norequirements")
+fi
+if on "$FEAT_POSE_DWPOSE" || on "$FEAT_POSE_OPENPOSE" || on "$FEAT_MANOS_MESH"; then
+  # anotadores de pose/depth para ControlNet; MeshGraphormer vive aqui dentro
+  NODES+=("https://github.com/Fannovel16/comfyui_controlnet_aux.git|comfyui_controlnet_aux||")
+fi
 
-# Paquetes pip extra que necesitan los nodos de arriba
-PIP_EXTRA=(ultralytics opencv-python-headless scipy scikit-image spandrel boto3
-           huggingface-hub transparent-background transformers)
+# --- Paquetes pip extra que necesitan los nodos de arriba --------------------
+PIP_EXTRA=(opencv-python-headless scipy scikit-image spandrel boto3 huggingface-hub
+           transformers)
+if on "$FEAT_CARA" || on "$FEAT_MANOS_YOLO"; then
+  PIP_EXTRA+=(ultralytics)
+fi
+if on "$FEAT_RMBG"; then
+  PIP_EXTRA+=(transparent-background)
+fi
+if on "$FEAT_MANOS_MESH"; then
+  # Sin estos, el nodo los instala por pip EN PLENO REQUEST.
+  PIP_EXTRA+=(mediapipe trimesh)
+fi
 
 # Checkpoint que usa el workflow de benchmark (tiene que estar en MODELS)
 BENCHMARK_CKPT="waiIllustriousSDXL_v170.safetensors"
@@ -75,10 +151,93 @@ MODEL_LOG="${MODEL_LOG:-/var/log/portal/comfyui.log}"
 mkdir -p "$(dirname "$MODEL_LOG")"
 
 log() { echo "[$(date '+%Y-%m-%d %H:%M:%S')] provision: $1" | tee -a "$MODEL_LOG"; }
-on_err() { log "[ERROR] fallo en la linea $1 (exit $2) - el worker NO se marcara ready"; }
+
+# --- notificaciones a Discord ------------------------------------------------
+# El webhook NO se escribe aqui: este fichero se publica en una URL R2 publica.
+# Llega por el entorno del template (-e DISCORD_WEBHOOK=...). Si no esta, todo
+# lo de abajo es un no-op y el provisioning sigue igual.
+DISCORD_WEBHOOK="${DISCORD_WEBHOOK:-}"
+T0=$(date +%s)
+WHO="${CONTAINER_ID:-${VAST_CONTAINERLABEL:-$(hostname)}}"
+GPU=$(nvidia-smi --query-gpu=name --format=csv,noheader 2>/dev/null | head -1)
+IP=$(curl -s -m 5 https://api.ipify.org 2>/dev/null || echo "?")
+
+elapsed() { printf '%dm%02ds' $(( ($(date +%s) - T0) / 60 )) $(( ($(date +%s) - T0) % 60 )); }
+
+# manda un mensaje. Blindado: red mala, 429 o webhook borrado nunca pueden
+# tumbar el provisioning (de ahi el || true y el timeout corto).
+dc() {
+    [ -n "$DISCORD_WEBHOOK" ] || return 0
+    python3 - "$DISCORD_WEBHOOK" "$1" <<'PY' >/dev/null 2>&1 || true
+import json, sys, urllib.request
+url, content = sys.argv[1], sys.argv[2][:1900]
+body = json.dumps({"content": content, "username": "mizuki-provision",
+                   "allowed_mentions": {"parse": []}}).encode()
+try:
+    urllib.request.urlopen(urllib.request.Request(
+        url, data=body, headers={"Content-Type": "application/json",
+                                 # sin User-Agent propio Discord devuelve 403
+                                 "User-Agent": "mizuki-provision/1.0"}), timeout=10).read()
+except Exception:
+    pass
+PY
+}
+
+# hito = al log del worker Y al canal
+hito() { log "$1"; dc "[$WHO $(elapsed)] $1"; }
+
+# vuelca las ultimas lineas del log dentro de un bloque de codigo
+dc_log() {
+    [ -n "$DISCORD_WEBHOOK" ] || return 0
+    local n="${1:-40}" cola
+    cola=$(tail -n "$n" "$MODEL_LOG" 2>/dev/null | tail -c 1500)
+    dc "\`\`\`$(printf '%s' "$cola")\`\`\`"
+}
+
+on_err() {
+    log "[ERROR] fallo en la linea $1 (exit $2) - el worker NO se marcara ready"
+    dc ":x: **provisioning FALLO** \`$WHO\` linea $1 (exit $2) tras $(elapsed) - el worker no se marca ready"
+    dc_log 40
+    ERR_YA_AVISADO=1
+}
 trap 'on_err $LINENO $?' ERR
 
+# --- poll de progreso ---------------------------------------------------------
+# pip y las descargas de R2 pasan minutos sin escribir nada; sin esto el canal
+# (y el log) parecen colgados cuando en realidad hay trabajo. Reporta cada 2 min
+# el tamano de la cache de pip, de models/ y la ultima linea viva del log.
+watch_progress() {
+    local prev="" ahora
+    while sleep 120; do
+        ahora="pip:$(du -sm "${PIP_CACHE_DIR:-/tmp}" 2>/dev/null | cut -f1)MB"
+        ahora="$ahora models:$(du -sm "${MODELS_DIR:-/tmp}" 2>/dev/null | cut -f1)MB"
+        ahora="$ahora libre:$(df -h "$WORKSPACE_DIR" 2>/dev/null | awk 'NR==2{print $4}')"
+        if [ "$ahora" = "$prev" ]; then
+            dc ":hourglass: [$WHO $(elapsed)] $ahora _(sin cambios)_ · $(tail -n 1 "$MODEL_LOG" 2>/dev/null | tail -c 200)"
+        else
+            dc ":arrow_forward: [$WHO $(elapsed)] $ahora · $(tail -n 1 "$MODEL_LOG" 2>/dev/null | tail -c 200)"
+        fi
+        prev="$ahora"
+    done
+}
+
+dc ":rocket: **provisioning ARRANCA** \`$WHO\` · ${GPU:-GPU?} · IP $IP"
 log "=== inicio ==="
+watch_progress & WATCH_PID=$!
+
+# Los 'exit 1' explicitos (credenciales, ComfyUI no encontrado, pip) NO disparan
+# el trap ERR, solo el EXIT. Aqui se cierra ese hueco: cualquier salida != 0 que
+# no venga ya de on_err se reporta con su cola de log.
+ERR_YA_AVISADO=0
+on_exit() {
+    local st=$?
+    kill "$WATCH_PID" 2>/dev/null || true
+    if [ "$st" != 0 ] && [ "$ERR_YA_AVISADO" = 0 ]; then
+        dc ":x: **provisioning ABORTADO** \`$WHO\` (exit $st) tras $(elapsed)"
+        dc_log 40
+    fi
+}
+trap on_exit EXIT
 
 # --- venv de la imagen -------------------------------------------------------
 if [ -f /venv/main/bin/activate ]; then
@@ -86,7 +245,16 @@ if [ -f /venv/main/bin/activate ]; then
     . /venv/main/bin/activate
     log "venv /venv/main activado"
 fi
-PIP_ARGS="--no-cache-dir -q"
+# Cache de pip en disco persistente. El autoscaler mata la carga a los ~791s y
+# hace restart_instance; con --no-cache-dir cada reinicio volvia a bajar los
+# mismos wheels desde cero (142 MB directos, ~15 min en un host a 350 KB/s) y
+# nunca cabia en el timeout: bucle infinito. Con cache, el 2o intento reaprovecha
+# lo ya bajado y converge aunque el host tenga la red mala.
+export PIP_CACHE_DIR="$WORKSPACE_DIR/.cache/pip"
+mkdir -p "$PIP_CACHE_DIR"
+# sin -q: en modo silencioso pip no escribe nada durante minutos y el log parece
+# colgado cuando en realidad esta progresando.
+PIP_ARGS="--cache-dir $PIP_CACHE_DIR --progress-bar off"
 [ -n "${VIRTUAL_ENV:-}" ] || PIP_ARGS="$PIP_ARGS --break-system-packages"
 
 # --- [1/5] localizar ComfyUI -------------------------------------------------
@@ -101,7 +269,7 @@ fi
 MODELS_DIR="$COMFY_DIR/models"
 NODES_DIR="$COMFY_DIR/custom_nodes"
 mkdir -p "$MODELS_DIR"/{checkpoints,loras,upscale_models} "$MODELS_DIR/ultralytics/bbox" "$NODES_DIR"
-log "[1/5] COMFY_DIR=$COMFY_DIR"
+hito "[1/5] COMFY_DIR=$COMFY_DIR"
 
 # --- [2/5] validar credenciales S3 antes de nada ------------------------------
 missing=""
@@ -112,7 +280,7 @@ if [ -n "$missing" ]; then
     log "[ERROR] faltan variables de entorno S3:$missing"
     exit 1
 fi
-log "[2/5] credenciales S3 presentes (bucket=$S3_BUCKET_NAME)"
+hito "[2/5] credenciales S3 presentes (bucket=$S3_BUCKET_NAME)"
 
 # --- [3/5] custom nodes ------------------------------------------------------
 install_node() {
@@ -136,7 +304,8 @@ install_node() {
     fi
 }
 
-for entry in "${NODES[@]}"; do
+for entry in "${NODES[@]:-}"; do
+    [ -n "$entry" ] || continue          # el array puede quedar vacio por un toggle
     IFS='|' read -r repo name recursive norequirements <<< "$entry"
     install_node "$repo" "$name" "$recursive" "$norequirements"
 done
@@ -144,20 +313,23 @@ done
 # shellcheck disable=SC2086
 pip install $PIP_ARGS --no-build-isolation "${PIP_EXTRA[@]}" \
     || { log "[ERROR] fallo instalando dependencias de nodos"; exit 1; }
-log "[3/5] custom nodes listos (${#NODES[@]})"
+hito "[3/5] custom nodes listos (${#NODES[@]})"
 
 # --- [4/5] modelos desde R2 --------------------------------------------------
 export COMFY_MODELS_DIR="$MODELS_DIR"
 # Se pasa a python un "clave|destino ABSOLUTO" por linea. MODELS va relativo a
 # models/ y EXTRA_FILES relativo a COMFY_DIR, pero aqui ya se resuelven los dos.
 COMFY_MODEL_LIST=$(
-    for e in "${MODELS[@]}"; do
+    # Ojo con el 'if': un '[ -n "$k" ] && echo' que falle en la ULTIMA vuelta
+    # hace que la sustitucion entera salga con codigo 1 y, con set -e, mata el
+    # provisioning. Pasa en cuanto un array queda vacio por un toggle en false.
+    for e in "${MODELS[@]:-}"; do
         IFS='|' read -r k r <<< "$e"
-        [ -n "$k" ] && echo "$k|$MODELS_DIR/$r"
+        if [ -n "$k" ]; then echo "$k|$MODELS_DIR/$r"; fi
     done
     for e in "${EXTRA_FILES[@]:-}"; do
         IFS='|' read -r k r <<< "$e"
-        [ -n "$k" ] && echo "$k|$COMFY_DIR/$r"
+        if [ -n "$k" ]; then echo "$k|$COMFY_DIR/$r"; fi
     done
 )
 export COMFY_MODEL_LIST
@@ -222,7 +394,30 @@ if errors:
     sys.exit(1)
 print("MODELOS_OK")
 PY
-log "[4/5] modelos listos"
+
+# Descargas por URL directa (HuggingFace publico). Se hacen despues de R2 para
+# que un fallo aqui no invalide lo ya bajado, pero cuentan igual: si falla una,
+# el worker no se marca listo.
+for e in "${URL_FILES[@]:-}"; do
+    IFS='|' read -r url rel <<< "$e"
+    [ -n "$url" ] || continue
+    dst="$COMFY_DIR/$rel"
+    if [ -s "$dst" ]; then
+        log "  ok (cache) $rel"
+        continue
+    fi
+    mkdir -p "$(dirname "$dst")"
+    if curl -fsSL --retry 3 -o "$dst.part" "$url"; then
+        mv "$dst.part" "$dst"
+        log "  ok (descargado $(du -h "$dst" | cut -f1)) $rel"
+    else
+        rm -f "$dst.part"
+        log "[ERROR] no se pudo bajar $url"
+        exit 1
+    fi
+done
+
+hito "[4/5] modelos listos"
 
 # --- [5/5] workflow de benchmark para el pyworker -----------------------------
 # El pyworker (BACKEND=comfyui-json) usa este JSON para medir el rendimiento de
@@ -260,7 +455,7 @@ for _ in $(seq 1 120); do
 done
 if [ -d "$BENCH_DIR" ]; then
     echo "$BENCH_JSON" > "$BENCH_DIR/benchmark.json"
-    log "[5/5] benchmark.json escrito en $BENCH_DIR"
+    hito "[5/5] benchmark.json escrito en $BENCH_DIR"
 else
     log "[WARN] $BENCH_DIR no aparecio en 120s; se usara el benchmark por defecto"
 fi
@@ -272,4 +467,72 @@ if [ -d /opt/comfyui-api-wrapper/payloads ]; then
     log "payload de smoke test en /opt/comfyui-api-wrapper/payloads/mizuki_smoke.json"
 fi
 
-log "=== PROVISIONING_OK ==="
+hito "=== PROVISIONING_OK ==="
+
+# --- centinela de ciclo de vida ----------------------------------------------
+# El provisioning termina aqui, pero ComfyUI tarda todavia en abrir el 18188 y
+# el contenedor puede morir despues (el autoscaler hace restart_instance a los
+# ~791s de carga). Este proceso sobrevive al script para avisar de encendido,
+# caida y apagado. El webhook se escribe en disco del worker, nunca en el .sh
+# publico de R2.
+if [ -n "$DISCORD_WEBHOOK" ]; then
+    cat > "$WORKSPACE_DIR/discord_sentinel.sh" <<'SENT'
+#!/bin/bash
+# arg1: webhook  arg2: etiqueta del worker
+W="$1"; WHO="$2"; T0=$(date +%s)
+el() { printf '%dm%02ds' $(( ($(date +%s)-T0)/60 )) $(( ($(date +%s)-T0)%60 )); }
+send() {
+    python3 - "$W" "$1" <<'PY' >/dev/null 2>&1 || true
+import json, sys, urllib.request
+url, content = sys.argv[1], sys.argv[2][:1900]
+body = json.dumps({"content": content, "username": "mizuki-worker",
+                   "allowed_mentions": {"parse": []}}).encode()
+try:
+    urllib.request.urlopen(urllib.request.Request(
+        url, data=body, headers={"Content-Type": "application/json",
+                                 # sin User-Agent propio Discord devuelve 403
+                                 "User-Agent": "mizuki-provision/1.0"}), timeout=10).read()
+except Exception:
+    pass
+PY
+}
+vivo() { [ "$(curl -s -m 8 -o /dev/null -w '%{http_code}' http://127.0.0.1:18188/object_info)" = "200" ]; }
+bye() { send ":octagonal_sign: **worker APAGANDOSE** \`$WHO\` (senal recibida tras $(el) de vida)"; exit 0; }
+trap bye TERM HUP INT
+
+# 1) esperar a que ComfyUI abra (hasta 60 min)
+arriba=0
+for _ in $(seq 1 240); do
+    if vivo; then arriba=1; break; fi
+    sleep 15
+done
+if [ "$arriba" = 1 ]; then
+    send ":white_check_mark: **ComfyUI ARRIBA** \`$WHO\` en $(el) desde el fin del provisioning"
+else
+    send ":warning: **ComfyUI no abrio el 18188** \`$WHO\` tras $(el)"
+    tail -n 25 /var/log/portal/comfyui.log 2>/dev/null | { c=$(cat); send "\`\`\`${c: -1400}\`\`\`"; }
+    exit 0
+fi
+
+# 2) vigilar caidas (3 fallos seguidos = caido; se avisa una sola vez por estado)
+fallos=0; estado=ok
+while sleep 60; do
+    if vivo; then
+        fallos=0
+        [ "$estado" = caido ] && { send ":arrows_counterclockwise: **ComfyUI recuperado** \`$WHO\`"; estado=ok; }
+    else
+        fallos=$((fallos+1))
+        if [ "$fallos" -ge 3 ] && [ "$estado" = ok ]; then
+            estado=caido
+            send ":x: **ComfyUI dejo de responder** \`$WHO\` (3 sondeos seguidos)"
+            tail -n 25 /var/log/portal/comfyui.log 2>/dev/null | { c=$(cat); send "\`\`\`${c: -1400}\`\`\`"; }
+        fi
+    fi
+done
+SENT
+    chmod +x "$WORKSPACE_DIR/discord_sentinel.sh"
+    setsid nohup "$WORKSPACE_DIR/discord_sentinel.sh" "$DISCORD_WEBHOOK" "$WHO" \
+        >/dev/null 2>&1 < /dev/null &
+    disown 2>/dev/null || true
+    log "centinela de Discord lanzado"
+fi

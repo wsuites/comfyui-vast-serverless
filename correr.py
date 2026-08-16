@@ -18,6 +18,7 @@ from vastai import Serverless
 
 HERE = Path(__file__).parent
 from config import ENDPOINT_NAME as ENDPOINT
+from construir_wf import escalado, DETALLE_RES2, anadir_flags, desde_flags
 LIENZO = 1024
 MARGEN = 32
 
@@ -104,6 +105,16 @@ def construir(base: dict, a, x: int, pose: str) -> dict:
                 wf[n]["inputs"]["height"] = ch
         wf["90"]["inputs"]["width"] = cw
         wf["90"]["inputs"]["height"] = ch
+        # hd2/hd3: el recorte ampliado sigue el aspecto del recorte, no es cuadrado
+        if "93" in wf:
+            dw, dh = escalado(cw, ch, DETALLE_RES2)
+            for n in ("82", "84"):
+                wf[n]["inputs"]["width"] = dw
+                wf[n]["inputs"]["height"] = dh
+            wf["93"]["inputs"]["text"] = (
+                f"masterpiece, best quality, solo, 1girl, {IDENTIDAD}, {pose}, "
+                "(detailed face:1.2), detailed eyes, detailed hands, detailed skin, "
+                "detailed fabric folds, sharp focus, high detail")
     return wf
 
 
@@ -124,7 +135,7 @@ def salidas(res):
 
 async def main() -> int:
     p = argparse.ArgumentParser()
-    p.add_argument("--workflow", default="wf_v_dwpose_hd.json")
+    anadir_flags(p)
     p.add_argument("--frames", type=int, default=8)
     p.add_argument("--denoise", type=float, default=0.85)
     p.add_argument("--tam", type=int, default=560)
@@ -138,7 +149,7 @@ async def main() -> int:
     p.add_argument("--timeout", type=float, default=900.0)
     a = p.parse_args()
 
-    base = json.loads((HERE / a.workflow).read_text(encoding="utf-8"))
+    base = desde_flags(a)
     dst = HERE / a.out
     dst.mkdir(parents=True, exist_ok=True)
 
