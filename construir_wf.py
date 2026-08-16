@@ -42,6 +42,7 @@ DETALLE_DENOISE = 0.45
 #   upscale   UltimateSDUpscale sobre el compuesto final.
 PERSONAJE_VERTICAL = (832, 1216)   # ratio nativo SDXL para figura de pie
 LIENZO_GRANDE = 1536
+BBOX_PADDING = 8     # px de aire alrededor de la silueta al recortar (--bbox)
 UPSCALE_MODELO = "4x_NMKD-Siax_200k.pth"
 
 # El prompt de la segunda pasada no debe describir el escenario: el recorte ya
@@ -112,8 +113,14 @@ def aplicar_caja(wf: dict, tam: int = 640, x: int = 200, y: int = 380,
     else:
         cw = ch = tam
     for n in ("26", "28"):
-        wf[n]["inputs"]["width"] = cw
-        wf[n]["inputs"]["height"] = ch
+        # con --bbox estos dos dejan de ser ImageScale y pasan a ser
+        # ResizeAndPadImage, que llama a lo mismo target_width/target_height
+        if wf[n]["class_type"] == "ResizeAndPadImage":
+            wf[n]["inputs"]["target_width"] = cw
+            wf[n]["inputs"]["target_height"] = ch
+        else:
+            wf[n]["inputs"]["width"] = cw
+            wf[n]["inputs"]["height"] = ch
     for n in ("30", "51"):
         if n in wf:
             wf[n]["inputs"]["x"] = x
@@ -153,13 +160,38 @@ def con_bbox(wf: dict) -> dict:
     produce un detector (rtdetr/sdpose) o el editor manual del canvas;
     AILab_ImageCrop recorta a coordenadas fijas, no al objeto.
 
-    PENDIENTE: cablearlo y medir. Un nodo mal cableado tumba el request entero,
-    asi que la primera prueba va contra un worker vivo, no a ciegas.
+    Recortar a la silueta obliga ademas a cambiar el escalado. La caja (26/28)
+    tiene un aspecto fijo y el bbox no: si se sigue estirando con ImageScale, el
+    personaje sale deformado y se pierde justo lo que se gana. Por eso 26/28
+    pasan a ResizeAndPadImage (comfy_extras.nodes_images), que mete la figura
+    dentro de la caja MANTENIENDO el aspecto y rellena lo que sobra de negro.
+
+        ResizeAndPadImage
+            req: image:IMAGE, target_width:INT, target_height:INT,
+                 padding_color:white|black, interpolation:...|lanczos
+            out: IMAGE
+
+    El relleno negro es inocuo: la mascara (28) se rellena igual, y negro = 0 =
+    "no pegues nada aqui", asi que el compuesto no ve el borde.
     """
-    raise SystemExit(
-        "--bbox todavia no esta implementado. El nodo es AILab_CropObject "
-        "(image, mask, padding -> IMAGE, MASK); falta cablearlo entre BiRefNet "
-        "(25) y el escalado de la caja (26/28).")
+    # el 32 esta libre y cae dentro del bloque del personaje (26-31). OJO: el
+    # 55 NO lo esta, lo ocupa un MaskToImage de la 2a pasada.
+    if "32" in wf:
+        raise SystemExit("con_bbox: el nodo 32 ya existe, busca otro id libre")
+    wf["32"] = {"class_type": "AILab_CropObject",
+                "inputs": {"image": ["25", 0], "mask": ["25", 1],
+                           "padding": BBOX_PADDING},
+                "_meta": {"title": "recorte a la silueta del personaje"}}
+    cw = wf["26"]["inputs"].get("width", 640)
+    ch = wf["26"]["inputs"].get("height", 640)
+    for n, fuente in (("26", ["32", 0]), ("28", ["27", 0])):
+        wf[n] = {"class_type": "ResizeAndPadImage",
+                 "inputs": {"image": fuente, "target_width": cw,
+                            "target_height": ch, "padding_color": "black",
+                            "interpolation": "lanczos"},
+                 "_meta": {"title": wf[n].get("_meta", {}).get("title", "")}}
+    wf["27"]["inputs"]["mask"] = ["32", 1]
+    return wf
 
 
 def con_lienzo(wf: dict, lado: int, tam: int = 640, x: int = 200, y: int = 380,
