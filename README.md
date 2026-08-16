@@ -248,6 +248,56 @@ en el worker. Si no, ComfyUI falla con el nombre del que falta.
 Los modelos ya descargados se saltan comparando tamaño con el de R2, así que
 añadir uno nuevo no vuelve a bajar los 7 GB.
 
+### Probar un modelo sin reprovisionar
+
+Para **pruebas**, no merece la pena tocar `serverless_provision.sh`: eso dispara
+el reemplazo del worker, un arranque en frío y volver a bajar los ~7 GB. Se baja
+el modelo directamente al worker vivo por SSH:
+
+```bash
+ssh -i ~/.ssh/xcl -o IdentitiesOnly=yes -p <puerto> root@<ip>
+curl -sL -o /workspace/ComfyUI/models/ultralytics/bbox/hand_yolov8s.pt \
+  https://huggingface.co/Bingsu/adetailer/resolve/main/hand_yolov8s.pt
+```
+
+**ComfyUI recoge el fichero nuevo sin reiniciar**; se comprueba con
+`curl -s http://127.0.0.1:18188/object_info/UltralyticsDetectorProvider`.
+
+El puerto y la IP salen de `vastai show instances --raw` (campo `ports`); ojo
+que el `ssh_host`/`ssh_port` que muestra la CLI es el proxy, y el mapeo directo
+del 22 suele ser otro. La clave que funciona es `~/.ssh/xcl`.
+
+> Dos callejones sin salida ya comprobados: `vastai attach ssh` sobre una
+> instancia **ya corriendo** devuelve `success` pero **no propaga la clave**, y
+> `vastai execute` solo funciona con instancias **paradas**.
+
+> ⚠️ Lo bajado así **no sobrevive al reemplazo del worker**. Cuando la prueba
+> convenza, hazlo permanente y lanza `renew_provisioning.py --update-workers`.
+
+Para hacerlo permanente hay dos sitios en `serverless_provision.sh`:
+
+- **`MODELS`** / **`EXTRA_FILES`** — ficheros espejados en R2. Verifican tamaño
+  contra el origen y se saltan si ya están.
+- **`URL_FILES`** — descarga directa por URL, para pesos públicos de HuggingFace
+  que no merece la pena espejar. Formato `<url>|<ruta relativa a COMFY_DIR>`.
+  Solo se salta si el fichero ya existe; no compara tamaños.
+
+`hand_yolov8s.pt` ya está en `URL_FILES`. Los dos pesos de MeshGraphormer están
+ahí **comentados**: descoméntalos si quieres las variantes `mesh`/`ambas`, pero
+son 1,37 GB.
+
+Lo que hace falta para las variantes de manos, si se quieren hacer permanentes:
+
+| Ruta | Ficheros | Tamaño |
+|---|---|---|
+| `hd3y` (yolo) | `Bingsu/adetailer` → `hand_yolov8s.pt` | 22 MB |
+| `hd3m` (MeshGraphormer) | `hr16/ControlNet-HandRefiner-pruned` → `graphormer_hand_state_dict.bin` + `hrnetv2_w64_imagenet_pretrained.pth` | 856 + 513 MB |
+
+El tercer fichero de ese repo, `control_sd15_inpaint_depth_hand_fp16.safetensors`
+(722 MB), **no hace falta**: es el ControlNet de SD1.5 y aquí se usa el union
+SDXL en modo depth. `mediapipe` y `trimesh` ya están en la imagen; si no
+estuvieran, el nodo los instala por pip **en pleno request**.
+
 ### Añadir un custom node
 
 Una línea en el array `NODES`, formato `<repo>|<directorio>|<recursive>`:
@@ -346,11 +396,63 @@ PERSONAJE ──► KSampler ──► BiRefNet ──► escalar ────�
 
 | | |
 |---|---|
-| `construir_wf.py` | Genera las variantes del workflow |
-| `wf_v_dwpose_hd.json` | **La configuración recomendada** |
+| `construir_wf.py` | **Arma el workflow** encendiendo/apagando cada parte |
 | `escena.py` | Runner con `--sweep` de denoise |
+| `ab_detalle.py` | A/B de la segunda pasada, con tiempos |
 | `frames.py` | Secuencia de poses en un set fijo |
 | `correr.py` | Secuencia de movimiento (personaje cruzando la escena) |
+| `wf_v_<pose>_<variante>.json` | La matriz pregenerada, para el A/B y para inspeccionar a mano |
+
+### Interruptores
+
+Todo el pipeline se enciende y se apaga con los mismos flags, y significan lo
+mismo en `construir_wf.py`, `escena.py` y `correr.py`:
+
+| Flag | Valores | Default | Qué hace |
+|---|---|---|---|
+| `--pose` | `none` / `openpose` / `dwpose` | `dwpose` | Guía de pose por ControlNet |
+| `--detalle` | `no` / `hd` / `hd2` | `hd2` | 2ª pasada sobre el recorte del personaje |
+| `--cara` | flag | off | `FaceDetailer` **dentro** de la 2ª pasada |
+| `--manos` | `yolo` / `mesh` / `ambas` | off | Pasada de manos **dentro** de la 2ª pasada |
+| `--sin-mascara` | flag | off | Quita `SetLatentNoiseMask` (deforma el escenario) |
+| `--variante` | ver abajo | — | Atajo con nombre |
+| `--workflow` | ruta | — | Usa un `.json` ya hecho e ignora todo lo anterior |
+
+El **escenario → personaje → collage** es la base del pipeline y no se apaga:
+es lo que hace el propio grafo. Lo que sí se apaga es la máscara que protege el
+escenario en la fusión.
+
+```powershell
+# escribir un workflow concreto
+python construir_wf.py --pose dwpose --detalle hd2 --cara --manos yolo -o mi_wf.json
+
+# lo mismo, con el atajo
+python construir_wf.py --variante hd3y -o mi_wf.json
+
+# sin escribir fichero: los runners lo arman en memoria
+python escena.py --pose dwpose --detalle hd2 --cara --manos yolo --denoise 0.85
+python correr.py --variante hd3y --frames 8
+
+# regenerar la matriz entera (3 poses x 7 variantes)
+python construir_wf.py --matriz
+```
+
+Los atajos de `--variante` son combinaciones con nombre de los flags de arriba:
+
+| Variante | Equivale a |
+|---|---|
+| `sd` | `--detalle no` |
+| `hd` | `--detalle hd` (la versión original, solo como baseline) |
+| `hd2` | `--detalle hd2` |
+| `hd3` | `--detalle hd2 --cara` |
+| `hd3y` | `--detalle hd2 --cara --manos yolo` |
+| `hd3m` | `--detalle hd2 --cara --manos mesh` |
+| `hd3ym` | `--detalle hd2 --cara --manos ambas` |
+
+El builder rechaza las combinaciones imposibles en vez de generar un grafo roto:
+`--cara` y `--manos` viven **dentro** de la 2ª pasada, así que necesitan
+`--detalle hd2`; y `--sin-mascara` no es compatible con la 2ª pasada, porque el
+recorte reutiliza esa misma máscara (nodo `53`).
 
 ### Lo que funciona y lo que no (todo medido)
 
@@ -361,7 +463,9 @@ PERSONAJE ──► KSampler ──► BiRefNet ──► escalar ────�
 | img2img **con** máscara | ✅ Escenario intacto a cualquier denoise |
 | `OpenposePreprocessor` | ❌ Falla con anime, empeora la pose |
 | `DWPreprocessor` | ✅ La mejor pose de las tres |
-| Doble inpaint a 1024 | ✅ Mejora leve pero real |
+| Doble inpaint a 1024 (`hd`) | ⚠️ Mejora leve: deformaba el aspecto y usaba el prompt de escena |
+| Doble inpaint a 1536 con prompt propio (`hd2`) | ✅ La ganancia grande. Cara y pelo dibujados de verdad |
+| `FaceDetailer` sobre el recorte (`hd3`) | ✅ Mejora fina de ojos y pestañas, +3,5 s |
 | Identidad entre frames | ⚠️ Sin resolver sin LoRA |
 
 ### Por qué la máscara es obligatoria
@@ -397,12 +501,123 @@ reforzar los tags de atuendo con pesos, que es gratis.
 
 Si el personaje ocupa 640 px de un lienzo de 1024, en el latente son ~80×80
 posiciones para toda la figura: cara, manos y pies se quedan sin píxeles. La
-segunda pasada recorta la zona, la amplía a 1024, re-difunde a `denoise 0.35` y
-la pega de vuelta. Mismo principio que el `FaceDetailer` pero para el cuerpo
-entero.
+segunda pasada recorta la zona, la amplía, re-difunde y la pega de vuelta.
+Mismo principio que el `FaceDetailer` pero para el cuerpo entero.
 
-La ganancia es visible al 100% (mechones de pelo definidos, pliegues de tela)
-pero **modesta**. Cuanto menor sea el personaje dentro del plano, más compensa.
+Hay tres variantes, que genera `construir_wf.py`:
+
+| | Recorte ampliado a | Prompt | Denoise | Extra |
+|---|---|---|---|---|
+| `hd` | 1024×1024 **fijo** | el de la escena (nodos `40`/`41`) | 0.35 | — |
+| `hd2` | 1536 por el lado largo, **aspecto intacto** | propio del recorte (nodos `93`/`94`) | 0.45 | — |
+| `hd3` | igual que `hd2` | igual que `hd2` | 0.45 | `FaceDetailer` sobre el recorte |
+
+**`hd` daba poco por tres razones, y las tres eran arreglables:**
+
+1. **Deformaba.** El recorte real es `704×676` y se escalaba a `1024×1024`
+   fijo: se estiraba un 4% de ancho, se re-difundía deformado y se devolvía
+   estirado. `escalado()` en `construir_wf.py` lo escala ahora proporcional,
+   redondeando a múltiplo de 8.
+2. **Ampliaba poco.** 704→1024 es 1.45×; la cara seguía midiendo ~130 px. A
+   1536 son 2.2× y la cara pasa de 300 px, que ya es territorio donde el modelo
+   dibuja iris, pestañas y mechones separados.
+3. **Prompt equivocado.** Usaba el positivo de la escena
+   (*"sitting on the edge of the bed, bedroom, soft window light"*). En un
+   recorte ya cerrado sobre el personaje, eso gasta capacidad repintando fondo.
+   `hd2` usa un prompt propio, solo de personaje y detalle.
+
+`hd3` mete además un `FaceDetailer` **después** de ampliar el recorte, que es
+donde sale rentable: en el lienzo de 1024 la cara mide ~90 px y el detector
+tiene poco con lo que trabajar; sobre el recorte a 1536 mide ~300 px. Toca
+17k píxeles, todos dentro del bbox de la cara.
+
+### Manos: `hd3y`, `hd3m`, `hd3ym`
+
+Tres variantes más, todas encima de `hd3` y actuando sobre el recorte ya ampliado:
+
+| | Cómo encuentra la mano | Qué guía la re-difusión | Denoise |
+|---|---|---|---|
+| `hd3y` | detector `bbox/hand_yolov8s.pt` | solo el prompt | 0.30 |
+| `hd3m` | malla 3D de MeshGraphormer | **depth de la malla** por ControlNet union | 0.65 |
+| `hd3ym` | las dos, malla primero y detector después | — | — |
+
+`FaceDetailer` **no es específico de caras**: recorta lo que le marque el
+`bbox_detector`. Con el detector de manos hace exactamente lo mismo. Por eso
+`hd3y` son solo dos nodos.
+
+MeshGraphormer (el pipeline **HandRefiner**) ajusta una malla 3D a la mano y
+devuelve **dos** salidas: el mapa de profundidad y la máscara de la zona. Es una
+**guía de geometría, no un corrector**: la pasada de inpaint hace falta igual.
+Lo que sustituye es el detector, no la pasada.
+
+#### Los dos detectores fallan de forma distinta
+
+Medido sobre dos escenas, una con un puño pequeño y medio ocluido y otra con la
+mano abierta y grande:
+
+| | puño pequeño ocluido | mano abierta y grande |
+|---|---|---|
+| `hand_yolov8s` | detecta | detecta 2 manos, conf 0.87 |
+| MeshGraphormer | **no detecta a ningún umbral** (0.6 / 0.3 / 0.15) | detecta ya a 0.6 |
+
+> ⚠️ **MeshGraphormer falla en silencio.** Si no detecta, `get_depth` devuelve
+> `None` y el nodo rellena con `np.zeros_like`: **depth negro y máscara vacía**,
+> sin error ni aviso. La pasada entera se convierte en un ida y vuelta por el
+> VAE que solo cuesta tiempo. Si usas esta ruta, mira siempre la salida
+> `g_depth`: negra = no ha hecho nada.
+
+El umbral por defecto del nodo (`detect_thr=0.6`) es además demasiado estricto
+para anime — sobre la imagen completa detectaba 0 manos a 0.6 y 1 a 0.3 — así
+que `construir_wf.py` lo baja a `MESH_DETECT_THR = 0.3`. Aun así no salva el
+caso del puño ocluido. No es un problema de montaje: sobre una foto real el
+mismo detector encuentra 2 manos a 0.6.
+
+#### Qué elegir
+
+- La mano **borrosa por falta de píxeles** ya la arregla en gran parte `hd2`/`hd3`,
+  porque la re-difusión del cuerpo entero a 1536 también le toca. `hd3y` añade
+  contraste y separación entre dedos.
+- La mano **rota de anatomía** (dedos de más, fusionados) es el caso de
+  MeshGraphormer. Pero si la geometría ya era correcta, el depth no tiene nada
+  que corregir y solo cambia ligeramente la forma.
+
+**Recomendación: `hd3y`.** Detecta en los dos escenarios, cuesta 7 s y no tiene
+el modo de fallo mudo. Reserva `hd3m`/`hd3ym` para cuando veas manos rotas *y*
+bien visibles.
+
+### Coste de cada variante
+
+Medido con `ab_detalle.py`, worker caliente y una seed distinta por variante
+(con la misma seed ComfyUI cachea el grafo y los tiempos salen sin sentido):
+
+| Variante | Tiempo | Sobre `sd` |
+|---|---|---|
+| `sd` (sin segunda pasada) | 9,0 s | — |
+| `hd` | 12,5 s | +3,5 s |
+| `hd2` | 18,5 s | +9,5 s |
+| `hd3` | 22,0 s | +13,0 s |
+| `hd3y` | 29,0 s | +20,0 s |
+| `hd3m` | 35,2 s | +26,2 s |
+| `hd3ym` | 43,0 s | +34,0 s |
+
+**`hd2` es el que compensa** y es el default de `correr.py`: se lleva casi toda
+la ganancia por 9,5 s. `hd3` añade una mejora fina en ojos y pestañas por 3,5 s
+más — vale la pena en una imagen suelta, no tanto en una secuencia de 8 frames.
+
+Para reproducir la comparación:
+
+```powershell
+python ab_detalle.py                                     # hd, hd2, hd3
+python ab_detalle.py --variantes hd3,hd3y,hd3m,hd3ym --out ab_manos
+```
+
+> ⚠️ **Al cronometrar, dale una seed distinta a cada variante.** Con la misma
+> seed ComfyUI cachea los nodos cuyos inputs no cambian y los tiempos salen sin
+> sentido: en una tanda llegó a salir `hd3` en 4,5 s porque reusaba el grafo
+> entero de la anterior.
+
+Deja `ab_detalle_full.png` (imagen entera) y `ab_detalle_zoom.png` (cara al
+200%), que es donde de verdad se ve la diferencia.
 
 ---
 
@@ -416,13 +631,55 @@ Dos partidas independientes:
 
 ### Disco
 
-Medido en un worker real: la imagen + venv + 7 GB de modelos ocupan **22 GB**.
-Por eso `DISK_SPACE=32` (10 GB de holgura para outputs y descargas). Pedir 60 GB
-era pagar el triple de lo necesario.
+Medido en el worker real (2026-08-16): con `VAST_DISK_SPACE=16` la imagen + venv
++ los modelos ocupaban **14 GB de 16**, o sea 2,9 GB libres, y tras bajar los
+pesos de MeshGraphormer quedaban **1,6 GB (91% usado)**. Demasiado justo, así que
+`VAST_DISK_SPACE` está ahora en **24**.
+
+**Cuánto disco pedir no afecta a la disponibilidad.** Las máquinas del pool
+ofrecen entre 288 y 1.352 GB, así que `disk_space>=16`, `>=24` o `>=60` devuelven
+exactamente las mismas 7 ofertas a los mismos precios. Lo único que cambia es la
+factura, que es `storage_cost × GB`:
+
+| `VAST_DISK_SPACE` | Coste al precio actual ($0,0267/GB/mes) | Tope con `storage_cost<=0.11` |
+|---|---|---|
+| 16 GB | $0,43/mes | $1,76/mes |
+| 18 GB | $0,48/mes | $1,98/mes |
+| **24 GB** | **$0,64/mes** | **$2,64/mes** |
+| 32 GB | $0,85/mes | $3,52/mes |
+
+Se descartó 18 GB: solo da 2 GB extra y MeshGraphormer se come 1,37 GB. Por 16
+céntimos más al mes, 24 GB deja 8 GB de holgura real.
+
+> No hay escalón de **VRAM** entre 16 y 24 GB: el mercado salta de una a otra sin
+> nada en medio, así que pedir `gpu_ram>=18` es pedir `>=24`. Y ahí sí duele:
+> con `storage_cost<=0.125` la 24 GB más barata se va a **$0,288/h** frente a
+> $0,107/h. Esto es sobre **disco**, no sobre VRAM.
+
+> ⚠️ **Comprueba siempre el disco real con `df -h /` en el worker antes de
+> decidir**, no te fíes de este número. El README ya se quedó obsoleto una vez
+> (decía 32 GB cuando la instancia tenía 16).
+
+#### El techo de `storage_cost`
+
+Está en **`0.11`**, que a 24 GB topa la factura de disco en $2,64/mes. No se baja
+más a propósito:
+
+| `storage_cost<=` | Ofertas | Tope a 24 GB |
+|---|---|---|
+| 0.0625 | **1** ⚠️ | $1,50/mes |
+| 0.0834 | 2 | $2,00/mes |
+| **0.11** | **7** | **$2,64/mes** |
+| 0.125 (el anterior) | 7 | $3,00/mes |
+
+Con **una sola oferta viable el autoscaler relaja el tope de precio y alquila por
+encima de `dph_total`** (ver [El `verified=true` fantasma](#el-verifiedtrue-fantasma)),
+que es justo la sorpresa que se quiere evitar. `0.11` mantiene las mismas 7
+ofertas que el `0.125` anterior y baja el techo 36 céntimos: no cuesta nada.
 
 `storage_cost` va en **$/GB/mes** y la mediana del mercado es **0.20**, o sea
-$6.40/mes a 32 GB (y $12/mes a 60 GB). El filtro `storage_cost<=0.0625` lo topa
-en $2/mes.
+$3.20/mes a 16 GB (y $12/mes a los 60 GB de antes). El filtro
+`storage_cost<=0.0625` lo topa en $1/mes.
 
 ### Red
 
@@ -440,8 +697,8 @@ barato hay H100 a $4.26/h, y sin techo el autoscaler puede cogerlas.
 
 | | Antes | Ahora |
 |---|---|---|
-| Disco asignado | 60 GB | 32 GB |
-| Coste de disco | $12.00/mes | ~$0.85/mes |
+| Disco asignado | 60 GB | 24 GB |
+| Coste de disco | $12.00/mes | ~$0.64/mes |
 | GPU | $0.190/h | $0.136–0.201/h |
 | Total a 60 h/mes | $23.40 | ~$12.90 |
 

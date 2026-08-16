@@ -45,6 +45,24 @@ EXTRA_FILES=(
   "comfy-stack/custom_nodes/comfyui_controlnet_aux/ckpts/lllyasviel/Annotators/facenet.pth|custom_nodes/comfyui_controlnet_aux/ckpts/lllyasviel/Annotators/facenet.pth"
 )
 
+# Ficheros que se bajan por URL directa en vez de R2. Ruta relativa a COMFY_DIR.
+#   "<url>|<ruta relativa a COMFY_DIR>"
+# Se usa para pesos publicos de HuggingFace que no merece la pena espejar. A
+# diferencia de MODELS/EXTRA_FILES no se comprueba el tamano contra un origen,
+# solo se salta si el fichero ya existe.
+#
+# Descomenta el bloque de MeshGraphormer si quieres la ruta 'mesh'/'ambas' de la
+# pasada de manos. Son 1,37 GB: comprueba antes que VAST_DISK_SPACE da de si.
+# El tercer fichero de ese repo (control_sd15_inpaint_depth_hand, 722MB) NO
+# hace falta: es el ControlNet de SD1.5 y aqui se usa el union SDXL en depth.
+URL_FILES=(
+  # detector de manos para la pasada 'yolo' (variantes hd3y / hd3ym)
+  "https://huggingface.co/Bingsu/adetailer/resolve/main/hand_yolov8s.pt|models/ultralytics/bbox/hand_yolov8s.pt"
+  # --- MeshGraphormer / HandRefiner (variantes hd3m / hd3ym) ---
+  # "https://huggingface.co/hr16/ControlNet-HandRefiner-pruned/resolve/main/graphormer_hand_state_dict.bin|custom_nodes/comfyui_controlnet_aux/ckpts/hr16/ControlNet-HandRefiner-pruned/graphormer_hand_state_dict.bin"
+  # "https://huggingface.co/hr16/ControlNet-HandRefiner-pruned/resolve/main/hrnetv2_w64_imagenet_pretrained.pth|custom_nodes/comfyui_controlnet_aux/ckpts/hr16/ControlNet-HandRefiner-pruned/hrnetv2_w64_imagenet_pretrained.pth"
+)
+
 # Custom nodes.  "<repo git>|<directorio>|<recursive>|<norequirements>"
 #   recursive       -> clonar con submodulos
 #   norequirements  -> NO instalar su requirements.txt; las deps van en PIP_EXTRA
@@ -222,6 +240,29 @@ if errors:
     sys.exit(1)
 print("MODELOS_OK")
 PY
+
+# Descargas por URL directa (HuggingFace publico). Se hacen despues de R2 para
+# que un fallo aqui no invalide lo ya bajado, pero cuentan igual: si falla una,
+# el worker no se marca listo.
+for e in "${URL_FILES[@]:-}"; do
+    IFS='|' read -r url rel <<< "$e"
+    [ -n "$url" ] || continue
+    dst="$COMFY_DIR/$rel"
+    if [ -s "$dst" ]; then
+        log "  ok (cache) $rel"
+        continue
+    fi
+    mkdir -p "$(dirname "$dst")"
+    if curl -fsSL --retry 3 -o "$dst.part" "$url"; then
+        mv "$dst.part" "$dst"
+        log "  ok (descargado $(du -h "$dst" | cut -f1)) $rel"
+    else
+        rm -f "$dst.part"
+        log "[ERROR] no se pudo bajar $url"
+        exit 1
+    fi
+done
+
 log "[4/5] modelos listos"
 
 # --- [5/5] workflow de benchmark para el pyworker -----------------------------

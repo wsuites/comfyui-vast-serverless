@@ -23,6 +23,8 @@ from vastai import Serverless
 
 HERE = Path(__file__).parent
 from config import ENDPOINT_NAME as ENDPOINT
+from construir_wf import (escalado, LIENZO, MARGEN, DETALLE_RES2,
+                          anadir_flags, desde_flags)
 
 
 def api_key() -> str:
@@ -36,7 +38,7 @@ def api_key() -> str:
 
 
 def construir(a) -> dict:
-    wf = json.loads((HERE / a.workflow).read_text(encoding="utf-8"))
+    wf = desde_flags(a)
     if a.escena:
         wf["10"]["inputs"]["text"] = a.escena
     if a.personaje:
@@ -55,6 +57,24 @@ def construir(a) -> dict:
     if "51" in wf:                      # variante enmascarada
         wf["51"]["inputs"]["x"] = a.x
         wf["51"]["inputs"]["y"] = a.y
+    if "80" in wf:                      # variantes hd/hd2/hd3: recorte de detalle
+        cx = max(0, a.x - MARGEN)
+        cy = max(0, a.y - MARGEN)
+        cw = min(LIENZO - cx, a.tam + 2 * MARGEN)
+        ch = min(LIENZO - cy, a.tam + 2 * MARGEN)
+        for n in ("80", "81"):
+            wf[n]["inputs"].update(x=cx, y=cy, width=cw, height=ch)
+        wf["91"]["inputs"].update(x=cx, y=cy)
+        wf["90"]["inputs"].update(width=cw, height=ch)
+        if "93" in wf:                  # hd2/hd3: aspecto y prompt propios
+            dw, dh = escalado(cw, ch, DETALLE_RES2)
+            for n in ("82", "84"):
+                wf[n]["inputs"].update(width=dw, height=dh)
+            if a.prompt_detalle:
+                wf["93"]["inputs"]["text"] = a.prompt_detalle
+        else:                           # hd: escalado cuadrado, como estaba
+            for n in ("82", "84"):
+                wf[n]["inputs"].update(width=1024, height=1024)
     return wf
 
 
@@ -107,10 +127,11 @@ async def una(a, denoise: float, dst: Path) -> None:
 
 async def main() -> int:
     p = argparse.ArgumentParser()
-    p.add_argument("--workflow", default="wf_escena.json")
+    anadir_flags(p)
     p.add_argument("--escena")
     p.add_argument("--personaje")
     p.add_argument("--fusion")
+    p.add_argument("--prompt-detalle", help="prompt de la 2a pasada (nodo 93)")
     p.add_argument("--seed-escena", type=int, default=111111)
     p.add_argument("--seed-personaje", type=int, default=222222)
     p.add_argument("--seed-fusion", type=int, default=333333)
