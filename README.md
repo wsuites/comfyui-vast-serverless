@@ -230,6 +230,48 @@ distintos en requests consecutivos sin tocar nada del despliegue.
 El único límite es que los modelos y nodos que use ese workflow tienen que estar
 en el worker. Si no, ComfyUI falla con el nombre del que falta.
 
+### Encender y apagar funcionalidades del worker
+
+Arriba de `serverless_provision.sh` hay un toggle `true`/`false` por
+característica. Cada uno arrastra **sus modelos, sus custom nodes y sus paquetes
+pip**, así que apagar lo que no uses ahorra disco y arranque en frío:
+
+| Toggle | Flag del cliente | Tamaño | Estado |
+|---|---|---|---|
+| `FEAT_UPSCALE` | `UltimateSDUpscale` de `wf.json` | 67 MB | `true` |
+| `FEAT_RMBG` | BiRefNet, recorta al personaje | ~1 GB | `true` |
+| `FEAT_CONTROLNET` | lo pide cualquier `--pose` y `--manos mesh` | 2,5 GB | `true` |
+| `FEAT_POSE_DWPOSE` | `--pose dwpose` | 351 MB | `true` |
+| `FEAT_POSE_OPENPOSE` | `--pose openpose` | ~430 MB | **`false`** |
+| `FEAT_CARA` | `--cara` | 52 MB | `true` |
+| `FEAT_MANOS_YOLO` | `--manos yolo` | 22 MB | `true` |
+| `FEAT_MANOS_MESH` | `--manos mesh` | 1,37 GB | `true` |
+
+`FEAT_POSE_OPENPOSE` está en `false` porque `OpenposePreprocessor` falla con
+anime y empeora la pose — ver la tabla de [Lo que funciona y lo que
+no](#lo-que-funciona-y-lo-que-no-todo-medido). Apagarlo ahorra los tres
+anotadores de `lllyasviel/Annotators`.
+
+> ⚠️ Apagar un toggle **no cambia los workflows**. Si mandas un workflow que usa
+> algo apagado, ComfyUI falla con el nombre del modelo o del nodo que falta.
+
+**Dos cosas que estaban colgando de una descarga en pleno request** y ahora se
+pre-bajan en el provisioning:
+
+- Los modelos de **DWPose** (`yolox_l.onnx` + `dw-ll_ucoco_384.onnx`, 351 MB) no
+  estaban en ningún array; el nodo se los bajaba de HuggingFace en el primer
+  request. Se descubrió al inventariar un worker vivo: estaban en disco sin
+  estar en el provisioning.
+- `mediapipe` y `trimesh`, que el nodo de MeshGraphormer instala **por pip** si
+  no los encuentra, también en pleno request.
+
+> 🐛 **Cuidado al añadir toggles**: un `[ -n "$k" ] && echo ...` como última
+> sentencia de un `for` hace que la sustitución `$( ... )` entera salga con
+> código 1 cuando el array queda vacío, y con `set -euo pipefail` eso **mata el
+> provisioning** y el worker nunca se marca listo. Usa `if ... then ... fi`.
+> Los bucles sobre arrays llevan además `"${ARR[@]:-}"` y un `continue` de
+> guardia.
+
 ### Añadir un modelo o un LoRA
 
 1. Súbelo a R2 bajo `comfy-stack/models/<tipo>/`.
@@ -274,17 +316,14 @@ del 22 suele ser otro. La clave que funciona es `~/.ssh/xcl`.
 > ⚠️ Lo bajado así **no sobrevive al reemplazo del worker**. Cuando la prueba
 > convenza, hazlo permanente y lanza `renew_provisioning.py --update-workers`.
 
-Para hacerlo permanente hay dos sitios en `serverless_provision.sh`:
+Para hacerlo permanente hay tres sitios en `serverless_provision.sh`, todos
+colgando del toggle de su característica:
 
 - **`MODELS`** / **`EXTRA_FILES`** — ficheros espejados en R2. Verifican tamaño
   contra el origen y se saltan si ya están.
 - **`URL_FILES`** — descarga directa por URL, para pesos públicos de HuggingFace
   que no merece la pena espejar. Formato `<url>|<ruta relativa a COMFY_DIR>`.
   Solo se salta si el fichero ya existe; no compara tamaños.
-
-`hand_yolov8s.pt` ya está en `URL_FILES`. Los dos pesos de MeshGraphormer están
-ahí **comentados**: descoméntalos si quieres las variantes `mesh`/`ambas`, pero
-son 1,37 GB.
 
 Lo que hace falta para las variantes de manos, si se quieren hacer permanentes:
 

@@ -18,68 +18,126 @@ set -euo pipefail
 # CONFIGURACION - esto es lo unico que normalmente hay que tocar
 # =============================================================================
 
-# Modelos a bajar de R2.   "<clave en el bucket>|<ruta relativa dentro de models/>"
+# --- FUNCIONALIDADES ---------------------------------------------------------
+# true/false por caracteristica. Cada una arrastra sus modelos, sus custom nodes
+# y sus paquetes pip; apagar la que no uses ahorra disco y arranque en frio.
+# El flag del cliente que activa cada una va en el comentario.
+#
+#   IMPORTANTE: apagar una aqui NO cambia los workflows. Si mandas un workflow
+#   que usa algo apagado, ComfyUI falla con el nombre del modelo o del nodo.
+FEAT_UPSCALE=true          # UltimateSDUpscale de wf.json            67 MB
+FEAT_RMBG=true             # BiRefNet, recorta al personaje         ~1 GB
+FEAT_CONTROLNET=true       # ControlNet union, lo pide cualquier --pose  2,5 GB
+FEAT_POSE_DWPOSE=true      # --pose dwpose                          351 MB
+FEAT_POSE_OPENPOSE=false   # --pose openpose: FALLA con anime       ~430 MB
+FEAT_CARA=true             # --cara (FaceDetailer)                   52 MB
+FEAT_MANOS_YOLO=true       # --manos yolo                            22 MB
+FEAT_MANOS_MESH=true       # --manos mesh (MeshGraphormer)         1,37 GB
+
+on() { [ "${1:-false}" = "true" ]; }
+
+# --- Modelos de R2.  "<clave en el bucket>|<ruta relativa dentro de models/>" --
 MODELS=(
   "comfy-stack/models/checkpoints/waiIllustriousSDXL_v170.safetensors|checkpoints/waiIllustriousSDXL_v170.safetensors"
   "comfy-stack/models/loras/stuffy_ai_style_ilxl_v2_goofy.safetensors|loras/stuffy_ai_style_ilxl_v2_goofy.safetensors"
-  "comfy-stack/models/ultralytics/bbox/face_yolov8m.pt|ultralytics/bbox/face_yolov8m.pt"
-  "comfy-stack/models/upscale_models/4x_NMKD-Siax_200k.pth|upscale_models/4x_NMKD-Siax_200k.pth"
-  # Quitado de fondo con BiRefNet (nodo BiRefNetRMBG). Espejados en R2 para no
-  # depender de HuggingFace, que si no se bajarian en el primer request.
-  # Los .py y el config.json son obligatorios: sin ellos el modelo no carga.
-  "comfy-stack/models/RMBG/BiRefNet/BiRefNet-general.safetensors|RMBG/BiRefNet/BiRefNet-general.safetensors"
-  "comfy-stack/models/RMBG/BiRefNet/BiRefNet_config.py|RMBG/BiRefNet/BiRefNet_config.py"
-  "comfy-stack/models/RMBG/BiRefNet/birefnet.py|RMBG/BiRefNet/birefnet.py"
-  "comfy-stack/models/RMBG/BiRefNet/birefnet_lite.py|RMBG/BiRefNet/birefnet_lite.py"
-  "comfy-stack/models/RMBG/BiRefNet/config.json|RMBG/BiRefNet/config.json"
-  # ControlNet Union: openpose, depth, canny... todo en un modelo
-  "comfy-stack/models/controlnet/controlnet-union-sdxl-1.0.safetensors|controlnet/controlnet-union-sdxl-1.0.safetensors"
 )
+if on "$FEAT_CARA"; then
+  MODELS+=("comfy-stack/models/ultralytics/bbox/face_yolov8m.pt|ultralytics/bbox/face_yolov8m.pt")
+fi
+if on "$FEAT_UPSCALE"; then
+  MODELS+=("comfy-stack/models/upscale_models/4x_NMKD-Siax_200k.pth|upscale_models/4x_NMKD-Siax_200k.pth")
+fi
+if on "$FEAT_RMBG"; then
+  # Espejados en R2 para no depender de HuggingFace, que si no se bajarian en el
+  # primer request. Los .py y el config.json son obligatorios: sin ellos no carga.
+  MODELS+=(
+    "comfy-stack/models/RMBG/BiRefNet/BiRefNet-general.safetensors|RMBG/BiRefNet/BiRefNet-general.safetensors"
+    "comfy-stack/models/RMBG/BiRefNet/BiRefNet_config.py|RMBG/BiRefNet/BiRefNet_config.py"
+    "comfy-stack/models/RMBG/BiRefNet/birefnet.py|RMBG/BiRefNet/birefnet.py"
+    "comfy-stack/models/RMBG/BiRefNet/birefnet_lite.py|RMBG/BiRefNet/birefnet_lite.py"
+    "comfy-stack/models/RMBG/BiRefNet/config.json|RMBG/BiRefNet/config.json"
+  )
+fi
+if on "$FEAT_CONTROLNET"; then
+  # Union: openpose, depth, canny... todo en un modelo. La pasada de manos
+  # 'mesh' lo usa en modo depth, asi que tambien lo necesita.
+  MODELS+=("comfy-stack/models/controlnet/controlnet-union-sdxl-1.0.safetensors|controlnet/controlnet-union-sdxl-1.0.safetensors")
+fi
 
-# Ficheros que NO van bajo models/. Ruta relativa a COMFY_DIR.
-# Los anotadores de controlnet_aux viven dentro del propio custom node; si no
-# se pre-bajan aqui, el nodo los descarga de HuggingFace en pleno request.
-EXTRA_FILES=(
-  "comfy-stack/custom_nodes/comfyui_controlnet_aux/ckpts/lllyasviel/Annotators/body_pose_model.pth|custom_nodes/comfyui_controlnet_aux/ckpts/lllyasviel/Annotators/body_pose_model.pth"
-  "comfy-stack/custom_nodes/comfyui_controlnet_aux/ckpts/lllyasviel/Annotators/hand_pose_model.pth|custom_nodes/comfyui_controlnet_aux/ckpts/lllyasviel/Annotators/hand_pose_model.pth"
-  "comfy-stack/custom_nodes/comfyui_controlnet_aux/ckpts/lllyasviel/Annotators/facenet.pth|custom_nodes/comfyui_controlnet_aux/ckpts/lllyasviel/Annotators/facenet.pth"
-)
+# --- Ficheros de R2 que NO van bajo models/. Ruta relativa a COMFY_DIR. -------
+EXTRA_FILES=()
+if on "$FEAT_POSE_OPENPOSE"; then
+  EXTRA_FILES+=(
+    "comfy-stack/custom_nodes/comfyui_controlnet_aux/ckpts/lllyasviel/Annotators/body_pose_model.pth|custom_nodes/comfyui_controlnet_aux/ckpts/lllyasviel/Annotators/body_pose_model.pth"
+    "comfy-stack/custom_nodes/comfyui_controlnet_aux/ckpts/lllyasviel/Annotators/hand_pose_model.pth|custom_nodes/comfyui_controlnet_aux/ckpts/lllyasviel/Annotators/hand_pose_model.pth"
+    "comfy-stack/custom_nodes/comfyui_controlnet_aux/ckpts/lllyasviel/Annotators/facenet.pth|custom_nodes/comfyui_controlnet_aux/ckpts/lllyasviel/Annotators/facenet.pth"
+  )
+fi
 
-# Ficheros que se bajan por URL directa en vez de R2. Ruta relativa a COMFY_DIR.
-#   "<url>|<ruta relativa a COMFY_DIR>"
-# Se usa para pesos publicos de HuggingFace que no merece la pena espejar. A
+# --- Descargas por URL directa.  "<url>|<ruta relativa a COMFY_DIR>" ----------
+# Para pesos publicos de HuggingFace que no merece la pena espejar en R2. A
 # diferencia de MODELS/EXTRA_FILES no se comprueba el tamano contra un origen,
 # solo se salta si el fichero ya existe.
-#
-# Descomenta el bloque de MeshGraphormer si quieres la ruta 'mesh'/'ambas' de la
-# pasada de manos. Son 1,37 GB: comprueba antes que VAST_DISK_SPACE da de si.
-# El tercer fichero de ese repo (control_sd15_inpaint_depth_hand, 722MB) NO
-# hace falta: es el ControlNet de SD1.5 y aqui se usa el union SDXL en depth.
-URL_FILES=(
-  # detector de manos para la pasada 'yolo' (variantes hd3y / hd3ym)
-  "https://huggingface.co/Bingsu/adetailer/resolve/main/hand_yolov8s.pt|models/ultralytics/bbox/hand_yolov8s.pt"
-  # --- MeshGraphormer / HandRefiner (variantes hd3m / hd3ym) ---
-  # "https://huggingface.co/hr16/ControlNet-HandRefiner-pruned/resolve/main/graphormer_hand_state_dict.bin|custom_nodes/comfyui_controlnet_aux/ckpts/hr16/ControlNet-HandRefiner-pruned/graphormer_hand_state_dict.bin"
-  # "https://huggingface.co/hr16/ControlNet-HandRefiner-pruned/resolve/main/hrnetv2_w64_imagenet_pretrained.pth|custom_nodes/comfyui_controlnet_aux/ckpts/hr16/ControlNet-HandRefiner-pruned/hrnetv2_w64_imagenet_pretrained.pth"
-)
+AUX_CKPTS="custom_nodes/comfyui_controlnet_aux/ckpts"
+URL_FILES=()
+if on "$FEAT_POSE_DWPOSE"; then
+  # Sin esto el nodo se los baja de HuggingFace EN PLENO REQUEST (medido: el
+  # worker los tenia sin estar en el provisioning).
+  URL_FILES+=(
+    "https://huggingface.co/yzd-v/DWPose/resolve/main/yolox_l.onnx|$AUX_CKPTS/yzd-v/DWPose/yolox_l.onnx"
+    "https://huggingface.co/yzd-v/DWPose/resolve/main/dw-ll_ucoco_384.onnx|$AUX_CKPTS/yzd-v/DWPose/dw-ll_ucoco_384.onnx"
+  )
+fi
+if on "$FEAT_MANOS_YOLO"; then
+  URL_FILES+=("https://huggingface.co/Bingsu/adetailer/resolve/main/hand_yolov8s.pt|models/ultralytics/bbox/hand_yolov8s.pt")
+fi
+if on "$FEAT_MANOS_MESH"; then
+  # El tercer fichero de ese repo (control_sd15_inpaint_depth_hand, 722MB) NO
+  # hace falta: es el ControlNet de SD1.5 y aqui se usa el union SDXL en depth.
+  URL_FILES+=(
+    "https://huggingface.co/hr16/ControlNet-HandRefiner-pruned/resolve/main/graphormer_hand_state_dict.bin|$AUX_CKPTS/hr16/ControlNet-HandRefiner-pruned/graphormer_hand_state_dict.bin"
+    "https://huggingface.co/hr16/ControlNet-HandRefiner-pruned/resolve/main/hrnetv2_w64_imagenet_pretrained.pth|$AUX_CKPTS/hr16/ControlNet-HandRefiner-pruned/hrnetv2_w64_imagenet_pretrained.pth"
+  )
+fi
 
-# Custom nodes.  "<repo git>|<directorio>|<recursive>|<norequirements>"
+# --- Custom nodes.  "<repo git>|<directorio>|<recursive>|<norequirements>" ----
 #   recursive       -> clonar con submodulos
 #   norequirements  -> NO instalar su requirements.txt; las deps van en PIP_EXTRA
-NODES=(
-  "https://github.com/ltdrdata/ComfyUI-Impact-Pack.git|ComfyUI-Impact-Pack||"
-  "https://github.com/ltdrdata/ComfyUI-Impact-Subpack.git|ComfyUI-Impact-Subpack||"
-  "https://github.com/ssitu/ComfyUI_UltimateSDUpscale.git|ComfyUI_UltimateSDUpscale|recursive|"
+NODES=()
+if on "$FEAT_CARA" || on "$FEAT_MANOS_YOLO"; then
+  # FaceDetailer y UltralyticsDetectorProvider. FaceDetailer NO es especifico de
+  # caras: con un bbox_detector de manos hace la pasada de manos.
+  NODES+=(
+    "https://github.com/ltdrdata/ComfyUI-Impact-Pack.git|ComfyUI-Impact-Pack||"
+    "https://github.com/ltdrdata/ComfyUI-Impact-Subpack.git|ComfyUI-Impact-Subpack||"
+  )
+fi
+if on "$FEAT_UPSCALE"; then
+  NODES+=("https://github.com/ssitu/ComfyUI_UltimateSDUpscale.git|ComfyUI_UltimateSDUpscale|recursive|")
+fi
+if on "$FEAT_RMBG"; then
   # El requirements.txt de RMBG arrastra onnxruntime-gpu, groundingdino-py,
   # decord y SAM2/SAM3: ~2GB que no usamos. Solo queremos BiRefNet.
-  "https://github.com/1038lab/ComfyUI-RMBG.git|ComfyUI-RMBG||norequirements"
-  # anotadores de pose/depth para ControlNet
-  "https://github.com/Fannovel16/comfyui_controlnet_aux.git|comfyui_controlnet_aux||"
-)
+  NODES+=("https://github.com/1038lab/ComfyUI-RMBG.git|ComfyUI-RMBG||norequirements")
+fi
+if on "$FEAT_POSE_DWPOSE" || on "$FEAT_POSE_OPENPOSE" || on "$FEAT_MANOS_MESH"; then
+  # anotadores de pose/depth para ControlNet; MeshGraphormer vive aqui dentro
+  NODES+=("https://github.com/Fannovel16/comfyui_controlnet_aux.git|comfyui_controlnet_aux||")
+fi
 
-# Paquetes pip extra que necesitan los nodos de arriba
-PIP_EXTRA=(ultralytics opencv-python-headless scipy scikit-image spandrel boto3
-           huggingface-hub transparent-background transformers)
+# --- Paquetes pip extra que necesitan los nodos de arriba --------------------
+PIP_EXTRA=(opencv-python-headless scipy scikit-image spandrel boto3 huggingface-hub
+           transformers)
+if on "$FEAT_CARA" || on "$FEAT_MANOS_YOLO"; then
+  PIP_EXTRA+=(ultralytics)
+fi
+if on "$FEAT_RMBG"; then
+  PIP_EXTRA+=(transparent-background)
+fi
+if on "$FEAT_MANOS_MESH"; then
+  # Sin estos, el nodo los instala por pip EN PLENO REQUEST.
+  PIP_EXTRA+=(mediapipe trimesh)
+fi
 
 # Checkpoint que usa el workflow de benchmark (tiene que estar en MODELS)
 BENCHMARK_CKPT="waiIllustriousSDXL_v170.safetensors"
@@ -154,7 +212,8 @@ install_node() {
     fi
 }
 
-for entry in "${NODES[@]}"; do
+for entry in "${NODES[@]:-}"; do
+    [ -n "$entry" ] || continue          # el array puede quedar vacio por un toggle
     IFS='|' read -r repo name recursive norequirements <<< "$entry"
     install_node "$repo" "$name" "$recursive" "$norequirements"
 done
@@ -169,13 +228,16 @@ export COMFY_MODELS_DIR="$MODELS_DIR"
 # Se pasa a python un "clave|destino ABSOLUTO" por linea. MODELS va relativo a
 # models/ y EXTRA_FILES relativo a COMFY_DIR, pero aqui ya se resuelven los dos.
 COMFY_MODEL_LIST=$(
-    for e in "${MODELS[@]}"; do
+    # Ojo con el 'if': un '[ -n "$k" ] && echo' que falle en la ULTIMA vuelta
+    # hace que la sustitucion entera salga con codigo 1 y, con set -e, mata el
+    # provisioning. Pasa en cuanto un array queda vacio por un toggle en false.
+    for e in "${MODELS[@]:-}"; do
         IFS='|' read -r k r <<< "$e"
-        [ -n "$k" ] && echo "$k|$MODELS_DIR/$r"
+        if [ -n "$k" ]; then echo "$k|$MODELS_DIR/$r"; fi
     done
     for e in "${EXTRA_FILES[@]:-}"; do
         IFS='|' read -r k r <<< "$e"
-        [ -n "$k" ] && echo "$k|$COMFY_DIR/$r"
+        if [ -n "$k" ]; then echo "$k|$COMFY_DIR/$r"; fi
     done
 )
 export COMFY_MODEL_LIST
