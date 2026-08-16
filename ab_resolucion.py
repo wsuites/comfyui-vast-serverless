@@ -36,6 +36,12 @@ COMBOS: dict[str, dict] = {
     "vu":   {"vertical": True, "upscale": True},
     "lu":   {"lienzo": 1536, "upscale": True},
     "vlu":  {"vertical": True, "lienzo": 1536, "upscale": True},
+    # bbox: la palanca que mas se espera que rinda, y la ultima en llegar.
+    # 'vb' es la combinacion recomendada (vertical + recorte a la silueta).
+    "b":    {"bbox": True},
+    "vb":   {"vertical": True, "bbox": True},
+    "vbu":  {"vertical": True, "bbox": True, "upscale": True},
+    "vblu": {"vertical": True, "bbox": True, "lienzo": 1536, "upscale": True},
 }
 
 

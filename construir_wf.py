@@ -222,7 +222,11 @@ def con_upscale(wf: dict, origen: list) -> dict:
                             "seam_fix_denoise": 1.0, "seam_fix_width": 64,
                             "seam_fix_mask_blur": 8, "seam_fix_padding": 16,
                             "force_uniform_tiles": True,
-                            "tiled_decode": False},
+                            "tiled_decode": False,
+                            # required en esta version del pack. Si falta, ComfyUI
+                            # NO falla: descarta este output ("Output will be
+                            # ignored") y devuelve el resto como si nada.
+                            "batch_size": 1},
                  "_meta": {"title": "UltimateSDUpscale 2x del compuesto"}}
     wf["132"] = {"class_type": "SaveImage",
                  "inputs": {"filename_prefix": "h_upscale", "images": ["131", 0]},
