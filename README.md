@@ -1,81 +1,89 @@
-# ComfyUI serverless en Vast.ai
+# ComfyUI serverless on Vast.ai
 
-Genera imágenes con `wf.json` (waiIllustrious SDXL v170 + LoRA stuffy + FaceDetailer
-+ UltimateSDUpscale) en un endpoint serverless de Vast.ai. Los modelos y nodos se
-provisionan desde Cloudflare R2 y las imágenes se suben ahí mismo.
+Generates images with `workflows/wf.json` (waiIllustrious SDXL v170 + stuffy
+LoRA + FaceDetailer + UltimateSDUpscale) on a serverless Vast.ai endpoint.
+Models and custom nodes are provisioned from Cloudflare R2 and images are
+uploaded back there.
 
-> **Configuración**: todo lo específico de un despliegue (identificadores de
-> Vast, bucket, URL de R2, credenciales) vive en `.env`, que **no se versiona**.
-> Copia `.env.example` a `.env` y rellénalo. En la documentación los valores
-> aparecen como `$VAST_ENDPOINT_ID`, `$VAST_TEMPLATE_ID`, etc.
+> **Setup**: everything deployment-specific (Vast identifiers, bucket, R2 URL,
+> credentials) lives in `.env`, which is **not versioned**. Copy `.env.example`
+> to `.env` and fill it in. In the docs, values appear as `$VAST_ENDPOINT_ID`,
+> `$VAST_TEMPLATE_ID`, etc.
 
-## Ficheros
+## Layout
 
-| Fichero | Qué es |
+| Path | What it is |
 |---|---|
-| `call_endpoint.py` | Cliente. Manda `wf.json` al endpoint y devuelve la URL de la imagen. |
-| `wf.json` | Workflow en formato **API** de ComfyUI. Es lo que se envía en cada request. |
-| `serverless_provision.sh` | Provisioning del worker. Copia de la que corre en R2 (`comfy-stack/scripts/serverless_provision.sh`). |
-| `renew_provisioning.py` | Sube el provisioning a R2, regenera la URL presignada y actualiza template + workergroup. |
-| `sondear_nodos.py` | Vuelca el esquema real de nodos del worker vivo (`object_info` por SSH). Para cablear un nodo nuevo sin adivinar. |
-| `reproducir-resultados-desde-cero.md` | Receta de parámetros y hallazgos de prompt. |
-| `loras.md` | LoRAs de personaje: candidatas, cómo añadirlas y cómo probarlas. |
-| `.env` | Configuración y credenciales. **No se versiona, no compartir.** |
-| `last_response.json` | Respuesta completa del último request (lo escribe el cliente). |
+| `scripts/call_endpoint.py` | Client. Sends `wf.json` to the endpoint and returns the image URL. |
+| `scripts/construir_wf.py` | **Builds the scene pipeline graph** (poses, detail passes, hands, upscale). |
+| `scripts/escena.py`, `frames.py`, `correr.py` | Runners for the scene pipeline. |
+| `scripts/sprites.py`, `normalizar.py`, `ciclo_pose.py` | RGBA sprite generation and normalization. |
+| `scripts/ab_detalle.py`, `ab_resolucion.py`, `hoja12.py` | A/B comparison harnesses. |
+| `scripts/serverless_provision.sh` | Worker provisioning. Copy of what runs in R2 (`comfy-stack/scripts/serverless_provision.sh`). |
+| `scripts/renew_provisioning.py` | Uploads the provisioning to R2, regenerates the presigned URL and updates template + workergroup. |
+| `scripts/sondear_nodos.py` | Dumps the real node schema from the live worker (`object_info` over SSH). For wiring a new node without guessing. |
+| `scripts/validar_wf.py` | Validates every flag combination against the worker schema. |
+| `scripts/visor.py` | Generates `output/visor.html`, a self-contained A/B viewer. |
+| `workflows/` | All workflows in ComfyUI **API** format (what is sent in each request). |
+| `docs/` | Parameter recipe and prompt findings (`reproducing-results-from-scratch.md`) and character LoRAs (`loras.md`). |
+| `output/` | Everything generated, organized by experiment, each with its own `README.md`. |
+| `.env` | Configuration and credentials. **Not versioned, do not share.** |
+| `output/general/last_response.json` | Full response of the last request (written by the client). |
 
 ---
 
-## Uso rápido
+## Quick start
 
 ```powershell
-cd <tu-repo>
+cd <your-repo>
 
-# rápido, sin upscale
-python call_endpoint.py --no-upscale --steps 20 `
+# quick, no upscale
+python scripts/call_endpoint.py --no-upscale --steps 20 `
   --prompt "aetherion, solo, 1girl, long red hair, (blue eyes:1.3), looking at viewer, standing"
 
-# workflow completo: FaceDetailer + UltimateSDUpscale 2x -> 2048x2048
-python call_endpoint.py --steps 30 --cfg 6 --seed 552827645330068 `
+# full workflow: FaceDetailer + UltimateSDUpscale 2x -> 2048x2048
+python scripts/call_endpoint.py --steps 30 --cfg 6 --seed 552827645330068 `
   --prompt "..." --negative "clothes, red eyes, bad hands, ..."
 ```
 
-La URL de la imagen se imprime por stdout y la respuesta entera queda en
-`last_response.json`.
+The image URL is printed to stdout and the whole response is saved to
+`output/general/last_response.json`.
 
 ### Flags
 
-| Flag | Default | Notas |
+| Flag | Default | Notes |
 |---|---|---|
-| `--prompt` | el de `wf.json` | Prompt positivo (nodo `3`). |
-| `--negative` | el de `wf.json` | Prompt negativo (nodo `5`). |
-| `--seed` | aleatoria | Se imprime siempre, para poder reproducir. |
-| `--width` / `--height` | 1024 / 1024 | Latente nativo. 1024x1024 es lo más estable. |
-| `--batch` | 1 | Imágenes por request. |
-| `--steps` | el de `wf.json` (35) | Ajusta también `end_at_step`. |
-| `--cfg` | el de `wf.json` (5.5) | Por encima de 6.5 se degradan los ojos. |
-| `--no-upscale` | off | Ver nota abajo. |
-| `--workflow` | `wf.json` | Para usar otro workflow. |
-| `--cost` | 100 | Unidades que descuenta el autoscaler por request. |
-| `--timeout` | 900 | Segundos. Incluye el arranque en frío. |
-| `--out` | `last_response.json` | Dónde volcar la respuesta. |
+| `--prompt` | the one in `wf.json` | Positive prompt (node `3`). |
+| `--negative` | the one in `wf.json` | Negative prompt (node `5`). |
+| `--seed` | random | Always printed, so results can be reproduced. |
+| `--width` / `--height` | 1024 / 1024 | Native latent. 1024x1024 is the most stable. |
+| `--batch` | 1 | Images per request. |
+| `--steps` | the one in `wf.json` (35) | Also adjusts `end_at_step`. |
+| `--cfg` | the one in `wf.json` (5.5) | Above 6.5 the eyes degrade. |
+| `--no-upscale` | off | See note below. |
+| `--workflow` | `workflows/wf.json` | To use another workflow. |
+| `--cost` | 100 | Units the autoscaler discounts per request. |
+| `--timeout` | 900 | Seconds. Includes cold start. |
+| `--out` | `output/general/last_response.json` | Where to dump the response. |
+| `--remove-bg` | off | Cuts the character out with BiRefNet (node 70, model with `--rmbg-model`). |
 
-**Sobre `--no-upscale`:** no basta con ignorar los nodos del upscaler. Hay que
-colgar el `SaveImage` (nodo `7`) directamente del FaceDetailer y **borrar** los
-nodos `46` y `47`, o ComfyUI los ejecuta igual porque siguen en el grafo. El
-script ya lo hace.
+**About `--no-upscale`:** ignoring the upscaler nodes is not enough. The
+`SaveImage` (node `7`) must be re-hung directly from the FaceDetailer and
+nodes `46` and `47` must be **deleted**, or ComfyUI executes them anyway
+because they are still in the graph. The script already does this.
 
 ---
 
-## Desde tu propio código
+## From your own code
 
 ```python
 import asyncio, json, uuid
 from pathlib import Path
 from vastai import Serverless
 
-async def generar(workflow: dict) -> str:
+async def generate(workflow: dict) -> str:
     key = (Path.home() / ".config/vastai/vast_api_key").read_text().strip()
-    client = Serverless(api_key=key)          # explícito, ver trampa abajo
+    client = Serverless(api_key=key)          # explicit, see trap below
     try:
         ep = await client.get_endpoint(name=ENDPOINT_NAME)
         r = await ep.request(
@@ -87,81 +95,83 @@ async def generar(workflow: dict) -> str:
     finally:
         await client.close()
 
-wf = json.loads(Path("wf.json").read_text(encoding="utf-8"))
-wf["3"]["inputs"]["text"] = "tu prompt"
+wf = json.loads(Path("workflows/wf.json").read_text(encoding="utf-8"))
+wf["3"]["inputs"]["text"] = "your prompt"
 wf["27"]["inputs"]["value"] = 12345           # seed
-print(asyncio.run(generar(wf)))
+print(asyncio.run(generate(wf)))
 ```
 
-> **Trampa del SDK:** `Serverless.__init__` tiene
-> `api_key = os.environ.get("VAST_API_KEY", None)` como *valor por defecto de
-> parámetro*, así que se evalúa **en el import del módulo**. Si defines la
-> variable de entorno desde Python antes de instanciar, la ignora. O la exportas
-> en la shell antes de lanzar el proceso, o pasas `api_key=` a mano.
+> **SDK trap:** `Serverless.__init__` has
+> `api_key = os.environ.get("VAST_API_KEY", None)` as a *parameter default*,
+> so it is evaluated **when the module is imported**. If you set the
+> environment variable from Python before instantiating, it is ignored.
+> Either export it in the shell before launching the process, or pass
+> `api_key=` by hand.
 
-### Contrato del payload
+### Payload contract
 
 ```json
-{"input": {"request_id": "<uuid>", "workflow_json": { ...ComfyUI formato API... }}}
+{"input": {"request_id": "<uuid>", "workflow_json": { ...ComfyUI API format... }}}
 ```
 
-Opcionales dentro de `input`: `s3` (sobrescribe el destino de subida) y `webhook`
-(respuesta asíncrona en vez de bloquear).
+Optional keys inside `input`: `s3` (overrides the upload destination) and
+`webhook` (async response instead of blocking).
 
-### Nodos de `wf.json`
+### Nodes of `workflows/wf.json`
 
-| Nodo | Qué es |
+| Node | What it is |
 |---|---|
 | `1` | CheckpointLoaderSimple — `waiIllustriousSDXL_v170.safetensors` |
 | `2` | LoraLoader — `stuffy_ai_style_ilxl_v2_goofy.safetensors` |
-| `3` / `5` | Prompt positivo / negativo |
-| `60` | CLIPSetLastLayer — **clip skip `-2`**, crítico: con `-1` salen imágenes negras |
+| `3` / `5` | Positive / negative prompt |
+| `60` | CLIPSetLastLayer — **clip skip `-2`**, critical: with `-1` images come out black |
 | `16` | KSamplerAdvanced — `steps`, `cfg`, `sampler_name`, `scheduler` |
 | `17` | FaceDetailer (Impact-Pack) |
 | `20` | UltralyticsDetectorProvider — `bbox/face_yolov8m.pt` |
 | `27` | Seed |
-| `39` / `40` / `41` | Ancho / alto / batch |
+| `39` / `40` / `41` | Width / height / batch |
 | `46` / `47` | UpscaleModelLoader + UltimateSDUpscale (`4x_NMKD-Siax_200k.pth`) |
-| `7` | SaveImage — es de donde el api-wrapper saca la imagen |
+| `7` | SaveImage — where the api-wrapper grabs the image from |
 
 ---
 
-## Rendimiento medido (RTX 5080)
+## Measured performance (RTX 5080)
 
-| Configuración | Tiempo |
+| Configuration | Time |
 |---|---|
-| 832×1216, 12 pasos, sin upscale | 8,3 s |
-| 1024×1024, 20 pasos, sin upscale | 13,4 s |
-| 1024×1024, 30 pasos, FaceDetailer + upscale 2x → 2048×2048 | 32,6 s |
-| Arranque en frío (worker parado → primer request) | ~2 min |
+| 832x1216, 12 steps, no upscale | 8.3 s |
+| 1024x1024, 20 steps, no upscale | 13.4 s |
+| 1024x1024, 30 steps, FaceDetailer + 2x upscale -> 2048x2048 | 32.6 s |
+| Cold start (stopped worker -> first request) | ~2 min |
 
 ---
 
-## Cómo está montado
+## How it is wired up
 
 ```
-endpoint <nombre> ($VAST_ENDPOINT_ID)
+endpoint <name> ($VAST_ENDPOINT_ID)
   └── workergroup $VAST_WORKERGROUP_ID
-        └── template "<nombre> ComfyUI Serverless" (id $VAST_TEMPLATE_ID)
+        └── template "<name> ComfyUI Serverless" (id $VAST_TEMPLATE_ID)
               image: vastai/comfy:v0.30.0-cuda-13.2-py312
-              runtype: ssh          <- NO jupyter (ver Troubleshooting)
+              runtype: ssh          <- NOT jupyter (see Troubleshooting)
               env: -p 3000:3000 (pyworker)
                    -e COMFYUI_ARGS="--disable-auto-launch --port 18188"
                    -e HF_TOKEN=...
-                   -e PROVISIONING_SCRIPT=<url de R2>
+                   -e PROVISIONING_SCRIPT=<R2 URL>
               onstart:
                    export SERVERLESS=true BACKEND=comfyui-json
-                   entrypoint.sh &                      <- arranca supervisord
-                   start_server.sh | bash               <- arranca el pyworker
+                   entrypoint.sh &                      <- starts supervisord
+                   start_server.sh | bash               <- starts the pyworker
 ```
 
-Las credenciales `S3_ACCESS_KEY_ID`, `S3_SECRET_ACCESS_KEY`, `S3_BUCKET_NAME`,
-`S3_ENDPOINT_URL` y `S3_REGION` están como **variables de entorno de cuenta** en
-Vast (`vastai show env-vars`), no en el template. Vast las inyecta en cada worker.
+The `S3_ACCESS_KEY_ID`, `S3_SECRET_ACCESS_KEY`, `S3_BUCKET_NAME`,
+`S3_ENDPOINT_URL` and `S3_REGION` credentials are **account environment
+variables** in Vast (`vastai show env-vars`), not in the template. Vast
+injects them into every worker.
 
-`serverless_provision.sh` corre vía `PROVISIONING_SCRIPT` **antes** de que el
-worker se marque como listo. Instala Impact-Pack, Impact-Subpack y
-UltimateSDUpscale, y baja de R2 estos 4 modelos:
+`serverless_provision.sh` runs via `PROVISIONING_SCRIPT` **before** the worker
+is marked ready. It installs Impact-Pack, Impact-Subpack and
+UltimateSDUpscale, and pulls these 4 models from R2:
 
 ```
 comfy-stack/models/checkpoints/waiIllustriousSDXL_v170.safetensors   6.9 GB
@@ -170,494 +180,502 @@ comfy-stack/models/ultralytics/bbox/face_yolov8m.pt                   52 MB
 comfy-stack/models/upscale_models/4x_NMKD-Siax_200k.pth               67 MB
 ```
 
-Si el script falla sale con código != 0 y el worker **no** se marca listo, así
-que los errores de provisioning se ven como error explícito en los logs y no como
-un timeout mudo.
+If the script fails it exits with code != 0 and the worker is **not** marked
+ready, so provisioning errors show up as explicit errors in the logs instead
+of a silent timeout.
 
-### Si cambias el provisioning
+### If you change the provisioning
 
 ```powershell
-python renew_provisioning.py                    # sube a R2 + actualiza template
-python renew_provisioning.py --update-workers   # además fuerza a los workers vivos
+python scripts/renew_provisioning.py                    # uploads to R2 + updates template
+python scripts/renew_provisioning.py --update-workers   # also forces the live workers
 ```
 
-Hace todo el ciclo: normaliza saltos de línea a LF, sube `serverless_provision.sh`
-a R2, comprueba que la URL pública sirve exactamente eso, actualiza el template y
-re-apunta el workergroup al hash resultante (que cambia en cada update).
+It does the whole cycle: normalizes line endings to LF, uploads
+`serverless_provision.sh` to R2, checks the public URL serves exactly that,
+updates the template and re-points the workergroup to the resulting hash
+(which changes on every update).
 
-`PROVISIONING_SCRIPT` apunta al **Public Development URL** del bucket, que es
-permanente:
+`PROVISIONING_SCRIPT` points to the bucket's **Public Development URL**, which
+is permanent:
 
 ```
 https://pub-XXXXXXXXXXXX.r2.dev/comfy-stack/scripts/serverless_provision.sh
 ```
 
-Con `--presigned` se genera en su lugar una URL firmada de 7 días, por si algún
-día se desactiva el acceso público del bucket.
+With `--presigned` it instead generates a 7-day signed URL, in case the
+bucket's public access is ever disabled.
 
-Lee las credenciales de R2 de `.env` o del entorno. Vast enmascara los valores en
-`vastai show env-vars` incluso con `-s`, así que no se pueden recuperar de ahí.
+It reads the R2 credentials from `.env` or the environment. Vast masks the
+values in `vastai show env-vars` even with `-s`, so they cannot be recovered
+from there.
 
-> Cloudflare devuelve **403** al User-Agent por defecto de `urllib`. `curl` y
-> `wget` pasan sin problema, que es lo que usa el provisioner del worker; el
-> script de verificación se hace pasar por curl. Si escribes tooling propio
-> contra esa URL, acuérdate de mandar un User-Agent.
+> Cloudflare returns **403** to urllib's default User-Agent. `curl` and
+> `wget` pass fine, which is what the worker provisioner uses; the
+> verification script impersonates curl. If you write your own tooling
+> against that URL, remember to send a User-Agent.
 
-> Cambiar el template dispara un reemplazo de workers: el autoscaler levanta uno
-> nuevo y provisiona de cero (unos minutos y unos céntimos). Es normal; se
-> estabiliza solo en un worker frío.
+> Changing the template triggers a worker replacement: the autoscaler spins
+> up a new one and provisions from scratch (a few minutes and a few cents).
+> That is normal; it settles on a cold worker on its own.
 
 ---
 
-## Qué se puede cambiar y cómo
+## What can be changed and how
 
-Hay tres capas, y el coste de tocarlas es muy distinto. Cuanto más arriba, más barato.
+There are three layers, and touching them costs very differently. The higher
+up, the cheaper.
 
-| Quiero cambiar | Dónde | Comando | Coste |
+| I want to change | Where | Command | Cost |
 |---|---|---|---|
-| Prompt, seed, tamaño, steps, cfg, batch | flags del cliente | `python call_endpoint.py --...` | nada |
-| El grafo del workflow (nodos, conexiones, otro workflow entero) | `wf.json` o `--workflow otro.json` | `python call_endpoint.py --workflow otro.json` | nada |
-| Modelos, LoRAs, custom nodes | bloque `CONFIGURACION` de `serverless_provision.sh` | `python renew_provisioning.py --update-workers` | ~5 min de reprovisión |
-| Imagen docker, puertos, env, GPU, disco | constantes de `renew_provisioning.py` | `python renew_provisioning.py` | reemplazo de worker |
-| Cuántos workers y cuándo | endpoint | `vastai update endpoint $VAST_ENDPOINT_ID ...` | inmediato |
+| Prompt, seed, size, steps, cfg, batch | client flags | `python scripts/call_endpoint.py --...` | nothing |
+| The workflow graph (nodes, connections, another whole workflow) | `workflows/wf.json` or `--workflow another.json` | `python scripts/call_endpoint.py --workflow another.json` | nothing |
+| Models, LoRAs, custom nodes | `CONFIGURATION` block of `serverless_provision.sh` | `python scripts/renew_provisioning.py --update-workers` | ~5 min of reprovisioning |
+| Docker image, ports, env, GPU, disk | constants at the top of `renew_provisioning.py` | `python scripts/renew_provisioning.py` | worker replacement |
+| How many workers and when | endpoint | `vastai update endpoint $VAST_ENDPOINT_ID ...` | immediate |
 
-### El workflow no requiere redespliegue
+### The workflow does not require redeploying
 
-Esto es lo importante: **el workflow viaja en cada request**. El worker no tiene
-ninguna copia de `wf.json`; lo que se envía en `input.workflow_json` es lo que se
-ejecuta. Puedes cambiar el grafo entero, usar otro workflow o mandar workflows
-distintos en requests consecutivos sin tocar nada del despliegue.
+This is the important part: **the workflow travels in every request**. The
+worker has no copy of `wf.json`; whatever is sent in `input.workflow_json` is
+what gets executed. You can change the whole graph, use another workflow, or
+send different workflows in consecutive requests without touching the
+deployment.
 
-El único límite es que los modelos y nodos que use ese workflow tienen que estar
-en el worker. Si no, ComfyUI falla con el nombre del que falta.
+The only limit is that the models and nodes that workflow uses must exist on
+the worker. Otherwise ComfyUI fails naming the missing one.
 
-### Encender y apagar funcionalidades del worker
+### Turning worker features on and off
 
-Arriba de `serverless_provision.sh` hay un toggle `true`/`false` por
-característica. Cada uno arrastra **sus modelos, sus custom nodes y sus paquetes
-pip**, así que apagar lo que no uses ahorra disco y arranque en frío:
+At the top of `serverless_provision.sh` there is a `true`/`false` toggle per
+feature. Each one drags **its own models, custom nodes and pip packages**, so
+turning off what you do not use saves disk and cold start time:
 
-| Toggle | Flag del cliente | Tamaño | Estado |
+| Toggle | Client flag | Size | State |
 |---|---|---|---|
-| `FEAT_UPSCALE` | `UltimateSDUpscale` de `wf.json` | 67 MB | `true` |
-| `FEAT_RMBG` | BiRefNet, recorta al personaje | ~1 GB | `true` |
-| `FEAT_CONTROLNET` | lo pide cualquier `--pose` y `--manos mesh` | 2,5 GB | `true` |
+| `FEAT_UPSCALE` | `UltimateSDUpscale` in `wf.json` | 67 MB | `true` |
+| `FEAT_RMBG` | BiRefNet, cuts out the character | ~1 GB | `true` |
+| `FEAT_CONTROLNET` | required by any `--pose` and `--hands mesh` | 2.5 GB | `true` |
 | `FEAT_POSE_DWPOSE` | `--pose dwpose` | 351 MB | `true` |
 | `FEAT_POSE_OPENPOSE` | `--pose openpose` | ~430 MB | **`false`** |
-| `FEAT_CARA` | `--cara` | 52 MB | `true` |
-| `FEAT_MANOS_YOLO` | `--manos yolo` | 22 MB | `true` |
-| `FEAT_MANOS_MESH` | `--manos mesh` | 1,37 GB | `true` |
+| `FEAT_FACE` | `--face` | 52 MB | `true` |
+| `FEAT_HANDS_YOLO` | `--hands yolo` | 22 MB | `true` |
+| `FEAT_HANDS_MESH` | `--hands mesh` | 1.37 GB | `true` |
 
-`FEAT_POSE_OPENPOSE` está en `false` porque `OpenposePreprocessor` falla con
-anime y empeora la pose — ver la tabla de [Lo que funciona y lo que
-no](#lo-que-funciona-y-lo-que-no-todo-medido). Apagarlo ahorra los tres
-anotadores de `lllyasviel/Annotators`.
+`FEAT_POSE_OPENPOSE` is `false` because `OpenposePreprocessor` fails on anime
+and worsens the pose — see the [What works and what does not](#what-works-and-what-does-not-all-measured)
+table. Turning it off saves the three annotators of `lllyasviel/Annotators`.
 
-> ⚠️ Apagar un toggle **no cambia los workflows**. Si mandas un workflow que usa
-> algo apagado, ComfyUI falla con el nombre del modelo o del nodo que falta.
+> ⚠️ Turning a toggle off **does not change the workflows**. If you send a
+> workflow that uses something disabled, ComfyUI fails with the name of the
+> missing model or node.
 
-**Dos cosas que estaban colgando de una descarga en pleno request** y ahora se
-pre-bajan en el provisioning:
+**Two things that used to hang off a download in the middle of a request**
+and are now pre-downloaded at provisioning time:
 
-- Los modelos de **DWPose** (`yolox_l.onnx` + `dw-ll_ucoco_384.onnx`, 351 MB) no
-  estaban en ningún array; el nodo se los bajaba de HuggingFace en el primer
-  request. Se descubrió al inventariar un worker vivo: estaban en disco sin
-  estar en el provisioning.
-- `mediapipe` y `trimesh`, que el nodo de MeshGraphormer instala **por pip** si
-  no los encuentra, también en pleno request.
+- The **DWPose** models (`yolox_l.onnx` + `dw-ll_ucoco_384.onnx`, 351 MB) were
+  not in any array; the node downloaded them from HuggingFace on the first
+  request. Found while inventorying a live worker: they were on disk without
+  being in the provisioning.
+- `mediapipe` and `trimesh`, which the MeshGraphormer node installs **via
+  pip** if it does not find them, also mid-request.
 
-> 🐛 **Cuidado al añadir toggles**: un `[ -n "$k" ] && echo ...` como última
-> sentencia de un `for` hace que la sustitución `$( ... )` entera salga con
-> código 1 cuando el array queda vacío, y con `set -euo pipefail` eso **mata el
-> provisioning** y el worker nunca se marca listo. Usa `if ... then ... fi`.
-> Los bucles sobre arrays llevan además `"${ARR[@]:-}"` y un `continue` de
-> guardia.
+> 🐛 **Careful when adding toggles**: a `[ -n "$k" ] && echo ...` as the last
+> statement of a `for` makes the whole `$( ... )` substitution exit with code
+> 1 when the array ends up empty, and with `set -euo pipefail` that **kills
+> the provisioning** and the worker never gets marked ready. Use
+> `if ... then ... fi`. Loops over arrays also carry `"${ARR[@]:-}"` and a
+> guard `continue`.
 
-### Añadir un modelo o un LoRA
+### Adding a model or LoRA
 
-1. Súbelo a R2 bajo `comfy-stack/models/<tipo>/`.
-2. Añade una línea al array `MODELS` de `serverless_provision.sh`:
+1. Upload it to R2 under `comfy-stack/models/<type>/`.
+2. Add a line to the `MODELS` array of `serverless_provision.sh`:
 
    ```bash
    MODELS=(
      ...
-     "comfy-stack/models/loras/mi_lora.safetensors|loras/mi_lora.safetensors"
+     "comfy-stack/models/loras/my_lora.safetensors|loras/my_lora.safetensors"
    )
    ```
 
-   El formato es `<clave en el bucket>|<ruta relativa dentro de models/>`.
-3. `python renew_provisioning.py --update-workers`
+   The format is `<bucket key>|<relative path inside models/>`.
+3. `python scripts/renew_provisioning.py --update-workers`
 
-Los modelos ya descargados se saltan comparando tamaño con el de R2, así que
-añadir uno nuevo no vuelve a bajar los 7 GB.
+Already-downloaded models are skipped by comparing size with R2, so adding a
+new one does not re-download the 7 GB.
 
-### Probar un modelo sin reprovisionar
+### Testing a model without reprovisioning
 
-Para **pruebas**, no merece la pena tocar `serverless_provision.sh`: eso dispara
-el reemplazo del worker, un arranque en frío y volver a bajar los ~7 GB. Se baja
-el modelo directamente al worker vivo por SSH:
+For **tests**, touching `serverless_provision.sh` is not worth it: that
+triggers a worker replacement, a cold start and re-downloading the ~7 GB. The
+model is downloaded straight to the live worker over SSH:
 
 ```bash
-ssh -i ~/.ssh/xcl -o IdentitiesOnly=yes -p <puerto> root@<ip>
+ssh -i ~/.ssh/xcl -o IdentitiesOnly=yes -p <port> root@<ip>
 curl -sL -o /workspace/ComfyUI/models/ultralytics/bbox/hand_yolov8s.pt \
   https://huggingface.co/Bingsu/adetailer/resolve/main/hand_yolov8s.pt
 ```
 
-**ComfyUI recoge el fichero nuevo sin reiniciar**; se comprueba con
+**ComfyUI picks up the new file without a restart**; verify with
 `curl -s http://127.0.0.1:18188/object_info/UltralyticsDetectorProvider`.
 
-El puerto y la IP salen de `vastai show instances --raw` (campo `ports`); ojo
-que el `ssh_host`/`ssh_port` que muestra la CLI es el proxy, y el mapeo directo
-del 22 suele ser otro. La clave que funciona es `~/.ssh/xcl`.
+The port and IP come from `vastai show instances --raw` (field `ports`); note
+that the `ssh_host`/`ssh_port` the CLI shows is the proxy, and the direct
+mapping of 22 is usually a different one. The key that works is `~/.ssh/xcl`.
 
-> Dos callejones sin salida ya comprobados: `vastai attach ssh` sobre una
-> instancia **ya corriendo** devuelve `success` pero **no propaga la clave**, y
-> `vastai execute` solo funciona con instancias **paradas**.
+> Two dead ends already checked: `vastai attach ssh` on an instance that is
+> **already running** returns `success` but **does not propagate the key**,
+> and `vastai execute` only works on **stopped** instances.
 
-> ⚠️ Lo bajado así **no sobrevive al reemplazo del worker**. Cuando la prueba
-> convenza, hazlo permanente y lanza `renew_provisioning.py --update-workers`.
+> ⚠️ What is downloaded this way **does not survive a worker replacement**.
+> Once the test convinces you, make it permanent and run
+> `renew_provisioning.py --update-workers`.
 
-Para hacerlo permanente hay tres sitios en `serverless_provision.sh`, todos
-colgando del toggle de su característica:
+To make it permanent there are three spots in `serverless_provision.sh`, all
+hanging off the toggle of their feature:
 
-- **`MODELS`** / **`EXTRA_FILES`** — ficheros espejados en R2. Verifican tamaño
-  contra el origen y se saltan si ya están.
-- **`URL_FILES`** — descarga directa por URL, para pesos públicos de HuggingFace
-  que no merece la pena espejar. Formato `<url>|<ruta relativa a COMFY_DIR>`.
-  Solo se salta si el fichero ya existe; no compara tamaños.
+- **`MODELS`** / **`EXTRA_FILES`** — files mirrored in R2. They verify size
+  against the origin and skip if already present.
+- **`URL_FILES`** — direct URL download, for public HuggingFace weights not
+  worth mirroring. Format `<url>|<path relative to COMFY_DIR>`. Only skipped
+  if the file already exists; does not compare sizes.
 
-Lo que hace falta para las variantes de manos, si se quieren hacer permanentes:
+What the hand variants need, if they are to be made permanent:
 
-| Ruta | Ficheros | Tamaño |
+| Path | Files | Size |
 |---|---|---|
-| `hd3y` (yolo) | `Bingsu/adetailer` → `hand_yolov8s.pt` | 22 MB |
-| `hd3m` (MeshGraphormer) | `hr16/ControlNet-HandRefiner-pruned` → `graphormer_hand_state_dict.bin` + `hrnetv2_w64_imagenet_pretrained.pth` | 856 + 513 MB |
+| `hd3y` (yolo) | `Bingsu/adetailer` -> `hand_yolov8s.pt` | 22 MB |
+| `hd3m` (MeshGraphormer) | `hr16/ControlNet-HandRefiner-pruned` -> `graphormer_hand_state_dict.bin` + `hrnetv2_w64_imagenet_pretrained.pth` | 856 + 513 MB |
 
-El tercer fichero de ese repo, `control_sd15_inpaint_depth_hand_fp16.safetensors`
-(722 MB), **no hace falta**: es el ControlNet de SD1.5 y aquí se usa el union
-SDXL en modo depth. `mediapipe` y `trimesh` ya están en la imagen; si no
-estuvieran, el nodo los instala por pip **en pleno request**.
+The third file of that repo, `control_sd15_inpaint_depth_hand_fp16.safetensors`
+(722 MB), is **not needed**: it is the SD1.5 ControlNet and here the SDXL
+union in depth mode is used. `mediapipe` and `trimesh` are already in the
+image; if they were not, the node would pip-install them **mid-request**.
 
-### Añadir un custom node
+### Adding a custom node
 
-Una línea en el array `NODES`, formato `<repo>|<directorio>|<recursive>`:
+One line in the `NODES` array, format `<repo>|<directory>|<recursive>`:
 
 ```bash
 NODES=(
   ...
-  "https://github.com/no-tal-cual/ComfyUI-LoQueSea.git|ComfyUI-LoQueSea|"
+  "https://github.com/whatever/ComfyUI-Something.git|ComfyUI-Something|"
 )
 ```
 
-El tercer campo solo se rellena (con `recursive`) si el repo tiene submódulos,
-como `ComfyUI_UltimateSDUpscale`. Si el nodo trae `requirements.txt` se instala
-solo; si necesita paquetes extra, añádelos a `PIP_EXTRA`.
+The third field is only filled (with `recursive`) if the repo has submodules,
+like `ComfyUI_UltimateSDUpscale`. If the node ships a `requirements.txt` it
+installs itself; if it needs extra packages, add them to `PIP_EXTRA`.
 
-### Cambiar la GPU, la imagen o los puertos
+### Changing the GPU, the image or the ports
 
-Están como constantes arriba de `renew_provisioning.py`: `IMAGE`, `IMAGE_TAG`,
-`SEARCH_PARAMS`, `HF_TOKEN`, `ONSTART`. Editas y corres `renew_provisioning.py`.
-Por ejemplo, para aceptar también 4090:
+They are constants at the top of `renew_provisioning.py`: `IMAGE`, `IMAGE_TAG`,
+`SEARCH_PARAMS`, `HF_TOKEN`, `ONSTART`. Edit and run `renew_provisioning.py`.
+For example, to also accept 4090s:
 
 ```python
 SEARCH_PARAMS = "gpu_name in [RTX_5080,RTX_4090] disk_space>=60 dph_total<0.40 verified=true rentable=true"
 ```
 
-Ojo con bajar de 16 GB de VRAM: el workflow con FaceDetailer y upscale a 2048
-no cabe cómodo.
+Careful going below 16 GB of VRAM: the workflow with FaceDetailer and upscale
+to 2048 does not fit comfortably.
 
-### Cambiar el workflow del benchmark
+### Changing the benchmark workflow
 
-`BENCHMARK_CKPT` y el bloque `BENCH_JSON` al final de `serverless_provision.sh`.
-Se mantiene ligero a propósito (512×512, 8 pasos) porque solo sirve para que el
-autoscaler mida el rendimiento de la GPU. Si lo haces pesado, alargas el arranque
-en frío de todos los workers.
+`BENCHMARK_CKPT` and the `BENCH_JSON` block at the end of
+`serverless_provision.sh`. It is kept light on purpose (512x512, 8 steps)
+because it only serves for the autoscaler to measure GPU performance. If you
+make it heavy, you lengthen every worker's cold start.
 
 ---
 
-## Operación
+## Operations
 
 ```powershell
-vastai show endpoints                    # estado del endpoint
-vastai get endpt-workers $VAST_ENDPOINT_ID           # workers y su status
-vastai get endpt-logs $VAST_ENDPOINT_ID              # log del autoscaler (lo más útil)
-vastai get wrkgrp-logs $VAST_WORKERGROUP_ID             # log del workergroup
-vastai show workergroups                 # config del workergroup
-vastai show instances                    # instancias vivas
+vastai show endpoints                    # endpoint state
+vastai get endpt-workers $VAST_ENDPOINT_ID           # workers and their status
+vastai get endpt-logs $VAST_ENDPOINT_ID              # autoscaler log (the most useful)
+vastai get wrkgrp-logs $VAST_WORKERGROUP_ID             # workergroup log
+vastai show workergroups                 # workergroup config
+vastai show instances                    # live instances
 
-# parar el gasto del todo
+# stop all spending
 vastai update endpoint $VAST_ENDPOINT_ID --max_workers 0 --cold_workers 0 --min_load 0
 
-# volver a levantarlo
+# bring it back up
 vastai update endpoint $VAST_ENDPOINT_ID --max_workers 1 --cold_workers 1 --min_load 0 --target_util 0.9
 ```
 
-Config actual: `max_workers=1`, `cold_workers=0`, `min_load=0`. Un solo worker,
-que se para solo cuando no hay carga y lo despierta el siguiente request.
+Current config: `max_workers=1`, `cold_workers=0`, `min_load=0`. A single
+worker that stops itself when idle and is woken by the next request.
 
-> ⚠️ **No pongas `cold_workers=1` con `max_workers=1`.** En cuanto hay un worker
-> caliente, el autoscaler ve 0 workers fríos, intenta crear uno, no cabe en la
-> única plaza y lo destruye — cada 5 segundos, indefinidamente. En los logs se ve
-> como `Creating 1 workers` / `Destroying 1 workers` en bucle. No se nota al
-> principio porque hace falta que haya un worker caliente ocupando la plaza.
+> ⚠️ **Do not set `cold_workers=1` with `max_workers=1`.** As soon as there
+> is a warm worker, the autoscaler sees 0 cold workers, tries to create one,
+> cannot fit in the single slot and destroys it — every 5 seconds,
+> indefinitely. In the logs you see `Creating 1 workers` / `Destroying 1
+> workers` in a loop. It goes unnoticed at first because a warm worker has to
+> be occupying the slot.
 >
-> Si quieres una plaza fría reservada de verdad, necesitas `max_workers=2`
-> (1 caliente + 1 frío), asumiendo que puede haber 2 GPUs alquiladas.
+> If you really want a reserved cold slot, you need `max_workers=2` (1 warm +
+> 1 cold), assuming 2 GPUs rented is acceptable.
 
 ---
 
-## Escenas coherentes: personaje sobre escenario fijo
+## Coherent scenes: character over a fixed set
 
-Pipeline para meter un personaje en un escenario que se mantiene idéntico entre
-frames. Todo ocurre **dentro de un solo grafo**: no hay que subir imágenes al
-worker, que en serverless es un lío.
+Pipeline to put a character into a scene that stays identical between frames.
+Everything happens **inside a single graph**: no images need to be uploaded
+to the worker, which is a mess in serverless.
 
 ```
-ESCENARIO ──► KSampler(seed fija) ─────────────► [a_escena]  ← el "set"
-                                                     │
-PERSONAJE ──► KSampler ──► BiRefNet ──► escalar ─────┤
-                              │                      │
-                              │              ImageCompositeMasked
-                              │                      │
-                        DWPreprocessor          [b_collage]
-                              │                      │
-                    ControlNet Union            VAEEncode
-                       (openpose)                    │
-                              └──────────► SetLatentNoiseMask ──► KSampler
-                                                                      │
-                                                                 [c_fusionado]
-                                                                      │
-                                            recortar → x1024 → re-difundir → pegar
-                                                                      │
-                                                                 [f_detalle]
+SCENE ──► KSampler(fixed seed) ─────────────► [a_scene]  <- the "set"
+                                                   │
+CHARACTER ──► KSampler ──► BiRefNet ──► scale ──────┤
+                             │                      │
+                             │              ImageCompositeMasked
+                             │                      │
+                       DWPreprocessor          [b_collage]
+                             │                      │
+                   ControlNet Union            VAEEncode
+                      (openpose)                   │
+                             └──────────► SetLatentNoiseMask ──► KSampler
+                                                                     │
+                                                                [c_fused]
+                                                                     │
+                                       crop -> x1024 -> re-diffuse -> paste
+                                                                     │
+                                                                [f_detail]
 ```
 
-### Ficheros
+### Files
 
 | | |
 |---|---|
-| `construir_wf.py` | **Arma el workflow** encendiendo/apagando cada parte |
-| `escena.py` | Runner con `--sweep` de denoise |
-| `ab_detalle.py` | A/B de la segunda pasada, con tiempos |
-| `ab_resolucion.py` | A/B de las palancas de resolución (`--vertical`, `--lienzo`, `--upscale`), con hojas de comparación |
-| `frames.py` | Secuencia de poses en un set fijo |
-| `correr.py` | Secuencia de movimiento (personaje cruzando la escena) |
-| `wf_v_<pose>_<variante>.json` | La matriz pregenerada, para el A/B y para inspeccionar a mano |
+| `scripts/construir_wf.py` | **Builds the workflow**, turning each part on/off |
+| `scripts/escena.py` | Runner with `--sweep` of denoise |
+| `scripts/ab_detalle.py` | A/B of the second pass, with timings |
+| `scripts/ab_resolucion.py` | A/B of the resolution levers (`--vertical`, `--canvas`, `--upscale`), with comparison sheets |
+| `scripts/frames.py` | Pose sequence on a fixed set |
+| `scripts/correr.py` | Movement sequence (character crossing the scene) |
+| `workflows/wf_v_<pose>_<variant>.json` | The pre-generated matrix, for the A/B and for manual inspection |
 
-### Interruptores
+### Switches
 
-Todo el pipeline se enciende y se apaga con los mismos flags, y significan lo
-mismo en `construir_wf.py`, `escena.py` y `correr.py`:
+The whole pipeline is turned on/off with the same flags, meaning the same in
+`construir_wf.py`, `escena.py` and `correr.py`:
 
-| Flag | Valores | Default | Qué hace |
+| Flag | Values | Default | What it does |
 |---|---|---|---|
-| `--pose` | `none` / `openpose` / `dwpose` | `dwpose` | Guía de pose por ControlNet |
-| `--detalle` | `no` / `hd` / `hd2` | `hd2` | 2ª pasada sobre el recorte del personaje |
-| `--cara` | flag | off | `FaceDetailer` **dentro** de la 2ª pasada |
-| `--manos` | `yolo` / `mesh` / `ambas` | off | Pasada de manos **dentro** de la 2ª pasada |
-| `--sin-mascara` | flag | off | Quita `SetLatentNoiseMask` (deforma el escenario) |
-| `--variante` | ver abajo | — | Atajo con nombre |
-| `--workflow` | ruta | — | Usa un `.json` ya hecho e ignora todo lo anterior |
+| `--pose` | `none` / `openpose` / `dwpose` | `dwpose` | Pose guidance via ControlNet |
+| `--detail` | `no` / `hd` / `hd2` | `hd2` | 2nd pass over the character crop |
+| `--face` | flag | off | `FaceDetailer` **inside** the 2nd pass |
+| `--hands` | `yolo` / `mesh` / `both` | off | Hands pass **inside** the 2nd pass |
+| `--no-mask` | flag | off | Removes `SetLatentNoiseMask` (deforms the scene) |
+| `--variant` | see below | — | Named shortcut |
+| `--workflow` | path | — | Uses an existing `.json` and ignores everything above |
 
-Y las palancas de **resolución del personaje**, que son ortogonales a las de
-arriba (se aplican también cuando usas `--variante`):
+And the **character resolution** levers, orthogonal to the ones above (they
+also apply when using `--variant`):
 
-| Flag | Default | Qué hace |
+| Flag | Default | What it does |
 |---|---|---|
-| `--vertical` | off | Genera el personaje en `832x1216` (ratio nativo SDXL) en vez de `1024x1024` |
-| `--lienzo N` | `1024` | Lado del escenario/composición. `1536` duplica los elementos del grafo |
-| `--upscale` | off | `UltimateSDUpscale` 2x sobre el compuesto final |
-| `--bbox` | off | **No implementado**, ver abajo |
+| `--vertical` | off | Generates the character in `832x1216` (native SDXL ratio) instead of `1024x1024` |
+| `--canvas N` | `1024` | Side of the scene/composition. `1536` doubles the graph's elements |
+| `--upscale` | off | `UltimateSDUpscale` 2x over the final composite |
+| `--bbox` | off | **Not implemented**, see below |
 
-El **escenario → personaje → collage** es la base del pipeline y no se apaga:
-es lo que hace el propio grafo. Lo que sí se apaga es la máscara que protege el
-escenario en la fusión.
+The **scene -> character -> collage** is the base of the pipeline and cannot
+be turned off: it is what the graph itself does. What can be turned off is
+the mask that protects the scene during the fusion.
 
 ```powershell
-# escribir un workflow concreto
-python construir_wf.py --pose dwpose --detalle hd2 --cara --manos yolo -o mi_wf.json
+# write a concrete workflow
+python scripts/construir_wf.py --pose dwpose --detail hd2 --face --hands yolo -o my_wf.json
 
-# lo mismo, con el atajo
-python construir_wf.py --variante hd3y -o mi_wf.json
+# same thing, via the shortcut
+python scripts/construir_wf.py --variant hd3y -o my_wf.json
 
-# sin escribir fichero: los runners lo arman en memoria
-python escena.py --pose dwpose --detalle hd2 --cara --manos yolo --denoise 0.85
-python correr.py --variante hd3y --frames 8
+# without writing a file: the runners build it in memory
+python scripts/escena.py --pose dwpose --detail hd2 --face --hands yolo --denoise 0.85
+python scripts/correr.py --variant hd3y --frames 8
 
-# regenerar la matriz entera (3 poses x 7 variantes)
-python construir_wf.py --matriz
+# regenerate the whole matrix (3 poses x 7 variants)
+python scripts/construir_wf.py --matrix
 ```
 
-Los atajos de `--variante` son combinaciones con nombre de los flags de arriba:
+The `--variant` shortcuts are named combinations of the flags above:
 
-| Variante | Equivale a |
+| Variant | Equivalent to |
 |---|---|
-| `sd` | `--detalle no` |
-| `hd` | `--detalle hd` (la versión original, solo como baseline) |
-| `hd2` | `--detalle hd2` |
-| `hd3` | `--detalle hd2 --cara` |
-| `hd3y` | `--detalle hd2 --cara --manos yolo` |
-| `hd3m` | `--detalle hd2 --cara --manos mesh` |
-| `hd3ym` | `--detalle hd2 --cara --manos ambas` |
+| `sd` | `--detail no` |
+| `hd` | `--detail hd` (the original version, only as baseline) |
+| `hd2` | `--detail hd2` |
+| `hd3` | `--detail hd2 --face` |
+| `hd3y` | `--detail hd2 --face --hands yolo` |
+| `hd3m` | `--detail hd2 --face --hands mesh` |
+| `hd3ym` | `--detail hd2 --face --hands both` |
 
-El builder rechaza las combinaciones imposibles en vez de generar un grafo roto:
-`--cara` y `--manos` viven **dentro** de la 2ª pasada, así que necesitan
-`--detalle hd2`; y `--sin-mascara` no es compatible con la 2ª pasada, porque el
-recorte reutiliza esa misma máscara (nodo `53`).
+The builder rejects impossible combinations instead of generating a broken
+graph: `--face` and `--hands` live **inside** the 2nd pass, so they need
+`--detail hd2`; and `--no-mask` is incompatible with the 2nd pass, because
+the crop reuses that same mask (node `53`).
 
-### Lo que funciona y lo que no (todo medido)
+### What works and what does not (all measured)
 
-| Técnica | Veredicto |
+| Technique | Verdict |
 |---|---|
-| Escenario fijo + collage | Base sólida |
-| img2img **sin** máscara | ❌ **Deforma el escenario** |
-| img2img **con** máscara | ✅ Escenario intacto a cualquier denoise |
-| `OpenposePreprocessor` | ❌ Falla con anime, empeora la pose |
-| `DWPreprocessor` | ✅ La mejor pose de las tres |
-| Doble inpaint a 1024 (`hd`) | ⚠️ Mejora leve: deformaba el aspecto y usaba el prompt de escena |
-| Doble inpaint a 1536 con prompt propio (`hd2`) | ✅ La ganancia grande. Cara y pelo dibujados de verdad |
-| `FaceDetailer` sobre el recorte (`hd3`) | ✅ Mejora fina de ojos y pestañas, +3,5 s |
-| Identidad entre frames | ⚠️ Sin resolver sin LoRA |
+| Fixed scene + collage | Solid base |
+| img2img **without** mask | ❌ **Deforms the scene** |
+| img2img **with** mask | ✅ Scene intact at any denoise |
+| `OpenposePreprocessor` | ❌ Fails on anime, worsens the pose |
+| `DWPreprocessor` | ✅ The best pose of the three |
+| Double inpaint at 1024 (`hd`) | ⚠️ Mild improvement: deformed the aspect and used the scene prompt |
+| Double inpaint at 1536 with own prompt (`hd2`) | ✅ The big win. Face and hair actually drawn |
+| `FaceDetailer` over the crop (`hd3`) | ✅ Fine improvement of eyes and lashes, +3.5 s |
+| Identity between frames | ⚠️ Unsolved without LoRA |
 
-### Por qué la máscara es obligatoria
+### Why the mask is mandatory
 
-`img2img` re-difunde **toda** la imagen. Sin máscara, subir el denoise para
-integrar mejor al personaje también reescribe el escenario: a 0.65 aparecían
-molduras en el techo y cambiaban la lámpara y el marco de la ventana. Con
-`SetLatentNoiseMask` limitado a la zona del personaje, el resto queda intacto y
-puedes subir a 0.85 sin riesgo.
+`img2img` re-diffuses **the whole image**. Without a mask, raising the
+denoise to integrate the character better also rewrites the scene: at 0.65
+moldings appeared on the ceiling and the lamp and window frame changed. With
+`SetLatentNoiseMask` limited to the character area, the rest stays intact and
+you can go up to 0.85 without risk.
 
-Dos parámetros importantes de la máscara:
+Two important mask parameters:
 
-- **`GrowMask expand`**: ensancha más allá de la silueta. Ese anillo es donde el
-  modelo pinta la **sombra de contacto**. Con 48 aparecían artefactos en la
-  pared; **24** va bien.
-- **`FeatherMask 32`**: difumina el borde entre lo repintado y lo intacto.
+- **`GrowMask expand`**: widens beyond the silhouette. That ring is where the
+  model paints the **contact shadow**. With 48, artifacts appeared on the
+  wall; **24** works well.
+- **`FeatherMask 32`**: blurs the edge between repainted and intact areas.
 
-### El compromiso denoise / identidad
+### The denoise / identity tradeoff
 
-| denoise | Escenario | Pose | Identidad |
+| denoise | Scene | Pose | Identity |
 |---|---|---|---|
-| 0.45 | intacto | respeta el collage | se conserva |
-| 0.55 | intacto | no corrige un collage malo | se conserva |
-| 0.85 | intacto | **recoloca según el prompt** | **deriva** |
+| 0.45 | intact | respects the collage | preserved |
+| 0.55 | intact | does not fix a bad collage | preserved |
+| 0.85 | intact | **repositions per the prompt** | **drifts** |
 
-A denoise alto el modelo reinterpreta la pose dentro de la máscara, así que el
-collage funciona como boceto y no hace falta colocar el recorte al píxel. El
-precio es que la ropa y la cara derivan. **La LoRA del personaje es lo único que
-tapa ese hueco** — ver [`loras.md`](loras.md), aunque antes conviene probar a
-reforzar los tags de atuendo con pesos, que es gratis.
+At high denoise the model reinterprets the pose inside the mask, so the
+collage works as a sketch and the cutout does not need pixel-perfect
+placement. The price is that clothes and face drift. **The character LoRA is
+the only thing that closes that gap** — see [`docs/loras.md`](docs/loras.md),
+though it is worth first trying to reinforce the outfit tags with weights,
+which is free.
 
-### Detalle: el doble inpaint
+### Detail: the double inpaint
 
-Si el personaje ocupa 640 px de un lienzo de 1024, en el latente son ~80×80
-posiciones para toda la figura: cara, manos y pies se quedan sin píxeles. La
-segunda pasada recorta la zona, la amplía, re-difunde y la pega de vuelta.
-Mismo principio que el `FaceDetailer` pero para el cuerpo entero.
+If the character occupies 640 px of a 1024 canvas, in the latent that is
+~80x80 positions for the whole figure: face, hands and feet run out of
+pixels. The second pass crops the area, enlarges it, re-diffuses and pastes
+it back. Same principle as the `FaceDetailer` but for the whole body.
 
-Hay tres variantes, que genera `construir_wf.py`:
+There are three variants, generated by `construir_wf.py`:
 
-| | Recorte ampliado a | Prompt | Denoise | Extra |
+| | Crop enlarged to | Prompt | Denoise | Extra |
 |---|---|---|---|---|
-| `hd` | 1024×1024 **fijo** | el de la escena (nodos `40`/`41`) | 0.35 | — |
-| `hd2` | 1536 por el lado largo, **aspecto intacto** | propio del recorte (nodos `93`/`94`) | 0.45 | — |
-| `hd3` | igual que `hd2` | igual que `hd2` | 0.45 | `FaceDetailer` sobre el recorte |
+| `hd` | 1024x1024 **fixed** | the scene's (nodes `40`/`41`) | 0.35 | — |
+| `hd2` | 1536 on the long side, **aspect intact** | its own crop prompt (nodes `93`/`94`) | 0.45 | — |
+| `hd3` | same as `hd2` | same as `hd2` | 0.45 | `FaceDetailer` over the crop |
 
-**`hd` daba poco por tres razones, y las tres eran arreglables:**
+**`hd` gave little for three reasons, and all three were fixable:**
 
-1. **Deformaba.** El recorte real es `704×676` y se escalaba a `1024×1024`
-   fijo: se estiraba un 4% de ancho, se re-difundía deformado y se devolvía
-   estirado. `escalado()` en `construir_wf.py` lo escala ahora proporcional,
-   redondeando a múltiplo de 8.
-2. **Ampliaba poco.** 704→1024 es 1.45×; la cara seguía midiendo ~130 px. A
-   1536 son 2.2× y la cara pasa de 300 px, que ya es territorio donde el modelo
-   dibuja iris, pestañas y mechones separados.
-3. **Prompt equivocado.** Usaba el positivo de la escena
-   (*"sitting on the edge of the bed, bedroom, soft window light"*). En un
-   recorte ya cerrado sobre el personaje, eso gasta capacidad repintando fondo.
-   `hd2` usa un prompt propio, solo de personaje y detalle.
+1. **It deformed.** The real crop is `704x676` and it was scaled to a fixed
+   `1024x1024`: stretched 4% in width, re-diffused deformed and returned
+   stretched. `scale_to()` in `construir_wf.py` now scales proportionally,
+   rounding to a multiple of 8.
+2. **It enlarged little.** 704->1024 is 1.45x; the face still measured
+   ~130 px. At 1536 it is 2.2x and the face passes 300 px, which is territory
+   where the model draws irises, lashes and separate strands.
+3. **Wrong prompt.** It used the scene's positive
+   (*"sitting on the edge of the bed, bedroom, soft window light"*). On a
+   crop already closed around the character, that spends capacity repainting
+   background. `hd2` uses its own prompt, character-and-detail only.
 
-`hd3` mete además un `FaceDetailer` **después** de ampliar el recorte, que es
-donde sale rentable: en el lienzo de 1024 la cara mide ~90 px y el detector
-tiene poco con lo que trabajar; sobre el recorte a 1536 mide ~300 px. Toca
-17k píxeles, todos dentro del bbox de la cara.
+`hd3` also adds a `FaceDetailer` **after** enlarging the crop, which is where
+it pays off: on the 1024 canvas the face measures ~90 px and the detector has
+little to work with; on the 1536 crop it measures ~300 px. It touches 17k
+pixels, all inside the face bbox.
 
-### Manos: `hd3y`, `hd3m`, `hd3ym`
+### Hands: `hd3y`, `hd3m`, `hd3ym`
 
-Tres variantes más, todas encima de `hd3` y actuando sobre el recorte ya ampliado:
+Three more variants, all on top of `hd3` and acting on the already-enlarged
+crop:
 
-| | Cómo encuentra la mano | Qué guía la re-difusión | Denoise |
+| | How it finds the hand | What guides the re-diffusion | Denoise |
 |---|---|---|---|
-| `hd3y` | detector `bbox/hand_yolov8s.pt` | solo el prompt | 0.30 |
-| `hd3m` | malla 3D de MeshGraphormer | **depth de la malla** por ControlNet union | 0.65 |
-| `hd3ym` | las dos, malla primero y detector después | — | — |
+| `hd3y` | `bbox/hand_yolov8s.pt` detector | only the prompt | 0.30 |
+| `hd3m` | MeshGraphormer 3D mesh | **mesh depth** via ControlNet union | 0.65 |
+| `hd3ym` | both, mesh first and detector after | — | — |
 
-`FaceDetailer` **no es específico de caras**: recorta lo que le marque el
-`bbox_detector`. Con el detector de manos hace exactamente lo mismo. Por eso
-`hd3y` son solo dos nodos.
+`FaceDetailer` **is not face-specific**: it crops whatever the
+`bbox_detector` marks. With the hand detector it does exactly the same. That
+is why `hd3y` is only two nodes.
 
-MeshGraphormer (el pipeline **HandRefiner**) ajusta una malla 3D a la mano y
-devuelve **dos** salidas: el mapa de profundidad y la máscara de la zona. Es una
-**guía de geometría, no un corrector**: la pasada de inpaint hace falta igual.
-Lo que sustituye es el detector, no la pasada.
+MeshGraphormer (the **HandRefiner** pipeline) fits a 3D mesh to the hand and
+returns **two** outputs: the depth map and the mask of the area. It is a
+**geometry guide, not a fixer**: the inpaint pass is still needed. What it
+replaces is the detector, not the pass.
 
-#### Los dos detectores fallan de forma distinta
+#### The two detectors fail differently
 
-Medido sobre dos escenas, una con un puño pequeño y medio ocluido y otra con la
-mano abierta y grande:
+Measured on two scenes, one with a small, half-occluded fist and another with
+a large open hand:
 
-| | puño pequeño ocluido | mano abierta y grande |
+| | small occluded fist | large open hand |
 |---|---|---|
-| `hand_yolov8s` | detecta | detecta 2 manos, conf 0.87 |
-| MeshGraphormer | **no detecta a ningún umbral** (0.6 / 0.3 / 0.15) | detecta ya a 0.6 |
+| `hand_yolov8s` | detects | detects 2 hands, conf 0.87 |
+| MeshGraphormer | **does not detect at any threshold** (0.6 / 0.3 / 0.15) | detects already at 0.6 |
 
-> ⚠️ **MeshGraphormer falla en silencio.** Si no detecta, `get_depth` devuelve
-> `None` y el nodo rellena con `np.zeros_like`: **depth negro y máscara vacía**,
-> sin error ni aviso. La pasada entera se convierte en un ida y vuelta por el
-> VAE que solo cuesta tiempo. Si usas esta ruta, mira siempre la salida
-> `g_depth`: negra = no ha hecho nada.
+> ⚠️ **MeshGraphormer fails silently.** If it does not detect, `get_depth`
+> returns `None` and the node fills with `np.zeros_like`: **black depth and
+> empty mask**, without error or warning. The whole pass becomes a round trip
+> through the VAE that only costs time. If you use this path, always check
+> the `g_depth` output: black = it did nothing.
 
-El umbral por defecto del nodo (`detect_thr=0.6`) es además demasiado estricto
-para anime — sobre la imagen completa detectaba 0 manos a 0.6 y 1 a 0.3 — así
-que `construir_wf.py` lo baja a `MESH_DETECT_THR = 0.3`. Aun así no salva el
-caso del puño ocluido. No es un problema de montaje: sobre una foto real el
-mismo detector encuentra 2 manos a 0.6.
+The node's default threshold (`detect_thr=0.6`) is also too strict for anime
+— on the full image it detected 0 hands at 0.6 and 1 at 0.3 — so
+`construir_wf.py` lowers it to `MESH_DETECT_THR = 0.3`. Even so it does not
+save the occluded-fist case. It is not a wiring problem: on a real photo the
+same detector finds 2 hands at 0.6.
 
-#### Qué elegir
+#### What to pick
 
-- La mano **borrosa por falta de píxeles** ya la arregla en gran parte `hd2`/`hd3`,
-  porque la re-difusión del cuerpo entero a 1536 también le toca. `hd3y` añade
-  contraste y separación entre dedos.
-- La mano **rota de anatomía** (dedos de más, fusionados) es el caso de
-  MeshGraphormer. Pero si la geometría ya era correcta, el depth no tiene nada
-  que corregir y solo cambia ligeramente la forma.
+- The hand **blurry for lack of pixels** is mostly fixed by `hd2`/`hd3`
+  already, because the whole-body re-diffusion at 1536 reaches it too. `hd3y`
+  adds contrast and finger separation.
+- The **anatomy-broken hand** (extra fingers, fused) is MeshGraphormer's
+  case. But if the geometry was already correct, the depth has nothing to
+  correct and only changes the shape slightly.
 
-**Recomendación: `hd3y`.** Detecta en los dos escenarios, cuesta 7 s y no tiene
-el modo de fallo mudo. Reserva `hd3m`/`hd3ym` para cuando veas manos rotas *y*
-bien visibles.
+**Recommendation: `hd3y`.** It detects in both scenarios, costs 7 s and has
+no silent failure mode. Reserve `hd3m`/`hd3ym` for when you see broken *and*
+clearly visible hands.
 
-### Resolución del personaje: dónde se pierde y qué la recupera
+### Character resolution: where it is lost and what recovers it
 
-El personaje se genera en su propio lienzo, se recorta con BiRefNet y se escala a
-una caja dentro del escenario. Se pierde resolución en **dos sitios distintos**, y
-cada palanca ataca uno:
+The character is generated on its own canvas, cut out with BiRefNet and
+scaled into a box inside the scene. Resolution is lost in **two different
+places**, and each lever attacks one:
 
-| Dónde | Qué pasa | Palanca |
+| Where | What happens | Lever |
 |---|---|---|
-| En la generación | Un cuerpo entero en `1024x1024` cuadrado solo ocupa una franja vertical; el resto son píxeles de fondo que BiRefNet tira después | `--vertical` (`832x1216`, ratio nativo SDXL) |
-| Al pegarlo | La caja de destino mide `640` sobre un lienzo de `1024` | `--lienzo 1536` |
-| Al final | — | `--upscale` (UltimateSDUpscale 2x sobre el compuesto) |
+| At generation | A full body in square `1024x1024` only occupies a vertical strip; the rest are background pixels BiRefNet throws away | `--vertical` (`832x1216`, native SDXL ratio) |
+| When pasting | The destination box measures `640` on a `1024` canvas | `--canvas 1536` |
+| At the end | — | `--upscale` (UltimateSDUpscale 2x over the composite) |
 
-Toda la geometría vive en **una sola función**, `aplicar_caja()` de
-`construir_wf.py`: coloca la caja del personaje sobre el escenario y devuelve la
-geometría resultante, para que quien tenga que recortar después (la 2ª pasada) no
-la recalcule por su cuenta y se desincronice. Antes esto estaba escrito en dos
-sitios —`escena.py` pisaba lo que hacía `construir_wf.py`— y la última escritura
-borraba a la anterior.
+All the geometry lives in **a single function**, `place_box()` in
+`construir_wf.py`: it places the character box over the scene and returns the
+resulting geometry, so whoever has to crop later (the 2nd pass) does not
+recompute it on its own and desync. Before, this was written in two places —
+`escena.py` stomped what `construir_wf.py` did — and the last write erased
+the previous one.
 
-Las 8 combinaciones, verificadas sobre el grafo (`python ab_resolucion.py`):
+The 8 combinations, verified on the graph (`python scripts/ab_resolucion.py`):
 
-| combo | generación | caja | lienzo | nodos | px de caja |
+| combo | generation | box | canvas | nodes | box px |
 |---|---|---|---|---|---|
 | base | 1024x1024 | 640x640 | 1024 | 59 | 409 600 |
 | `v` | 832x1216 | 440x640 | 1024 | 59 | 281 600 |
@@ -668,384 +686,400 @@ Las 8 combinaciones, verificadas sobre el grafo (`python ab_resolucion.py`):
 | `lu` | 1024x1024 | 960x960 | 1536 | 62 | 921 600 |
 | `vlu` | 832x1216 | 656x960 | 1536 | 62 | 629 760 |
 
-**Cuidado al leer la columna de px:** en vertical la caja tiene *menos* píxeles
-(281k vs 409k) y aun así es la mejora. Lo que importa no son los píxeles de la
-caja sino los que caen **sobre la figura**: antes la silueta ocupaba una franja de
-un cuadrado, ahora llena la caja. No juzgues los combos por el tamaño de la caja.
+**Careful reading the px column:** in vertical the box has *fewer* pixels
+(281k vs 409k) and it is still the improvement. What matters is not the box's
+pixels but those falling **on the figure**: before, the silhouette occupied a
+strip of a square; now it fills the box. Do not judge combos by box size.
 
-**`--bbox` no está implementado**, y el builder lanza `SystemExit` a propósito en
-vez de generar un grafo mudo. La idea: BiRefNet devuelve el recorte sobre el
-lienzo entero con alfa transparente, así que ese padding viaja hasta la caja de
-destino y se lleva buena parte de los píxeles útiles. Recortando a la silueta, la
-figura aprovecha la caja completa.
+**`--bbox` is not implemented**, and the builder raises `SystemExit` on
+purpose instead of generating a silent graph. The idea: BiRefNet returns the
+cutout over the whole canvas with transparent alpha, so that padding travels
+to the destination box and takes a good part of the useful pixels with it.
+Cropping to the silhouette makes the figure use the whole box.
 
-Sondeado el worker vivo (`python sondear_nodos.py`), el nodo que lo hace es
-**`AILab_CropObject`** (de `ComfyUI-RMBG`, que ya instalamos con `FEAT_RMBG`):
+Probed on the live worker (`python scripts/sondear_nodos.py`), the node that
+does this is **`AILab_CropObject`** (from `ComfyUI-RMBG`, already installed
+with `FEAT_RMBG`):
 
 ```
 AILab_CropObject   in: image:IMAGE, mask:MASK, padding:INT   out: IMAGE, MASK
 ```
 
-Es el único candidato cableable tal cual. Los demás (`CropByBBoxes`,
-`ImageCropV2`) exigen un tipo `BOUNDING_BOX` que solo produce un detector
-(`rtdetr`/`sdpose`) o el editor manual del canvas, y `AILab_ImageCrop` recorta a
-coordenadas fijas, no al objeto.
+It is the only candidate wireable as is. The others (`CropByBBoxes`,
+`ImageCropV2`) require a `BOUNDING_BOX` type that only a detector
+(`rtdetr`/`sdpose`) or the manual canvas editor produces, and
+`AILab_ImageCrop` crops to fixed coordinates, not to the object.
 
-### Coste de cada variante
+### Cost of each variant
 
-Medido con `ab_detalle.py`, worker caliente y una seed distinta por variante
-(con la misma seed ComfyUI cachea el grafo y los tiempos salen sin sentido):
+Measured with `ab_detalle.py`, warm worker and a different seed per variant
+(with the same seed ComfyUI caches the graph and the timings make no sense):
 
-| Variante | Tiempo | Sobre `sd` |
+| Variant | Time | vs `sd` |
 |---|---|---|
-| `sd` (sin segunda pasada) | 9,0 s | — |
-| `hd` | 12,5 s | +3,5 s |
-| `hd2` | 18,5 s | +9,5 s |
-| `hd3` | 22,0 s | +13,0 s |
-| `hd3y` | 29,0 s | +20,0 s |
-| `hd3m` | 35,2 s | +26,2 s |
-| `hd3ym` | 43,0 s | +34,0 s |
+| `sd` (no second pass) | 9.0 s | — |
+| `hd` | 12.5 s | +3.5 s |
+| `hd2` | 18.5 s | +9.5 s |
+| `hd3` | 22.0 s | +13.0 s |
+| `hd3y` | 29.0 s | +20.0 s |
+| `hd3m` | 35.2 s | +26.2 s |
+| `hd3ym` | 43.0 s | +34.0 s |
 
-**`hd2` es el que compensa** y es el default de `correr.py`: se lleva casi toda
-la ganancia por 9,5 s. `hd3` añade una mejora fina en ojos y pestañas por 3,5 s
-más — vale la pena en una imagen suelta, no tanto en una secuencia de 8 frames.
+**`hd2` is the one that pays off** and it is the default of `correr.py`: it
+takes almost all the gain for 9.5 s. `hd3` adds a fine eyes-and-lashes
+improvement for 3.5 s more — worth it in a single image, not so much in an
+8-frame sequence.
 
-Para reproducir la comparación:
+To reproduce the comparison:
 
 ```powershell
-python ab_detalle.py                                     # hd, hd2, hd3
-python ab_detalle.py --variantes hd3,hd3y,hd3m,hd3ym --out ab_manos
+python scripts/ab_detalle.py                                  # hd, hd2, hd3
+python scripts/ab_detalle.py --variants hd3,hd3y,hd3m,hd3ym --out output/ab-detail/ab_manos
 ```
 
-> ⚠️ **Al cronometrar, dale una seed distinta a cada variante.** Con la misma
-> seed ComfyUI cachea los nodos cuyos inputs no cambian y los tiempos salen sin
-> sentido: en una tanda llegó a salir `hd3` en 4,5 s porque reusaba el grafo
-> entero de la anterior.
+> ⚠️ **When timing, give each variant a different seed.** With the same seed
+> ComfyUI caches nodes whose inputs do not change and timings make no sense:
+> in one batch `hd3` came out at 4.5 s because it reused the whole graph of
+> the previous one.
 
-Deja `ab_detalle_full.png` (imagen entera) y `ab_detalle_zoom.png` (cara al
-200%), que es donde de verdad se ve la diferencia.
+Leave `output/ab-detail/ab_detalle_full.png` (whole image) and
+`output/ab-detail/ab_detalle_zoom.png` (face at 200%), which is where the
+difference really shows.
 
 ---
 
-## Costes
+## Costs
 
-Dos partidas independientes:
+Two independent line items:
 
-- **Disco**: se paga **24/7**, por GB **asignado** (no usado). Es lo que domina en
-  un endpoint mayormente parado.
-- **GPU**: solo mientras el worker corre.
+- **Disk**: paid **24/7**, per GB **allocated** (not used). It dominates on
+  a mostly-idle endpoint.
+- **GPU**: only while the worker runs.
 
-### Disco
+### Disk
 
-Medido en el worker real (2026-08-16): con `VAST_DISK_SPACE=16` la imagen + venv
-+ los modelos ocupaban **14 GB de 16**, o sea 2,9 GB libres, y tras bajar los
-pesos de MeshGraphormer quedaban **1,6 GB (91% usado)**. Demasiado justo, así que
-`VAST_DISK_SPACE` está ahora en **18**, donde el worker se queda sobre el 78%.
+Measured on the real worker (2026-08-16): with `VAST_DISK_SPACE=16` the image
++ models occupied **14 GB of 16**, i.e. 2.9 GB free, and after downloading
+the MeshGraphormer weights it was down to **1.6 GB (91% used)**. Too tight,
+so `VAST_DISK_SPACE` is now **18**, where the worker sits around 78%.
 
-**Cuánto disco pedir no afecta a la disponibilidad.** Las máquinas del pool
-ofrecen entre 288 y 1.352 GB, así que `disk_space>=16`, `>=24` o `>=60` devuelven
-exactamente las mismas 7 ofertas a los mismos precios. Lo único que cambia es la
-factura, que es `storage_cost × GB`:
+**How much disk you ask for does not affect availability.** Pool machines
+offer between 288 and 1,352 GB, so `disk_space>=16`, `>=24` or `>=60` return
+exactly the same 7 offers at the same prices. The only thing that changes is
+the bill, which is `storage_cost x GB`:
 
-| `VAST_DISK_SPACE` | Coste al precio actual ($0,0267/GB/mes) | Tope con `storage_cost<=0.11` |
+| `VAST_DISK_SPACE` | Cost at current price ($0.0267/GB/month) | Ceiling with `storage_cost<=0.11` |
 |---|---|---|
-| 16 GB | $0,43/mes | $1,76/mes |
-| **18 GB** | **$0,48/mes** | **$1,98/mes** |
-| 24 GB | $0,64/mes | $2,64/mes |
-| 32 GB | $0,85/mes | $3,52/mes |
+| 16 GB | $0.43/month | $1.76/month |
+| **18 GB** | **$0.48/month** | **$1.98/month** |
+| 24 GB | $0.64/month | $2.64/month |
+| 32 GB | $0.85/month | $3.52/month |
 
-18 GB deja el tope de disco en **$1,98/mes** sin perder ninguna oferta, y con
-los 14 GB que ocupa el stack completo (MeshGraphormer incluido) quedan ~4 GB
-libres. Si se añaden más modelos, subir a 24 cuesta 16 céntimos más al mes.
+18 GB keeps the disk ceiling at **$1.98/month** without losing any offer, and
+with the 14 GB the full stack occupies (MeshGraphormer included) ~4 GB stay
+free. If more models are added, going up to 24 costs 16 more cents a month.
 
-> No hay escalón de **VRAM** entre 16 y 24 GB: el mercado salta de una a otra sin
-> nada en medio, así que pedir `gpu_ram>=18` es pedir `>=24`. Y ahí sí duele:
-> con `storage_cost<=0.125` la 24 GB más barata se va a **$0,288/h** frente a
-> $0,107/h. Esto es sobre **disco**, no sobre VRAM.
+> There is no **VRAM** step between 16 and 24 GB: the market jumps from one
+> to the other with nothing in between, so asking `gpu_ram>=18` is asking
+> `>=24`. And there it hurts: with `storage_cost<=0.125` the cheapest 24 GB
+> goes to **$0.288/h** vs $0.107/h. This is about **disk**, not VRAM.
 
-> ⚠️ **Comprueba siempre el disco real con `df -h /` en el worker antes de
-> decidir**, no te fíes de este número. El README ya se quedó obsoleto una vez
-> (decía 32 GB cuando la instancia tenía 16).
+> ⚠️ **Always check the real disk with `df -h /` on the worker before
+> deciding**, do not trust this number. The README already went stale once
+> (it said 32 GB when the instance had 16).
 
-#### El techo de `storage_cost`
+#### The `storage_cost` ceiling
 
-Está en **`0.11`**, que a 18 GB topa la factura de disco en $1,98/mes. No se baja
-más a propósito:
+It is at **`0.11`**, which at 18 GB caps the disk bill at $1.98/month. It is
+not lowered further on purpose:
 
-| `storage_cost<=` | Ofertas | Tope a 24 GB |
+| `storage_cost<=` | Offers | Ceiling at 24 GB |
 |---|---|---|
-| 0.0625 | **1** ⚠️ | $1,13/mes |
-| 0.0834 | 2 | $1,50/mes |
-| **0.11** | **7** | **$1,98/mes** |
-| 0.125 (el anterior) | 7 | $2,25/mes |
+| 0.0625 | **1** ⚠️ | $1.13/month |
+| 0.0834 | 2 | $1.50/month |
+| **0.11** | **7** | **$1.98/month** |
+| 0.125 (the previous) | 7 | $2.25/month |
 
-Con **una sola oferta viable el autoscaler relaja el tope de precio y alquila por
-encima de `dph_total`** (ver [El `verified=true` fantasma](#el-verifiedtrue-fantasma)),
-que es justo la sorpresa que se quiere evitar. `0.11` mantiene las mismas 7
-ofertas que el `0.125` anterior y baja el techo 27 céntimos: no cuesta nada.
+With **a single viable offer the autoscaler relaxes the price ceiling and
+rents above `dph_total`** (see [The phantom `verified=true`](#the-phantom-verifiedtrue)),
+which is exactly the surprise to avoid. `0.11` keeps the same 7 offers as the
+previous `0.125` and lowers the ceiling 27 cents: it costs nothing.
 
-`storage_cost` va en **$/GB/mes** y la mediana del mercado es **0.20**, o sea
-$3.20/mes a 16 GB (y $12/mes a los 60 GB de antes). El filtro
-`storage_cost<=0.0625` lo topa en $1/mes.
+`storage_cost` is in **$/GB/month** and the market median is **0.20**, i.e.
+$3.20/month at 16 GB (and $12/month at the 60 GB of before). The
+`storage_cost<=0.0625` filter caps it at $1/month.
 
-### Red
+### Network
 
-`inet_down_cost` va en **$/GB**. Un arranque en frío descarga ~22 GB (imagen +
-modelos), así que a $1.30/TB son **~3 céntimos por arranque**. Exigir <$1/TB
-recorta el abanico de 123 a 22 ofertas para ahorrar céntimos al mes: no compensa.
-Por eso el filtro está en `inet_down_cost<=0.005` ($5/TB).
+`inet_down_cost` is in **$/GB**. A cold start downloads ~22 GB (image +
+models), so at $1.30/TB that is **~3 cents per start**. Requiring <$1/TB cuts
+the range from 123 to 22 offers to save cents a month: not worth it. That is
+why the filter is at `inet_down_cost<=0.005` ($5/TB).
 
-### Precio por hora
+### Hourly price
 
-`dph_total<=0.25` es **obligatorio**, no cosmético. Entre las máquinas con disco
-barato hay H100 a $4.26/h, y sin techo el autoscaler puede cogerlas.
+`dph_total<=0.25` is **mandatory**, not cosmetic. Among machines with cheap
+disk there are H100s at $4.26/h, and without a ceiling the autoscaler can
+grab them.
 
-### Antes y después
+### Before and after
 
-| | Antes | Ahora |
+| | Before | Now |
 |---|---|---|
-| Disco asignado | 60 GB | 18 GB |
-| Coste de disco | $12.00/mes | ~$0.48/mes |
-| GPU | $0.190/h | $0.136–0.201/h |
-| Total a 60 h/mes | $23.40 | ~$12.90 |
+| Allocated disk | 60 GB | 18 GB |
+| Disk cost | $12.00/month | ~$0.48/month |
+| GPU | $0.190/h | $0.136-0.201/h |
+| Total at 60 h/month | $23.40 | ~$12.90 |
 
-> Las máquinas con disco barato tienden a cobrar **más** por hora. No se pueden
-> optimizar las dos cosas a la vez: con disco ≤$2/mes, red <$1/TB y ≤$0.15/h
-> simultáneamente hay **cero ofertas** en el mercado. Para un endpoint que está
-> parado la mayor parte del tiempo, prioriza el disco. Si le vas a meter muchas
-> horas, baja `dph_total` y acepta pagar más de disco.
+> Machines with cheap disk tend to charge **more** per hour. Both cannot be
+> optimized at once: with disk <=$2/month, network <$1/TB and <=$0.15/h
+> simultaneously there are **zero offers** on the market. For an endpoint
+> that is idle most of the time, prioritize disk. If you are going to put
+> many hours on it, lower `dph_total` and accept paying more for disk.
 
-### `verified=true`: quitarlo salía carísimo
+### `verified=true`: removing it cost dearly
 
-Durante un tiempo este repo **quitaba** `verified=true` del filtro, porque con el
-presupuesto de entonces dejaba una sola oferta:
+For a while this repo **removed** `verified=true` from the filter, because
+with the budget of then it left a single offer:
 
-| | Ofertas ≤$0.15/h |
+| | Offers <=$0.15/h |
 |---|---|
-| con `verified=true` y `storage_cost<=0.11` | **1** ⚠️ |
-| sin `verified=true` | 7 (mejor a $0.109/h) |
+| with `verified=true` and `storage_cost<=0.11` | **1** ⚠️ |
+| without `verified=true` | 7 (best at $0.109/h) |
 
-El razonamiento era correcto en su mecanismo — **con una sola oferta viable el
-autoscaler relaja el tope de precio** y alquila por encima de `dph_total`; así
-entró un worker a $0.201/h teniendo el tope en $0.15 — pero la conclusión
-trataba el síntoma. El daño lo hacía **quedarse sin abanico de ofertas**, no la
-verificación.
+The reasoning was correct in its mechanism — **with a single viable offer the
+autoscaler relaxes the price ceiling** and rents above `dph_total`; that is
+how a worker came in at $0.201/h with the ceiling at $0.15 — but the
+conclusion treated the symptom. The damage was done by **running out of
+offers**, not by verification.
 
-**Y quitar `verified` tenía un coste oculto mucho peor: workers inservibles.**
-Medido el 2026-08-16 con dos máquinas no verificadas seguidas (139268 y 147722):
-ambas anunciaban puertos directos (`direct_port_count` 100 y 200) que en
-realidad estaban **filtrados**. El worker provisiona bien, el pyworker arranca,
-el autoscaler lo marca `idle` y enruta a `https://<ip>:<puerto>`… pero ese
-puerto da *timeout* desde cualquier red externa, así que **el pyworker recibe
-cero requests** (`num_requests_recieved: 0`) y cada llamada muere por timeout.
+**And removing `verified` had a much worse hidden cost: unusable workers.**
+Measured on 2026-08-16 with two consecutive unverified machines (139268 and
+147722): both advertised direct ports (`direct_port_count` 100 and 200) that
+were actually **filtered**. The worker provisions fine, the pyworker starts,
+the autoscaler marks it `idle` and routes to `https://<ip>:<port>`... but
+that port *times out* from any external network, so **the pyworker receives
+zero requests** (`num_requests_recieved: 0`) and every call dies by timeout.
 
-La palanca buena es `storage_cost`, que cuesta céntimos:
+The good lever is `storage_cost`, which costs cents:
 
-| Configuración | Ofertas | GPU más barata | Tope disco a 18 GB |
+| Configuration | Offers | Cheapest GPU | Disk ceiling at 18 GB |
 |---|---|---|---|
-| sin `verified`, `storage<=0.11` | 7 | $0.107/h | $1.98/mes |
-| **`verified`, `storage<=0.20`** ← actual | **11** | **$0.108/h** | $3.60/mes |
-| `verified`, `storage<=0.11` | **1** ⚠️ | $0.134/h | $1.98/mes |
+| without `verified`, `storage<=0.11` | 7 | $0.107/h | $1.98/month |
+| **`verified`, `storage<=0.20`** <- current | **11** | **$0.108/h** | $3.60/month |
+| `verified`, `storage<=0.11` | **1** ⚠️ | $0.134/h | $1.98/month |
 
-Aflojando el disco se recupera el abanico **y** el precio de GPU queda igual
-($0.108 vs $0.107). Se paga como mucho $1.62/mes más de disco a cambio de que
-las máquinas funcionen.
+Loosening the disk recovers the range **and** the GPU price stays the same
+($0.108 vs $0.107). You pay at most $1.62/month more of disk in exchange for
+the machines actually working.
 
-#### Cómo se diagnostica esto rápido
+#### How to diagnose this quickly
 
-El síntoma es un request que se cuelga y muere con
-`TimeoutError: Timed out after 61.4s waiting for worker`, con el worker en
-`idle`. Comprobaciones, en orden:
+The symptom is a request that hangs and dies with
+`TimeoutError: Timed out after 61.4s waiting for worker`, with the worker in
+`idle`. Checks, in order:
 
 ```powershell
-# 1. que URL entrega el autoscaler, y esta abierto ese puerto?
-python -c "import socket;socket.create_connection(('<ip>',<puerto>),10)"
+# 1. which URL does the autoscaler deliver, and is that port open?
+python -c "import socket;socket.create_connection(('<ip>',<port>),10)"
 
-# 2. desde fuera de tu red, por si el bloqueo es tuyo
-curl -s "https://check-host.net/check-tcp?host=<ip>:<puerto>&max_nodes=3"
+# 2. from outside your network, in case the block is yours
+curl -s "https://check-host.net/check-tcp?host=<ip>:<port>&max_nodes=3"
 ```
 
-Dentro del worker, el pyworker habla **HTTPS**, no HTTP: `curl -k
-https://127.0.0.1:3000/health` devuelve **404** cuando está sano (esa ruta no
-existe, pero responder ya prueba que vive). Con `http://` da *Empty reply from
-server* y parece caído sin estarlo. Y `/workspace/pyworker.log` trae un
-`num_requests_recieved` que dice si le llega algo.
+Inside the worker, the pyworker speaks **HTTPS**, not HTTP: `curl -k
+https://127.0.0.1:3000/health` returns **404** when healthy (that route does
+not exist, but responding proves it is alive). With `http://` it gives
+*Empty reply from server* and looks down without being down. And
+`/workspace/pyworker.log` carries a `num_requests_recieved` that says whether
+anything reaches it.
 
-### Interruptible: no está soportado
+### Interruptible: not supported
 
-Los workergroups serverless **solo usan on-demand**. Probado el 2026-08-15:
-poniendo `--launch_args "--bid_price 0.15"`, la instancia creada sale con
-`is_bid=False`. Las instancias interruptibles (que salen a la mitad de precio)
-solo se pueden usar fuera del serverless, con `vastai create instance --bid_price`.
+Serverless workergroups **only use on-demand**. Tested on 2026-08-15:
+setting `--launch_args "--bid_price 0.15"`, the created instance comes out
+with `is_bid=False`. Interruptible instances (which come at half price) can
+only be used outside serverless, with
+`vastai create instance --bid_price`.
 
 ---
 
 ## Troubleshooting
 
-### El worker cicla `model_loading -> error (timed out loading after 795s) -> reboot`
+### The worker cycles `model_loading -> error (timed out loading after 795s) -> reboot`
 
-El síntoma clásico de que **el servicio nunca arranca**. Casi siempre es el modo
-de lanzamiento: si el template está en **Jupyter** (o ssh sin llamar a
-`entrypoint.sh`), Vast sustituye el ENTRYPOINT de la imagen por `/.launch`, que
-solo levanta sshd y jupyter. El supervisord de `vastai/comfy` nunca corre, así que
-no hay ComfyUI ni pyworker y el autoscaler no recibe señal de listo.
+The classic symptom that **the service never starts**. It is almost always
+the launch mode: if the template is in **Jupyter** (or ssh without calling
+`entrypoint.sh`), Vast replaces the image's ENTRYPOINT with `/.launch`, which
+only brings up sshd and jupyter. The supervisord of `vastai/comfy` never
+runs, so there is no ComfyUI or pyworker and the autoscaler receives no
+ready signal.
 
-Cómo confirmarlo, entrando por SSH al worker:
+How to confirm it, by SSHing into the worker:
 
 ```bash
-ps -p 1 -o cmd=            # si dice "bash /.launch" -> es esto
-supervisorctl status       # "no such file" -> supervisord no está corriendo
-ss -lntp                   # solo 8080 y 22; falta 18188 (ComfyUI) y 3000 (pyworker)
-ls /var/log/supervisor /var/log/portal   # vacíos
+ps -p 1 -o cmd=            # if it says "bash /.launch" -> it is this
+supervisorctl status       # "no such file" -> supervisord is not running
+ss -lntp                   # only 8080 and 22; 18188 (ComfyUI) and 3000 (pyworker) missing
+ls /var/log/supervisor /var/log/portal   # empty
 ```
 
-Y desde fuera: `image_runtype` en `vastai show instances --raw` dice
-`jupyter_direc ...` en vez de `ssh`.
+And from outside: `image_runtype` in `vastai show instances --raw` says
+`jupyter_direc ...` instead of `ssh`.
 
-Arreglo: que el `onstart` del template llame a `entrypoint.sh &` y luego a
-`start_server.sh`, como arriba.
+Fix: the template's `onstart` must call `entrypoint.sh &` and then
+`start_server.sh`, as above.
 
-**La otra causa, y la que de verdad muerde: el host tiene la red mala.** Mismo
-script, mismo template, misma imagen — y sale bucle infinito o ciclo limpio según
-la máquina que te toque. Medido el 2026-08-16 con dos instancias seguidas:
+**The other cause, and the one that really bites: the host has a bad
+network.** Same script, same template, same image — and it comes out as an
+infinite loop or a clean cycle depending on which machine you get. Measured
+on 2026-08-16 with two consecutive instances:
 
-| | host malo (`47857982`) | host bueno (`47861232`) |
+| | bad host (`47857982`) | good host (`47861232`) |
 |---|---|---|
-| Velocidad real | ~350 KB/s | ~45 MB/s |
-| `pip install` del Impact-Pack | ~15 min | segundos |
-| Modelos de R2 (10 GB) | nunca llegó | 3,7 min |
-| Resultado | 3 timeouts → `destroying` | `PROVISIONING_OK` en 14 min |
+| Real speed | ~350 KB/s | ~45 MB/s |
+| `pip install` of Impact-Pack | ~15 min | seconds |
+| R2 models (10 GB) | never got there | 3.7 min |
+| Result | 3 timeouts -> `destroying` | `PROVISIONING_OK` in 14 min |
 
-El autoscaler tiene un **timeout de carga fijo de 791 s** (~13,2 min) que no
-aparece en la config del endpoint y no es configurable desde ahí. Al agotarse hace
-`restart_instance` (no `destroy`), así que el contenedor se reinicia y el
-provisioning **vuelve a empezar desde cero**. Tres fallos seguidos y sí destruye la
-máquina. Con 350 KB/s el pip solo ya come 15 min: bucle infinito garantizado.
+The autoscaler has a **fixed loading timeout of 791 s** (~13.2 min) that does
+not appear in the endpoint config and is not configurable from there. When it
+runs out it does `restart_instance` (not `destroy`), so the container
+restarts and the provisioning **starts over from zero**. Three consecutive
+failures and it does destroy the machine. At 350 KB/s the pip alone eats
+15 min: infinite loop guaranteed.
 
-Cómo distinguir "colgado" de "lento", desde el worker:
+How to tell "hung" from "slow", from the worker:
 
 ```bash
-ps -eo pid,ppid,etime,stat,args --forest       # ¿hay un hijo de pip vivo?
-ls -l /proc/<pid>/fd                           # ¿qué .whl está bajando?
-stat -c %s <whl>; sleep 20; stat -c %s <whl>   # velocidad real
-cat /proc/net/dev                              # bytes totales de la instancia
+ps -eo pid,ppid,etime,stat,args --forest       # is there a live pip child?
+ls -l /proc/<pid>/fd                           # which .whl is downloading?
+stat -c %s <whl>; sleep 20; stat -c %s <whl>   # real speed
+cat /proc/net/dev                              # total instance bytes
 ```
 
-El log parece congelado porque `PIP_ARGS` llevaba `-q`: en modo silencioso pip no
-escribe nada durante minutos aunque esté progresando. Ahora usa `--progress-bar off`
-y el `watch_progress` reporta cada 2 min al canal de Discord.
+The log looks frozen because `PIP_ARGS` carried `-q`: in silent mode pip
+writes nothing for minutes even while progressing. Now it uses
+`--progress-bar off` and `watch_progress` reports to the Discord channel
+every 2 min.
 
-**Lo que sí ayuda** (aplicado): caché de pip persistente en
-`$WORKSPACE_DIR/.cache/pip` vía `PIP_CACHE_DIR`, en vez de `--no-cache-dir`. Como
-`restart_instance` conserva `/workspace`, el 2º intento reaprovecha los wheels ya
-bajados y entra de sobra en el timeout. Da tres oportunidades (~45 min) para
-converger antes de que el autoscaler destruya la máquina.
+**What does help** (applied): persistent pip cache at
+`$WORKSPACE_DIR/.cache/pip` via `PIP_CACHE_DIR`, instead of
+`--no-cache-dir`. Since `restart_instance` keeps `/workspace`, the 2nd
+attempt reuses the already-downloaded wheels and fits well inside the
+timeout. That gives three opportunities (~45 min) to converge before the
+autoscaler destroys the machine.
 
-**Lo que NO ayuda, comprobado:** mover los wheels a R2. R2 va a 361 KB/s desde el
-worker malo — *exactamente igual de lento que PyPI* (320 KB/s), y con 4 conexiones
-en paralelo suma ~730 KB/s (~2x, no 4x). El cuello es el ancho de banda de la
-instancia, no el origen. Tampoco lo arregla el filtro del workergroup:
-`search_query` filtra por `inet_down_cost<=0.005` (precio de la red, no velocidad)
-y las 10 ofertas del pool ya anuncian `inet_down` entre 190 y 1368 Mbit/s. El host
-malo anunciaba **1376 Mbit/s** y entregaba 3. El dato es autodeclarado y no hay
-filtro que te salve.
+**What does NOT help, checked:** moving the wheels to R2. R2 goes at 361 KB/s
+from the bad worker — *exactly as slow as PyPI* (320 KB/s), and with 4
+parallel connections it adds up to ~730 KB/s (~2x, not 4x). The bottleneck is
+the instance's bandwidth, not the origin. The workergroup filter does not fix
+it either: `search_query` filters by `inet_down_cost<=0.005` (network price,
+not speed) and the pool's 10 offers already advertise `inet_down` between 190
+and 1368 Mbit/s. The bad host advertised **1376 Mbit/s** and delivered 3. The
+data is self-reported and no filter saves you.
 
 ### `HF_TOKEN must be set when BACKEND is set!`
 
-Validación de `start_server.sh` del pyworker. Exige que exista `HF_TOKEN` si
-`BACKEND` está definido, aunque no descargues nada de HuggingFace. Ponlo en el
-env del template.
+Validation of the pyworker's `start_server.sh`. It requires `HF_TOKEN` to
+exist if `BACKEND` is defined, even if you download nothing from HuggingFace.
+Put it in the template env.
 
-### El worker aparece como `stopped`
+### The worker shows as `stopped`
 
-Normal, no es un fallo. Con `min_load=0` el autoscaler apaga los workers cuando
-no hay carga y los deja en frío. El siguiente request lo despierta.
+Normal, not a failure. With `min_load=0` the autoscaler powers down workers
+when idle and leaves them cold. The next request wakes it up.
 
-**Y sale muy barato dejarlo así.** Una instancia parada solo paga el disco:
+**And it is very cheap to leave it like that.** A stopped instance only pays
+the disk:
 
-| Estado | Coste | Al mes |
+| State | Cost | Per month |
 |---|---|---|
-| Encendida | `dph_total` 0,125 $/h | ~90 $ |
-| Parada (solo disco) | `storage_total_cost` 0,005 $/h | ~3,60 $ |
+| Powered on | `dph_total` 0.125 $/h | ~$90 |
+| Stopped (disk only) | `storage_total_cost` 0.005 $/h | ~$3.60 |
 
-25 veces más barato, y conserva `/workspace` entero: los modelos en
-`/workspace/ComfyUI/models` y la caché de pip. Un arranque desde parada se salta
-los ~22 GB de descarga y los minutos de pip. Eso es exactamente lo que hace el
-autoscaler con `cold_workers=1`; el problema es que para conservar una máquina
-parada primero tiene que haberla dado por buena una vez — es la recompensa de que
-el provisioning termine bien, no una alternativa a arreglarlo.
+25x cheaper, and it keeps the whole `/workspace`: the models in
+`/workspace/ComfyUI/models` and the pip cache. A start from stopped skips the
+~22 GB download and the pip minutes. That is exactly what the autoscaler does
+with `cold_workers=1`; the problem is that to keep a stopped machine it first
+had to validate it once — it is the reward for the provisioning finishing
+well, not an alternative to fixing it.
 
-Avisos: una instancia parada **no reserva la GPU**. El host puede alquilar ese
-hardware a otro y entonces no arranca cuando la quieras encender. Es barato
-precisamente porque no garantiza nada.
+Caveats: a stopped instance **does not reserve the GPU**. The host can rent
+that hardware to someone else and then it will not start when you want to
+power it on. It is cheap precisely because it guarantees nothing.
 
-### Avisos de Discord
+### Discord notifications
 
-El provisioning reporta al canal por webhook: arranque, cada hito de las 5 fases,
-progreso cada 2 min (tamaño de la caché de pip, de los modelos, disco libre y la
-última línea viva del log), `PROVISIONING_OK`, fallo con el bloque de log, y un
-centinela que sigue vivo después para avisar de encendido, caída y apagado.
+The provisioning reports to the channel via webhook: start, each milestone of
+the 5 phases, progress every 2 min (pip cache size, model size, free disk and
+the last live log line), `PROVISIONING_OK`, failure with the log block, and a
+sentinel that stays alive afterwards to warn of power-on, outage and
+shutdown.
 
-Se configura con `DISCORD_WEBHOOK` en el `.env`. **Viaja por el env del template**,
-no dentro del `.sh`: ese fichero se sirve desde una URL pública de R2 y cualquiera
-podría leerlo. `renew_provisioning.py` lo mete en el `template_env` al publicar; si
-no está definido, el provisioning no notifica y funciona igual (todo el bloque es
-un no-op).
+Configured with `DISCORD_WEBHOOK` in the `.env`. **It travels via the
+template env**, not inside the `.sh`: that file is served from a public R2
+URL and anyone could read it. `renew_provisioning.py` puts it in the
+`template_env` when publishing; if it is not defined, the provisioning does
+not notify and works the same (the whole block is a no-op).
 
-Dos detalles que costaron sangre:
+Two details that cost blood:
 
-- **Discord devuelve `403 Forbidden` al `User-Agent` por defecto de urllib**
-  (`Python-urllib/3.x`). Hay que mandar cabecera propia:
-  `headers={"User-Agent": "mizuki-provision/1.0"}` → `204`. Mismo patrón que
-  Cloudflare/R2, donde se usa `curl/8.0`.
-- **El webhook nunca puede tumbar el provisioning.** El script corre con
-  `set -euo pipefail`; todos los emisores acaban en `|| true` y con timeout corto,
-  probado con webhook roto y con webhook vacío (`exit 0` en ambos casos).
+- **Discord returns `403 Forbidden` to urllib's default User-Agent**
+  (`Python-urllib/3.x`). You must send your own header:
+  `headers={"User-Agent": "mizuki-provision/1.0"}` -> `204`. Same pattern as
+  Cloudflare/R2, where `curl/8.0` is used.
+- **The webhook must never be able to take down the provisioning.** The
+  script runs with `set -euo pipefail`; all emitters end in `|| true` and
+  with a short timeout, tested with a broken webhook and with an empty one
+  (`exit 0` in both cases).
 
 ### `invalid template hash or id`
 
-`vastai update template` **cambia el `hash_id`**. Después de tocar el template hay
-que re-apuntar el workergroup al hash nuevo:
+`vastai update template` **changes the `hash_id`**. After touching the
+template the workergroup must be re-pointed to the new hash:
 
 ```powershell
-vastai search templates "creator_id=$VAST_CREATOR_ID"    # sacar el hash actual
+vastai search templates "creator_id=$VAST_CREATOR_ID"    # get the current hash
 vastai update workergroup $VAST_WORKERGROUP_ID --endpoint_id $VAST_ENDPOINT_ID --template_hash <HASH> --template_id $VAST_TEMPLATE_ID
 ```
 
-### Imágenes negras
+### Black images
 
-Clip skip. El nodo `60` (`CLIPSetLastLayer`) tiene que estar en `-2`. Con `-1`,
-`waiIllustriousSDXL_v170` produce imágenes negras.
+Clip skip. Node `60` (`CLIPSetLastLayer`) must be at `-2`. With `-1`,
+`waiIllustriousSDXL_v170` produces black images.
 
-### Falta un modelo o un nodo custom
+### A model or custom node is missing
 
-El request falla en ComfyUI con el nombre del nodo o del fichero. Añádelo a
-`serverless_provision.sh` (lista `WANTED` para modelos, `install_node` para nodos),
-súbelo a R2 y lanza `vastai update workers $VAST_WORKERGROUP_ID`.
+The request fails in ComfyUI with the name of the node or file. Add it to
+`serverless_provision.sh` (the `WANTED` list for models, `install_node` for
+nodes), upload it to R2 and run
+`vastai update workers $VAST_WORKERGROUP_ID`.
 
 ---
 
-## Mantenimiento pendiente
+## Pending maintenance
 
-- [x] ~~`PROVISIONING_SCRIPT` es una presigned que caduca a los 7 días.~~
-      Resuelto: el bucket sirve por *Public Development URL* y la URL es
-      permanente. `renew_provisioning.py` sigue siendo el comando para publicar
-      (sube a R2, verifica el contenido y re-apunta template + workergroup), pero
-      ya no hay nada que renovar por calendario.
-- [ ] **Paralelizar el provisioning.** Hoy las 5 fases van en serie. La fase 3
-      (custom nodes: PyPI + GitHub) y la fase 4 (modelos de R2) no dependen una de
-      otra y usan recursos distintos; solaparlas quita del camino crítico la más
-      corta. El bucle de `URL_FILES` (pesos sueltos de HuggingFace) son `curl` uno
-      detrás de otro y se paraleliza en cuatro líneas. Techo real medido: **~2x**,
-      no 4x — el cuello es el ancho de banda de la instancia, no el número de
-      flujos. **No paralelizar dos `pip install` sobre el mismo venv**: se pisan en
-      `site-packages` y dan entornos corruptos de forma intermitente. Y el
-      `trap on_err` con procesos en segundo plano necesita `wait` explícito, o los
-      fallos dejan de avisar.
-- [ ] **`--bbox` sin implementar.** Ya está identificado el nodo
-      (`AILab_CropObject`, ver *Resolución del personaje*); falta cablearlo entre
-      BiRefNet y el escalado a la caja.
-- [ ] **`HF_TOKEN=hf_placeholder_not_used`** en el template. Sustituir por uno
-      real si algún día se añaden descargas desde HuggingFace.
-- [ ] Las URLs de las imágenes generadas caducan a los 7 días. Si hay que
-      conservarlas, descargarlas o moverlas dentro de R2.
+- [x] ~~`PROVISIONING_SCRIPT` was a presigned URL expiring after 7 days.~~
+      Solved: the bucket serves via *Public Development URL* and the URL is
+      permanent. `renew_provisioning.py` remains the publish command (upload
+      to R2, verify content and re-point template + workergroup), but there
+      is nothing left to renew on a calendar.
+- [ ] **Parallelize the provisioning.** Today the 5 phases run in series.
+      Phase 3 (custom nodes: PyPI + GitHub) and phase 4 (R2 models) do not
+      depend on each other and use different resources; overlapping them
+      takes the shorter one off the critical path. The `URL_FILES` loop
+      (loose HuggingFace weights) is one `curl` after another and
+      parallelizes in four lines. Real ceiling measured: **~2x**, not 4x —
+      the bottleneck is the instance's bandwidth, not the number of streams.
+      **Do not parallelize two `pip install`s on the same venv**: they step
+      on each other in `site-packages` and give intermittently corrupted
+      environments. And the `trap on_err` with background processes needs
+      explicit `wait`, or failures stop reporting.
+- [ ] **`--bbox` not implemented.** The node is already identified
+      (`AILab_CropObject`, see *Character resolution*); what is missing is
+      wiring it between BiRefNet and the scaling into the box.
+- [ ] **`HF_TOKEN=hf_placeholder_not_used`** in the template. Replace with a
+      real one if downloads from HuggingFace are ever added.
+- [ ] The URLs of generated images expire after 7 days. If they must be kept,
+      download them or move them inside R2.

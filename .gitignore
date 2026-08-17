@@ -1,39 +1,23 @@
-# secretos y config del despliegue
+# Secrets and deployment config
 .env
 config.json
 .presigned_url.txt
 
-# salidas generadas
-*.png
-*.gif
-last_response.json
-bg_*.json
-verif_final.json
-escena_out/
-escena_sweep/
-escena_mask/
-escena_pose/
-cmp_*/
-frames_out/
-correr_out/
-sprites_out/
-sprites_pose/
-sprites_pose2/
-sprites_norm/
-muestras_bg/
-poses/
-*.zip
-
-# python
+# Generated outputs (everything under output/ is produced by scripts)
+output/
+scripts/__pycache__/
 __pycache__/
 *.pyc
 
-# volcado de esquemas del worker (3 MB, se regenera con sondear_nodos.py)
-nodos.json
+# Worker schema dump (~3 MB, regenerated with sondear_nodos.py)
+scripts/nodos.json
 
-# logs y sondas temporales del A/B
-*.log
-res_*.json
+# A/B probes and logs
 probe_*.py
-ab_res*/
-ab_vb/
+res_*.json
+*.log
+
+# Editor/OS/agent noise
+.DS_Store
+Thumbs.db
+.opencode/
