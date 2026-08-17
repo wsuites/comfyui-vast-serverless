@@ -42,6 +42,10 @@ DETAIL_DENOISE = 0.45
 #             it tends to duplicate elements, so this is the last resort.
 #   upscale   UltimateSDUpscale on the final composite.
 CHARACTER_VERTICAL = (832, 1216)   # SDXL native ratio for a standing figure
+# Mirror of the above for a figure lying down: on a square canvas a reclining
+# body fills a horizontal strip and the rest is background BiRefNet deletes,
+# which is the same waste `vertical` fixes for a standing one, rotated 90.
+CHARACTER_HORIZONTAL = (1216, 832)
 CANVAS_LARGE = 1536
 BBOX_PADDING = 8      # px of air around the silhouette when cropping (--bbox)
 UPSCALE_MODEL = "4x_NMKD-Siax_200k.pth"
@@ -88,24 +92,33 @@ def scale_to(cw: int, ch: int, res: int) -> tuple[int, int]:
 
 
 def place_box(wf: dict, size: int = 640, x: int = 200, y: int = 380,
-              canvas: int = CANVAS, vertical: bool = False) -> dict:
+              canvas: int = CANVAS, vertical: bool = False,
+              horizontal: bool = False) -> dict:
     """Only function that places the character box on the scene.
 
     Touches the scale nodes (26/28) and the paste nodes (30/51) and returns
     the geometry it computes, so whoever must crop afterwards (the 2nd pass)
     does not recompute it on their own and desync.
+
+    `size` is always the LONG side of the box: height when vertical, width
+    when horizontal, the side when square.
     """
+    if vertical and horizontal:
+        raise SystemExit("vertical and horizontal are mutually exclusive")
     f = canvas / CANVAS
     size = max(8, round(size * f / 8) * 8)
     x, y = int(x * f), int(y * f)
-    if vertical:
-        pw, ph = CHARACTER_VERTICAL
+    if vertical or horizontal:
+        pw, ph = CHARACTER_VERTICAL if vertical else CHARACTER_HORIZONTAL
         wf["22"]["inputs"]["width"] = pw
         wf["22"]["inputs"]["height"] = ph
-        # the box keeps the aspect: height = size, proportional width. If
-        # size x size is still forced the figure flattens and exactly what
-        # is gained is lost.
-        cw, ch = max(8, round(size * pw / ph / 8) * 8), size
+        # the box keeps the aspect: the long side is `size` and the short one
+        # is proportional. If size x size is still forced the figure flattens
+        # and exactly what is gained is lost.
+        if vertical:
+            cw, ch = max(8, round(size * pw / ph / 8) * 8), size
+        else:
+            cw, ch = size, max(8, round(size * ph / pw / 8) * 8)
     else:
         cw = ch = size
     for n in ("26", "28"):
@@ -191,14 +204,44 @@ def with_bbox(wf: dict) -> dict:
     return wf
 
 
+def with_flip(wf: dict) -> dict:
+    """Mirror the character horizontally before it is pasted on the scene.
+
+    Which way the figure faces is decided by the character seed and is not
+    reliably steerable from the prompt, so a pose can come out facing away
+    from the part of the scene it should relate to (head at the foot of the
+    bed instead of on the pillow). Flipping the cutout settles it.
+
+    Both branches must be flipped: the image that feeds the box scaling AND
+    the mask image, or the mask stops matching the figure and the composite
+    cuts it in half. Whatever currently feeds them is used as the source, so
+    this works both with and without --bbox (which rewires 26/28 to read from
+    the crop node). Must therefore run AFTER with_bbox.
+
+        ImageFlip   req: image:IMAGE, flip_method:"x-axis: vertically" |
+                                                  "y-axis: horizontally"
+    """
+    for new, target in (("33", "26"), ("34", "28")):
+        if new in wf:
+            raise SystemExit(f"with_flip: node {new} already exists")
+        wf[new] = {"class_type": "ImageFlip",
+                   "inputs": {"image": wf[target]["inputs"]["image"],
+                              "flip_method": "y-axis: horizontally"},
+                   "_meta": {"title": "mirror character" if new == "33"
+                             else "mirror mask like the character"}}
+        wf[target]["inputs"]["image"] = [new, 0]
+    return wf
+
+
 def with_canvas(wf: dict, side: int, size: int = 640, x: int = 200, y: int = 380,
-                vertical: bool = False) -> dict:
+                vertical: bool = False, horizontal: bool = False) -> dict:
     """Raise the scene/composition canvas. Scales positions and mask."""
     wf["12"]["inputs"]["width"] = side
     wf["12"]["inputs"]["height"] = side
     wf["50"]["inputs"]["width"] = side
     wf["50"]["inputs"]["height"] = side
-    place_box(wf, size=size, x=x, y=y, canvas=side, vertical=vertical)
+    place_box(wf, size=size, x=x, y=y, canvas=side, vertical=vertical,
+              horizontal=horizontal)
     return wf
 
 
@@ -235,7 +278,10 @@ def with_upscale(wf: dict, origen: list) -> dict:
 def with_pose(wf: dict, detector: str) -> dict:
     """Adds pose guidance. detector: 'openpose' or 'dwpose'."""
     clase = "OpenposePreprocessor" if detector == "openpose" else "DWPreprocessor"
-    inputs = {"image": ["25", 0],          # the CROPPED CHARACTER, not the collage:
+    # with --flip the skeleton must come from the MIRRORED character, or the
+    # ControlNet would guide the fusion towards the pose facing the other way
+    source = ["33", 0] if "33" in wf else ["25", 0]
+    inputs = {"image": source,             # the CROPPED CHARACTER, not the collage:
               "detect_hand": "enable",     # on a clean background the detector hits more
               "detect_body": "enable",
               "detect_face": "enable",
@@ -524,7 +570,8 @@ def no_mask(wf: dict) -> dict:
 def build(pose: str = "dwpose", detail: str = "hd2", face: bool = True,
           hands: str | None = None, mask: bool = True,
           vertical: bool = False, canvas: int = CANVAS,
-          bbox: bool = False, upscale: bool = False) -> dict:
+          bbox: bool = False, upscale: bool = False,
+          horizontal: bool = False, flip: bool = False) -> dict:
     """Assembles the workflow by switching each feature on and off.
 
     pose     none | openpose | dwpose   ControlNet pose guidance
@@ -535,6 +582,8 @@ def build(pose: str = "dwpose", detail: str = "hd2", face: bool = True,
 
     Character resolution (see the CHARACTER_VERTICAL comment):
     vertical bool    generate the character at 832x1216 instead of 1024 square
+    horizontal bool  the mirror, 1216x832, for a figure lying down
+    flip     bool    mirror the character horizontally before pasting it
     canvas   int     side of the scene/composition (1024 by default)
     bbox     bool    crop the character to its bounding box before scaling
     upscale  bool    UltimateSDUpscale 2x on the final composite
@@ -556,10 +605,12 @@ def build(pose: str = "dwpose", detail: str = "hd2", face: bool = True,
     # canvas and vertical are resolved in one go (one writes the scale and
     # the other the aspect of the SAME box: applied separately they stomped
     # each other)
-    if canvas != CANVAS or vertical:
-        wf = with_canvas(wf, canvas, vertical=vertical)
+    if canvas != CANVAS or vertical or horizontal:
+        wf = with_canvas(wf, canvas, vertical=vertical, horizontal=horizontal)
     if bbox:
         wf = with_bbox(wf)
+    if flip:                                # after bbox: it reads 26/28 sources
+        wf = with_flip(wf)
     if pose != "none":
         wf = with_pose(wf, pose)
     if detail == "hd":
@@ -609,10 +660,15 @@ def add_flags(p) -> None:
     r = p.add_argument_group("character resolution")
     r.add_argument("--vertical", action="store_true",
                    help=f"generate the character at {CHARACTER_VERTICAL[0]}x{CHARACTER_VERTICAL[1]}")
+    r.add_argument("--horizontal", action="store_true",
+                   help=f"generate the character at {CHARACTER_HORIZONTAL[0]}x"
+                        f"{CHARACTER_HORIZONTAL[1]} (figure lying down)")
     r.add_argument("--canvas", type=int, default=CANVAS,
                    help=f"scene side (default {CANVAS}; {CANVAS_LARGE} duplicates elements)")
     r.add_argument("--bbox", action="store_true",
                    help="crop the character to its bounding box")
+    r.add_argument("--flip", action="store_true",
+                   help="mirror the character horizontally before pasting it")
     r.add_argument("--upscale", action="store_true",
                    help="UltimateSDUpscale 2x of the final composite")
 
@@ -625,7 +681,7 @@ def from_flags(a) -> dict:
         dict(detail=a.detail, face=a.face, hands=a.hands)
     # the resolution levers are orthogonal to the variant: they are always
     # applied, also when --variant is used as a shortcut
-    for k in ("vertical", "canvas", "bbox", "upscale"):
+    for k in ("vertical", "horizontal", "canvas", "bbox", "upscale", "flip"):
         opts[k] = getattr(a, k, CANVAS if k == "canvas" else False)
     return build(pose=a.pose, mask=not a.no_mask, **opts)
 

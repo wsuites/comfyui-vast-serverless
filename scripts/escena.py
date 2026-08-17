@@ -45,6 +45,12 @@ def build(a) -> dict:
         wf["20"]["inputs"]["text"] = a.character
     if a.fusion:
         wf["40"]["inputs"]["text"] = a.fusion
+    # the negatives were only editable by hand-patching the json: without them
+    # there is no way to push AGAINST something the positive keeps dragging in
+    if a.character_neg:
+        wf["21"]["inputs"]["text"] = a.character_neg
+    if a.fusion_neg:
+        wf["41"]["inputs"]["text"] = a.fusion_neg
     wf["13"]["inputs"]["seed"] = a.seed_scene
     wf["23"]["inputs"]["seed"] = a.seed_character
     wf["43"]["inputs"]["seed"] = a.seed_fusion
@@ -53,7 +59,8 @@ def build(a) -> dict:
     # building the graph, so --vertical/--canvas do not get stomped here
     g = place_box(wf, size=a.size, x=a.x, y=a.y,
                   canvas=getattr(a, "canvas", CANVAS),
-                  vertical=getattr(a, "vertical", False))
+                  vertical=getattr(a, "vertical", False),
+                  horizontal=getattr(a, "horizontal", False))
     if "80" in wf:                      # hd/hd2/hd3 variants: detail crop
         cx = max(0, g["x"] - MARGIN)
         cy = max(0, g["y"] - MARGIN)
@@ -128,6 +135,8 @@ async def main() -> int:
     p.add_argument("--scene")
     p.add_argument("--character")
     p.add_argument("--fusion")
+    p.add_argument("--character-neg", help="character negative (node 21)")
+    p.add_argument("--fusion-neg", help="fusion negative (node 41)")
     p.add_argument("--detail-prompt", help="2nd pass prompt (node 93)")
     p.add_argument("--seed-scene", type=int, default=111111)
     p.add_argument("--seed-character", type=int, default=222222)
