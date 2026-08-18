@@ -17,6 +17,7 @@ uploaded back there.
 | `scripts/call_endpoint.py` | Client. Sends `wf.json` to the endpoint and returns the image URL. |
 | `scripts/construir_wf.py` | **Builds the scene pipeline graph** (poses, detail passes, hands, upscale). |
 | `scripts/escena.py`, `frames.py`, `correr.py` | Runners for the scene pipeline. |
+| `scripts/una_pasada.py` | Single-pass render: character and scene generated together, no cutout and no paste. Better anatomy and no seam; use it when the figure fills the frame. |
 | `scripts/sprites.py`, `normalizar.py`, `ciclo_pose.py` | RGBA sprite generation and normalization. |
 | `scripts/ab_detalle.py`, `ab_resolucion.py`, `hoja12.py` | A/B comparison harnesses. |
 | `scripts/serverless_provision.sh` | Worker provisioning. Copy of what runs in R2 (`comfy-stack/scripts/serverless_provision.sh`). |
@@ -25,7 +26,7 @@ uploaded back there.
 | `scripts/validar_wf.py` | Validates every flag combination against the worker schema. |
 | `scripts/visor.py` | Generates `output/visor.html`, a self-contained A/B viewer. |
 | `workflows/` | All workflows in ComfyUI **API** format (what is sent in each request). |
-| `docs/` | Parameter recipe and prompt findings (`reproducing-results-from-scratch.md`) and character LoRAs (`loras.md`). |
+| `docs/` | Parameter recipe and prompt findings (`reproducing-results-from-scratch.md`), character LoRAs (`loras.md`), and what each lever actually does plus the dead ends not worth retrying (`levers-and-dead-ends.md`). |
 | `output/` | Everything generated, organized by experiment, each with its own `README.md`. |
 | `.env` | Configuration and credentials. **Not versioned, do not share.** |
 | `output/general/last_response.json` | Full response of the last request (written by the client). |
@@ -634,6 +635,15 @@ a large open hand:
 > empty mask**, without error or warning. The whole pass becomes a round trip
 > through the VAE that only costs time. If you use this path, always check
 > the `g_depth` output: black = it did nothing.
+
+The yolo path fails silently in exactly the same way: if the detector marks
+nothing, `FaceDetailer` returns the image untouched and reports no error, so
+a threshold that finds nothing is indistinguishable from a pass that ran. Its
+threshold is `HANDS_BBOX_THR = 0.25` (`--hands-thr` to override) and it writes
+its own `i_hands` output with the mask it actually produced: black = no hands
+found. The node default is 0.4 and at that value the five bedroom poses came
+back **changed in the same place in all five** — that is run-to-run GPU noise,
+not a hands pass.
 
 The node's default threshold (`detect_thr=0.6`) is also too strict for anime
 — on the full image it detected 0 hands at 0.6 and 1 at 0.3 — so

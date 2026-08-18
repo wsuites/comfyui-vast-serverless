@@ -533,13 +533,13 @@
         "70",
         0
       ],
-      "upscale_method": "nearest-exact",
+      "upscale_method": "lanczos",
       "width": 640,
       "height": 640,
       "crop": "disabled"
     },
     "_meta": {
-      "title": "scale skeleton like the character"
+      "title": "skeleton back to box size"
     }
   },
   "76": {
@@ -746,7 +746,7 @@
         "60",
         0
       ],
-      "text": "masterpiece, best quality, solo, 1girl, long red hair, (blue eyes:1.3), (detailed face:1.2), detailed eyes, detailed hands, detailed skin, detailed fabric folds, sharp focus, high detail"
+      "text": "masterpiece, best quality, solo, 1girl, (detailed face:1.2), detailed hands, detailed skin, detailed fabric folds, sharp focus, high detail"
     },
     "_meta": {
       "title": "crop positive (no scene)"
@@ -1121,7 +1121,7 @@
       "feather": 5,
       "noise_mask": true,
       "force_inpaint": true,
-      "bbox_threshold": 0.4,
+      "bbox_threshold": 0.25,
       "bbox_dilation": 10,
       "bbox_crop_factor": 3,
       "sam_detection_hint": "center-1",
@@ -1168,6 +1168,28 @@
     },
     "_meta": {
       "title": "hand detail (yolo)"
+    }
+  },
+  "102": {
+    "class_type": "MaskToImage",
+    "inputs": {
+      "mask": [
+        "101",
+        3
+      ]
+    }
+  },
+  "103": {
+    "class_type": "SaveImage",
+    "inputs": {
+      "filename_prefix": "i_hands",
+      "images": [
+        "102",
+        0
+      ]
+    },
+    "_meta": {
+      "title": "OUTPUT: hand mask (diagnostics)"
     }
   },
   "90": {

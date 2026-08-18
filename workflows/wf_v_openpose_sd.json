@@ -533,13 +533,13 @@
         "70",
         0
       ],
-      "upscale_method": "nearest-exact",
+      "upscale_method": "lanczos",
       "width": 640,
       "height": 640,
       "crop": "disabled"
     },
     "_meta": {
-      "title": "scale skeleton like the character"
+      "title": "skeleton back to box size"
     }
   },
   "76": {

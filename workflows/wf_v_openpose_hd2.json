@@ -533,13 +533,13 @@
         "70",
         0
       ],
-      "upscale_method": "nearest-exact",
+      "upscale_method": "lanczos",
       "width": 640,
       "height": 640,
       "crop": "disabled"
     },
     "_meta": {
-      "title": "scale skeleton like the character"
+      "title": "skeleton back to box size"
     }
   },
   "76": {
@@ -746,7 +746,7 @@
         "60",
         0
       ],
-      "text": "masterpiece, best quality, solo, 1girl, long red hair, (blue eyes:1.3), (detailed face:1.2), detailed eyes, detailed hands, detailed skin, detailed fabric folds, sharp focus, high detail"
+      "text": "masterpiece, best quality, solo, 1girl, (detailed face:1.2), detailed hands, detailed skin, detailed fabric folds, sharp focus, high detail"
     },
     "_meta": {
       "title": "crop positive (no scene)"

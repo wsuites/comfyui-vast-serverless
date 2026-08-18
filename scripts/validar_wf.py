@@ -24,7 +24,8 @@ SCHEMA = HERE / "nodos.json"
 def combinations():
     axes = dict(detail=("no", "hd", "hd2"), face=(False, True),
                 hands=(None, "yolo", "mesh", "both"), bbox=(False, True),
-                vertical=(False, True), upscale=(False, True))
+                vertical=(False, True), upscale=(False, True),
+                flip=(False, True))
     for vals in itertools.product(*axes.values()):
         yield dict(zip(axes, vals))
 

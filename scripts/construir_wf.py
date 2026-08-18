@@ -53,8 +53,14 @@ UPSCALE_MODEL = "4x_NMKD-Siax_200k.pth"
 # The second-pass prompt must not describe the scene: the crop is already
 # closed on the character and asking for "bedroom, window light" makes the
 # model spend capacity repainting background instead of skin, hair and hands.
-DETAIL_POS = ("masterpiece, best quality, solo, 1girl, long red hair, "
-              "(blue eyes:1.3), (detailed face:1.2), detailed eyes, "
+# It must not describe the CHARACTER either. This used to say "long red hair,
+# (blue eyes:1.3), detailed eyes" -- Asuka's description, hardcoded in a generic
+# pipeline. Two silent failures came from it: on a pose with her eyes CLOSED the
+# 2nd pass reopened them (and FaceDetailer, node 95, reads this same prompt from
+# node 93, so both passes pushed the same way), and on any other character it
+# dragged towards red hair and blue eyes. Identity now travels in
+# --detail-prompt, which is what those runs must pass.
+DETAIL_POS = ("masterpiece, best quality, solo, 1girl, (detailed face:1.2), "
               "detailed hands, detailed skin, detailed fabric folds, "
               "sharp focus, high detail")
 DETAIL_NEG = ("worst quality, blurry, lowres, bad hands, bad anatomy, "
@@ -77,6 +83,15 @@ MESH_DENOISE = 0.65     # MeshGraphormer path: depth holds the geometry
 # it detects at 0.6 fine, so it is the style that costs it, not the setup.
 MESH_DETECT_THR = 0.3
 
+# Same lesson, sibling path: 'bbox/hand_yolov8s.pt' is trained on photographs
+# and this art style costs it confidence, exactly like MeshGraphormer above.
+# The node default is 0.4 and the whole yolo path was left on it, so the five
+# bedroom poses were re-rendered with --hands yolo and came back CHANGED IN
+# THE SAME PLACE (a patch of wooden floor, 5523-5545 px in all five): that is
+# run-to-run GPU noise, not a hands pass. Five different poses cannot change
+# identically in the same spot. The detector never fired.
+HANDS_BBOX_THR = 0.25
+
 
 def scale_to(cw: int, ch: int, res: int) -> tuple[int, int]:
     """Dimensions of the upscaled crop, keeping the aspect ratio.
@@ -89,6 +104,20 @@ def scale_to(cw: int, ch: int, res: int) -> tuple[int, int]:
     factor = res / max(cw, ch)
     return (max(8, round(cw * factor / 8) * 8),
             max(8, round(ch * factor / 8) * 8))
+
+
+def set_box_size(node: dict, cw: int, ch: int) -> None:
+    """Writes the destination box size, whatever node is doing the fitting.
+
+    With --bbox the scale nodes stop being ImageScale and become
+    ResizeAndPadImage, which calls the same thing target_width/target_height.
+    """
+    if node["class_type"] == "ResizeAndPadImage":
+        node["inputs"]["target_width"] = cw
+        node["inputs"]["target_height"] = ch
+    else:
+        node["inputs"]["width"] = cw
+        node["inputs"]["height"] = ch
 
 
 def place_box(wf: dict, size: int = 640, x: int = 200, y: int = 380,
@@ -121,15 +150,9 @@ def place_box(wf: dict, size: int = 640, x: int = 200, y: int = 380,
             cw, ch = size, max(8, round(size * ph / pw / 8) * 8)
     else:
         cw = ch = size
-    for n in ("26", "28"):
-        # with --bbox these two stop being ImageScale and become
-        # ResizeAndPadImage, which calls the same target_width/target_height
-        if wf[n]["class_type"] == "ResizeAndPadImage":
-            wf[n]["inputs"]["target_width"] = cw
-            wf[n]["inputs"]["target_height"] = ch
-        else:
-            wf[n]["inputs"]["width"] = cw
-            wf[n]["inputs"]["height"] = ch
+    for n in ("26", "28", "75"):
+        if n in wf:
+            set_box_size(wf[n], cw, ch)
     for n in ("30", "51"):
         if n in wf:
             wf[n]["inputs"]["x"] = x
@@ -278,22 +301,42 @@ def with_upscale(wf: dict, origen: list) -> dict:
 def with_pose(wf: dict, detector: str) -> dict:
     """Adds pose guidance. detector: 'openpose' or 'dwpose'."""
     clase = "OpenposePreprocessor" if detector == "openpose" else "DWPreprocessor"
-    # with --flip the skeleton must come from the MIRRORED character, or the
-    # ControlNet would guide the fusion towards the pose facing the other way
-    source = ["33", 0] if "33" in wf else ["25", 0]
-    inputs = {"image": source,             # the CROPPED CHARACTER, not the collage:
-              "detect_hand": "enable",     # on a clean background the detector hits more
+    # The skeleton has to end up EXACTLY on top of the pasted figure, and the
+    # figure gets there through a chain (--bbox crop, --flip) that
+    # 26 has already applied. Reading 26 directly aligns by construction, but
+    # a mirrored body can confuse the detector, so it reads the character
+    # BEFORE the flip and the same flip is replayed on the skeleton after.
+    # Result: it detects AND it lands aligned.
+    src, ops = wf["26"]["inputs"]["image"], []
+    while isinstance(src, list) and src[0] == "33":           # --flip
+        node = wf[src[0]]
+        ops.append((node["class_type"], dict(node["inputs"])))
+        src = node["inputs"]["image"]
+    inputs = {"image": src,                 # the CHARACTER, not the collage:
+              "detect_hand": "enable",      # on a clean background the detector hits more
               "detect_body": "enable",
               "detect_face": "enable",
               "resolution": 1024}
     wf["70"] = {"class_type": clase, "inputs": inputs,
                 "_meta": {"title": f"skeleton ({detector})"}}
-    # the skeleton comes from the isolated character (1024) and must be placed
-    # where the character is in the collage: it is scaled and composed on black
-    wf["75"] = {"class_type": "ImageScale",
-                "inputs": {"image": ["70", 0], "upscale_method": "nearest-exact",
-                           "width": 640, "height": 640, "crop": "disabled"},
-                "_meta": {"title": "scale skeleton like the character"}}
+    # replay the transforms in the same order the character got them (the
+    # walk above goes backwards, hence the reversed)
+    prev = ["70", 0]
+    for i, (cls, params) in enumerate(reversed(ops)):
+        n = str(78 + i)                     # 78, 79: free, inside the pose block
+        if n in wf:
+            raise SystemExit(f"with_pose: node {n} already exists")
+        wf[n] = {"class_type": cls, "inputs": {**params, "image": prev},
+                 "_meta": {"title": "same transform as the character"}}
+        prev = [n, 0]
+    # the preprocessor returns its own resolution: back to the box the SAME
+    # way the character got there (with --bbox that is ResizeAndPadImage, which
+    # centres and pads instead of stretching; stretching here would misalign
+    # it whenever the silhouette does not fill the box).
+    # 75/76/77 carry the DEFAULT geometry; whoever knows the real one
+    # (escena.py, after place_box) rewrites them.
+    wf["75"] = dict(wf["26"], inputs={**wf["26"]["inputs"], "image": prev},
+                    _meta={"title": "skeleton back to box size"})
     wf["76"] = {"class_type": "EmptyImage",
                 "inputs": {"width": CANVAS, "height": CANVAS, "batch_size": 1, "color": 0},
                 "_meta": {"title": "black canvas for the skeleton"}}
@@ -367,12 +410,17 @@ def with_detail(wf: dict) -> dict:
     return wf
 
 
-def _hands_yolo(wf: dict, input_img: list) -> list:
+def _hands_yolo(wf: dict, input_img: list,
+                thr: float = HANDS_BBOX_THR) -> list:
     """Hands pass with yolo detector + FaceDetailer.
 
     FaceDetailer is not face-specific: it crops whatever bbox_detector marks.
     With 'bbox/hand_yolov8s.pt' it does exactly the same for hands. Returns
     the new image output.
+
+    `thr` is the one setting that decides whether this pass exists at all: if
+    the detector marks nothing, FaceDetailer returns the image untouched and
+    reports no error. See HANDS_BBOX_THR.
     """
     wf["100"] = {"class_type": "UltralyticsDetectorProvider",
                  "inputs": {"model_name": "bbox/hand_yolov8s.pt"}}
@@ -381,7 +429,7 @@ def _hands_yolo(wf: dict, input_img: list) -> list:
                             "seed": 666666, "steps": 20, "cfg": 4.0,
                             "sampler_name": "dpmpp_2m", "scheduler": "karras",
                             "denoise": HANDS_DENOISE, "feather": 5, "noise_mask": True,
-                            "force_inpaint": True, "bbox_threshold": 0.4,
+                            "force_inpaint": True, "bbox_threshold": thr,
                             "bbox_dilation": 10, "bbox_crop_factor": 3,
                             "sam_detection_hint": "center-1", "sam_dilation": -395,
                             "sam_threshold": 0.93, "sam_bbox_expansion": 0,
@@ -394,6 +442,13 @@ def _hands_yolo(wf: dict, input_img: list) -> list:
                             "vae": ["1", 2], "positive": ["97", 0],
                             "negative": ["98", 0], "bbox_detector": ["100", 0]},
                  "_meta": {"title": "hand detail (yolo)"}}
+    # Diagnostics: the mask the detector actually produced. Without this the
+    # pass is silent -- a threshold that detects nothing looks exactly like a
+    # pass that ran. Black image here == no hands found, raise HANDS_BBOX_THR.
+    wf["102"] = {"class_type": "MaskToImage", "inputs": {"mask": ["101", 3]}}
+    wf["103"] = {"class_type": "SaveImage",
+                 "inputs": {"filename_prefix": "i_hands", "images": ["102", 0]},
+                 "_meta": {"title": "OUTPUT: hand mask (diagnostics)"}}
     return ["101", 0]
 
 
@@ -451,7 +506,8 @@ def _hands_mesh(wf: dict, input_img: list, dw: int, dh: int) -> list:
     return ["122", 0]
 
 
-def with_detail2(wf: dict, face: bool, hands: str | None = None) -> dict:
+def with_detail2(wf: dict, face: bool, hands: str | None = None,
+                 hands_thr: float = HANDS_BBOX_THR) -> dict:
     """Improved second pass: correct aspect, more resolution, own prompt.
 
     With `face`, it also adds a FaceDetailer on the already-upscaled crop,
@@ -534,7 +590,7 @@ def with_detail2(wf: dict, face: bool, hands: str | None = None) -> dict:
         if hands in ("mesh", "both"):
             origen = _hands_mesh(wf, origen, dw, dh)
         if hands in ("yolo", "both"):
-            origen = _hands_yolo(wf, origen)
+            origen = _hands_yolo(wf, origen, hands_thr)
 
     wf["90"] = {"class_type": "ImageScale",
                 "inputs": {"image": origen, "upscale_method": "lanczos",
@@ -568,7 +624,8 @@ def no_mask(wf: dict) -> dict:
 
 
 def build(pose: str = "dwpose", detail: str = "hd2", face: bool = True,
-          hands: str | None = None, mask: bool = True,
+          hands: str | None = None, hands_thr: float = HANDS_BBOX_THR,
+          mask: bool = True,
           vertical: bool = False, canvas: int = CANVAS,
           bbox: bool = False, upscale: bool = False,
           horizontal: bool = False, flip: bool = False) -> dict:
@@ -578,6 +635,7 @@ def build(pose: str = "dwpose", detail: str = "hd2", face: bool = True,
     detail   no | hd | hd2             2nd pass on the character crop
     face     bool                       FaceDetailer inside the 2nd pass
     hands    None | yolo | mesh | both  hands pass inside the 2nd pass
+    hands_thr float                     yolo confidence; below it, no pass at all
     mask     bool                       SetLatentNoiseMask in the fusion
 
     Character resolution (see the CHARACTER_VERTICAL comment):
@@ -616,7 +674,7 @@ def build(pose: str = "dwpose", detail: str = "hd2", face: bool = True,
     if detail == "hd":
         wf = with_detail(wf)
     elif detail == "hd2":
-        wf = with_detail2(wf, face=face, hands=hands)
+        wf = with_detail2(wf, face=face, hands=hands, hands_thr=hands_thr)
     if not mask:
         wf = no_mask(wf)
     if upscale:
@@ -652,6 +710,10 @@ def add_flags(p) -> None:
     g.add_argument("--face", action="store_true", help="FaceDetailer in the 2nd pass")
     g.add_argument("--hands", choices=("yolo", "mesh", "both"),
                    help="hands pass in the 2nd pass")
+    g.add_argument("--hands-thr", type=float, default=HANDS_BBOX_THR,
+                   help=f"yolo confidence for the hands pass (default "
+                        f"{HANDS_BBOX_THR}); if nothing is detected the pass "
+                        f"silently does nothing")
     g.add_argument("--no-mask", action="store_true",
                    help="remove SetLatentNoiseMask (deforms the scene)")
     g.add_argument("--variant", choices=tuple(VARIANTS),
@@ -683,7 +745,8 @@ def from_flags(a) -> dict:
     # applied, also when --variant is used as a shortcut
     for k in ("vertical", "horizontal", "canvas", "bbox", "upscale", "flip"):
         opts[k] = getattr(a, k, CANVAS if k == "canvas" else False)
-    return build(pose=a.pose, mask=not a.no_mask, **opts)
+    return build(pose=a.pose, mask=not a.no_mask,
+                 hands_thr=getattr(a, "hands_thr", HANDS_BBOX_THR), **opts)
 
 
 def main() -> None:

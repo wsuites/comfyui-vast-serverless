@@ -47,6 +47,8 @@ def build(a) -> dict:
         wf["40"]["inputs"]["text"] = a.fusion
     # the negatives were only editable by hand-patching the json: without them
     # there is no way to push AGAINST something the positive keeps dragging in
+    if a.scene_neg:
+        wf["11"]["inputs"]["text"] = a.scene_neg
     if a.character_neg:
         wf["21"]["inputs"]["text"] = a.character_neg
     if a.fusion_neg:
@@ -61,6 +63,15 @@ def build(a) -> dict:
                   canvas=getattr(a, "canvas", CANVAS),
                   vertical=getattr(a, "vertical", False),
                   horizontal=getattr(a, "horizontal", False))
+    if "77" in wf:                      # --pose: the skeleton follows the box
+        # construir_wf builds 75/76/77 with the default geometry (640 at
+        # 200,380 over a 1024 canvas). Without this the ControlNet skeleton
+        # ends up in a different place and at a different scale than the
+        # pasted figure, and the fusion is guided towards a pose that is not
+        # there: seen in output/bedroom/fix4d (skeleton 1024, composite 1536).
+        # 75 (skeleton -> box) is already resized by place_box, same as 26/28
+        wf["76"]["inputs"].update(width=g["canvas"], height=g["canvas"])
+        wf["77"]["inputs"].update(x=g["x"], y=g["y"])
     if "80" in wf:                      # hd/hd2/hd3 variants: detail crop
         cx = max(0, g["x"] - MARGIN)
         cy = max(0, g["y"] - MARGIN)
@@ -135,6 +146,7 @@ async def main() -> int:
     p.add_argument("--scene")
     p.add_argument("--character")
     p.add_argument("--fusion")
+    p.add_argument("--scene-neg", help="scene negative (node 11)")
     p.add_argument("--character-neg", help="character negative (node 21)")
     p.add_argument("--fusion-neg", help="fusion negative (node 41)")
     p.add_argument("--detail-prompt", help="2nd pass prompt (node 93)")
