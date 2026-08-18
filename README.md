@@ -645,6 +645,16 @@ found. The node default is 0.4 and at that value the five bedroom poses came
 back **changed in the same place in all five** — that is run-to-run GPU noise,
 not a hands pass.
 
+> ⚠️ **Lowering the threshold does not find the hands, it invents a
+> detection.** Measured on pose `1_edge` at 1536x1536 (`--hands yolo
+> --hands-thr 0.25`, no upscale, `output/bedroom/hands_thr/`): the mask is no
+> longer black — 5537 px — but it is a single 112x48 box at (336,768)-(448,816),
+> and that region is **empty wall**. The hands are around (650,930)-(790,1060).
+> The pass repainted background. Above 0.4 nothing is detected; at 0.25 the
+> only thing detected is a false positive. See
+> `output/bedroom/hands_thr/1_edge/_yolo_false_positive.png` (red = what the
+> detector marked, blue = where the hands are).
+
 The node's default threshold (`detect_thr=0.6`) is also too strict for anime
 — on the full image it detected 0 hands at 0.6 and 1 at 0.3 — so
 `construir_wf.py` lowers it to `MESH_DETECT_THR = 0.3`. Even so it does not
@@ -660,9 +670,15 @@ same detector finds 2 hands at 0.6.
   case. But if the geometry was already correct, the depth has nothing to
   correct and only changes the shape slightly.
 
-**Recommendation: `hd3y`.** It detects in both scenarios, costs 7 s and has
-no silent failure mode. Reserve `hd3m`/`hd3ym` for when you see broken *and*
-clearly visible hands.
+**Recommendation on generic scenes: `hd3y`.** It detects in both scenarios,
+costs 7 s and now writes `i_hands` so the failure is not silent. Reserve
+`hd3m`/`hd3ym` for when you see broken *and* clearly visible hands.
+
+**On the bedroom poses: no hands pass.** Both detectors were run against the
+real renders and neither one lands on the hands (see the two boxes above).
+`hd2` is the whole pipeline that touches them, and it does so through the
+whole-body re-diffusion, not through a detector. Do not spend a run on
+`--hands` here.
 
 ### Character resolution: where it is lost and what recovers it
 

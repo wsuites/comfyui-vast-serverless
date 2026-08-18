@@ -83,6 +83,7 @@ pixels), which is what reads as detail.
   detail over more pixels.
 - **The style LoRA at half strength is the worst of both worlds**: no texture
   gain at all, and the highest saturation of any variant.
+- **The hands pass on these poses.** Measured, not guessed — see below.
 
 ### What works
 
@@ -147,6 +148,39 @@ the face came out correct in the collage, was smudged by the fusion at denoise
 0.55, and was then rebuilt **with an open blue eye** two passes later. It is
 invisible unless you zoom into the face of the final upscale. Identity now
 travels in `--detail-prompt`, which reaches both passes.
+
+---
+
+## The hands pass: closed, with the measurement
+
+The question was whether `--hands yolo` did nothing because the threshold was
+too high. Lowering it does not help: it turns a silent no-op into a wrong
+detection.
+
+Probe on pose `1_edge`, 1536x1536, `--hands yolo --hands-thr 0.25`, no upscale
+(`output/bedroom/hands_thr/`):
+
+| | |
+|---|---|
+| `i_hands` mask | 5537 px, one box, (336,768)-(448,816) |
+| what is in that box | empty wall |
+| where the hands actually are | around (650,930)-(790,1060) |
+
+So the pass ran and repainted a patch of background. At the node default (0.4)
+the detector marks nothing and `FaceDetailer` returns the image untouched; at
+0.25 the only thing it marks is a false positive. There is no threshold in
+between that lands on the hands, because the detector is not seeing them at
+all: `hand_yolov8s` is trained on photographs and this art style costs it the
+confidence, exactly like MeshGraphormer above.
+
+The five bedroom poses re-rendered with `--hands yolo` and came back changed in
+the same 5523-5545 px patch of wooden floor in all five. Five different poses
+cannot change identically in the same spot from a hands pass — that was
+run-to-run GPU noise, and the detector never fired.
+
+Rule: the hands on these renders are fixed by `hd2` (whole-body re-diffusion at
+1536), which reaches them, or not at all. Do not spend a run on `--hands`.
+`_yolo_false_positive.png` in that folder draws both boxes over the render.
 
 ---
 
