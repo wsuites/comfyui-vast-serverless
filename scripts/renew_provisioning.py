@@ -40,10 +40,25 @@ IMAGE_TAG = config.var("VAST_IMAGE_TAG")
 HF_TOKEN = config.var("VAST_HF_TOKEN")
 EXPIRES = 7 * 24 * 3600  # maximum SigV4 allows
 
-ONSTART = """export SERVERLESS=true
+ONSTART = r"""export SERVERLESS=true
 export BACKEND=comfyui-json
 export COMFYUI_API_BASE="http://localhost:18188"
 export MODEL_LOG=/var/log/portal/comfyui.log;
+# Some hosts (old Docker seccomp + hiveos kernels) deny the faccessat2 syscall,
+# so bash's builtin permission tests ([ -r ], [ -x ]) always return false while
+# [ -f ], cat and /usr/bin/test keep working. boot_default.sh gates every
+# /etc/vast_boot.d script behind `[[ -f ]] && [[ -r ]]`, so on such a host it
+# sources ZERO of them: no supervisord, no ComfyUI, no models - an empty shell
+# that still bills by the hour. Measured on machine 148233 (kernel 6.6.0-hiveos).
+# The -r test is redundant there ([[ -f ]] already ran), so drop it - but only
+# on a host that is actually broken, so healthy hosts boot byte-identically.
+# 25-first-boot.sh carries the very same line; one sed covers both. The two
+# scripts that matter (65-supervisor-launch, 75-provisioning-manifest) use no
+# permission tests at all, which is why patching just this line is enough.
+: > /tmp/.acc_probe
+[ -r /tmp/.acc_probe ] || sed -i 's/&& \[\[ -r "$script" \]\] //' \
+    /opt/instance-tools/bin/boot_default.sh /etc/vast_boot.d/25-first-boot.sh
+rm -f /tmp/.acc_probe
 entrypoint.sh &
 wget -O - "https://raw.githubusercontent.com/vast-ai/pyworker/main/start_server.sh" | bash"""
 
