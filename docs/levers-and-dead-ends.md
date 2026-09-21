@@ -90,11 +90,11 @@ pixels), which is what reads as detail.
   airbrush. Measured on 10 seeds per arm, bare text2img at 1024, same seeds
   and prompt, everything else held at the current baseline:
 
-  | scheduler | texture | saturation | s/img |
-  |---|---|---|---|
-  | `karras` (baseline) | 6.62 | 69.3 | 29 |
-  | `beta` (alpha 0.6 / beta 0.6) | 6.37 | **−4 %** | 68.8 |
-  | `beta57` (alpha 0.5 / beta 0.7) | 6.48 | **−2 %** | 67.9 |
+  | scheduler | texture | vs baseline | saturation | s/img |
+  |---|---|---|---|---|
+  | `karras` (baseline) | 6.62 | — | 69.3 | 29 |
+  | `beta` (alpha 0.6 / beta 0.6) | 6.37 | **−4 %** | 68.8 | 18 |
+  | `beta57` (alpha 0.5 / beta 0.7) | 6.48 | **−2 %** | 67.9 | 17 |
 
   Both beta arms come out *below* karras. The schedule is not the lever; the
   style LoRA is (see the table above). Reproduce with
@@ -106,6 +106,68 @@ pixels), which is what reads as detail.
   the full scene pipeline (collage, detail pass, upscale) and this is bare
   text2img. Same metric, different content: only the deltas inside one run
   compare.
+
+- **Another model does not buy the texture either.** Anima (`anima-aesthetic-v1.0`,
+  a 2B DiT finetune of Cosmos-Predict2-2B-Text2Image) was measured against WAI
+  on the same 10 seeds, bare text2img at 1024, each arm on its own recommended
+  sampler/scheduler/steps/cfg. It lands *below* the WAI baseline:
+
+  | arm | texture | vs WAI | skin only | saturation | s/img |
+  |---|---|---|---|---|---|
+  | `wai` (style LoRA 0.5, baseline) | 6.62 | — | 2.06 | 69.3 | 22 |
+  | `wai_beta` | 6.37 | −4 % | 1.79 | 68.8 | 17 |
+  | `wai_beta57` | 6.48 | −2 % | 1.90 | 67.9 | 17 |
+  | **`wai_nolora` (style LoRA 0.0)** | **9.65** | **+46 %** | **3.05** | 74.5 | 17 |
+  | `anima` | 6.34 | −4 % | **1.17** | 78.8 | 32 |
+
+  s/img is the median, so the one cold start per arm is excluded; Anima is
+  genuinely ~2x slower per image because the worker has 16 GB and cannot hold
+  SDXL and Anima at once, so it reloads a ~5 GB model on every request.
+
+  Anima is the *worst* arm on skin and the most saturated. It draws cleanly —
+  harder line art, more separated hair strands, cheek hatching — which is why
+  its first seed came in at 7.37 and looked like a win. That seed was an
+  outlier; over 10 it is 6.34. Do not re-run this comparison hoping the first
+  number was real.
+
+- **Confirmed at n=10: dropping the style LoRA is the only lever that works.**
+  The +25 % in the table above understates it; on 10 bare text2img seeds it is
+  **+46 %**, and it is the only arm that moves skin as well as the whole frame.
+  The documented colour cost does not reproduce at this scale: saturation goes
+  69.3 -> 74.5, **+7.5 %**, not the +56 % of the single `s121212` pair. A
+  texture gain that costs 7 % saturation is affordable in a way that one
+  costing 56 % is not, so the "paid for in colour" framing in the older note is
+  too pessimistic for bare generation. It may still hold through the full
+  pipeline, which is where that pair was measured — untested.
+
+  Caveat: the no-LoRA arm also composes *busier scenes*
+  (window mullions, picture frames, shirt buttons, far more hair strands), so
+  part of +46 % is scene complexity, not surface. The skin-only column exists
+  to control for exactly that and still favours it, 3.05 vs 2.06.
+
+  **On the "skin only" column.** The headline metric is a blunt
+  neighbouring-pixel difference over the whole frame, so across models with
+  different drawing styles it partly counts line art. The skin-only figure
+  scores every 64 px patch, keeps the skin-coloured ones (HSV hue 3-30,
+  saturation 25-120, value >= 110) and averages the flattest quartile — surface
+  micro-detail with the lineart outliers dropped. It was built to check whether
+  Anima's lead was an artefact of style. It was not needed for that in the end:
+  both metrics rank all five arms identically. Keep it for cross-model
+  comparisons; inside one model the cheap whole-frame number is sufficient.
+
+  Reproduce the whole table with:
+
+  ```powershell
+  python scripts/ab_modelo.py --arms wai,wai_beta,wai_beta57 --seeds 10
+  python scripts/ab_modelo.py --arms wai_nolora --seeds 10 --out output/ab-model/nolora
+  python scripts/ab_modelo.py --arms anima --seeds 10 --out output/ab-model/anima
+  python scripts/skin_texture.py output/ab-model/wai/wai_1*.png
+  python scripts/skin_texture.py output/ab-model/nolora/ output/ab-model/anima/
+  ```
+
+  `ab_modelo.py` rewrites `metrics.json` and `ab_model.png` from its own run's
+  rows only, so every arm set needs its own `--out` or it erases the previous
+  one.
 
 ### What works
 

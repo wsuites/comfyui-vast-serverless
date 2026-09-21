@@ -19,7 +19,8 @@ uploaded back there.
 | `scripts/escena.py`, `frames.py`, `correr.py` | Runners for the scene pipeline. |
 | `scripts/una_pasada.py` | Single-pass render: character and scene generated together, no cutout and no paste. Better anatomy and no seam; use it when the figure fills the frame. |
 | `scripts/sprites.py`, `normalizar.py`, `ciclo_pose.py` | RGBA sprite generation and normalization. |
-| `scripts/ab_detalle.py`, `ab_resolucion.py`, `hoja12.py` | A/B comparison harnesses. |
+| `scripts/ab_detalle.py`, `ab_resolucion.py`, `ab_modelo.py`, `hoja12.py` | A/B comparison harnesses. |
+| `scripts/skin_texture.py` | Skin-only texture metric, for A/Bs that cross models. |
 | `scripts/serverless_provision.sh` | Worker provisioning. Copy of what runs in R2 (`comfy-stack/scripts/serverless_provision.sh`). |
 | `scripts/renew_provisioning.py` | Uploads the provisioning to R2, regenerates the presigned URL and updates template + workergroup. |
 | `scripts/sondear_nodos.py` | Dumps the real node schema from the live worker (`object_info` over SSH). For wiring a new node without guessing. |
@@ -506,6 +507,8 @@ CHARACTER ──► KSampler ──► BiRefNet ──► scale ─────�
 | `scripts/escena.py` | Runner with `--sweep` of denoise |
 | `scripts/ab_detalle.py` | A/B of the second pass, with timings |
 | `scripts/ab_resolucion.py` | A/B of the resolution levers (`--vertical`, `--canvas`, `--upscale`), with comparison sheets |
+| `scripts/ab_modelo.py` | A/B across models and schedulers (`--arms`, `--seeds`), with a texture/saturation table |
+| `scripts/skin_texture.py` | Texture scored on skin patches only — use it when the arms are different models |
 | `scripts/frames.py` | Pose sequence on a fixed set |
 | `scripts/correr.py` | Movement sequence (character crossing the scene) |
 | `workflows/wf_v_<pose>_<variant>.json` | The pre-generated matrix, for the A/B and for manual inspection |
