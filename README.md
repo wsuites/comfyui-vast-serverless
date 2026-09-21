@@ -787,7 +787,13 @@ Two independent line items:
 Measured on the real worker (2026-08-16): with `VAST_DISK_SPACE=16` the image
 + models occupied **14 GB of 16**, i.e. 2.9 GB free, and after downloading
 the MeshGraphormer weights it was down to **1.6 GB (91% used)**. Too tight,
-so `VAST_DISK_SPACE` is now **18**, where the worker sits around 78%.
+so `VAST_DISK_SPACE` went to **18**, where the worker sat around 78%
+(measured 2026-09-21 on worker 51766427: **13.9 GB used of 18**).
+
+It is now **26**, because `FEAT_ANIMA` adds a whole second model stack next to
+the SDXL one: Anima is a 2B DiT with its own encoder and VAE, **5.25 GB**
+across three files (3.90 + 1.11 + 0.24). At 18 GB it did not fit in the 4.1 GB
+that were free. 26 leaves ~6 GB of headroom with both stacks installed.
 
 **How much disk you ask for does not affect availability.** Pool machines
 offer between 288 and 1,352 GB, so `disk_space>=16`, `>=24` or `>=60` return
@@ -797,13 +803,16 @@ the bill, which is `storage_cost x GB`:
 | `VAST_DISK_SPACE` | Cost at current price ($0.0267/GB/month) | Ceiling with `storage_cost<=0.11` |
 |---|---|---|
 | 16 GB | $0.43/month | $1.76/month |
-| **18 GB** | **$0.48/month** | **$1.98/month** |
+| 18 GB | $0.48/month | $1.98/month |
 | 24 GB | $0.64/month | $2.64/month |
+| **26 GB** | **$0.69/month** | **$2.86/month** |
 | 32 GB | $0.85/month | $3.52/month |
 
-18 GB keeps the disk ceiling at **$1.98/month** without losing any offer, and
-with the 14 GB the full stack occupies (MeshGraphormer included) ~4 GB stay
-free. If more models are added, going up to 24 costs 16 more cents a month.
+Going from 18 to 26 GB costs **21 cents a month** and loses no offer. Keep the
+`disk_space>=` filter in `VAST_SEARCH_PARAMS` in sync with the number: the
+filter selects machines and `--disk_space` allocates on them, so a filter
+below the allocation picks machines that cannot host what is then asked of
+them.
 
 > There is no **VRAM** step between 16 and 24 GB: the market jumps from one
 > to the other with nothing in between, so asking `gpu_ram>=18` is asking

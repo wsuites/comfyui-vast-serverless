@@ -34,6 +34,7 @@ FEAT_POSE_OPENPOSE=false   # --pose openpose: FAILS with anime      ~430 MB
 FEAT_FACE=true             # --face (FaceDetailer)                   52 MB
 FEAT_HANDS_YOLO=true       # --hands yolo                            22 MB
 FEAT_HANDS_MESH=true       # --hands mesh (MeshGraphormer)         1.37 GB
+FEAT_ANIMA=true            # Anima (ab_modelo.py A/B)               ~5.6 GB
 
 on() { [ "${1:-false}" = "true" ]; }
 
@@ -64,6 +65,26 @@ if on "$FEAT_CONTROLNET"; then
   # Union: openpose, depth, canny... all in one model. The 'mesh' hands pass
   # uses it in depth mode, so it also needs it.
   MODELS+=("comfy-stack/models/controlnet/controlnet-union-sdxl-1.0.safetensors|controlnet/controlnet-union-sdxl-1.0.safetensors")
+fi
+if on "$FEAT_ANIMA"; then
+  # Anima is NOT an SDXL checkpoint: it is a 2B DiT (finetune of
+  # nvidia/Cosmos-Predict2-2B-Text2Image) with a Qwen3-0.6B text encoder and
+  # the Qwen-Image VAE. There is no CheckpointLoaderSimple path -- it needs
+  # three separate files in three different folders, which is why they are
+  # listed apart from the checkpoints above.
+  #
+  # DISK: ~5.6 GB on top of everything else. With VAST_DISK_SPACE=18 and the
+  # full SDXL feature set already installed there is not room; raise the disk
+  # or turn off the features the A/B does not use (it is bare text2img: it
+  # needs no controlnet, no rmbg, no pose, no face, no hands, no upscale).
+  #
+  # Mirror these to R2 first, same as BiRefNet, so provisioning does not
+  # depend on HuggingFace. Source: circlestone-labs/Anima, split_files/.
+  MODELS+=(
+    "comfy-stack/models/diffusion_models/anima-aesthetic-v1.0.safetensors|diffusion_models/anima-aesthetic-v1.0.safetensors"
+    "comfy-stack/models/text_encoders/qwen_3_06b_base.safetensors|text_encoders/qwen_3_06b_base.safetensors"
+    "comfy-stack/models/vae/qwen_image_vae.safetensors|vae/qwen_image_vae.safetensors"
+  )
 fi
 
 # --- R2 files that do NOT go under models/. Path relative to COMFY_DIR. -------
