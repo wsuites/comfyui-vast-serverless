@@ -25,6 +25,7 @@ uploaded back there.
 | `scripts/sondear_nodos.py` | Dumps the real node schema from the live worker (`object_info` over SSH). For wiring a new node without guessing. |
 | `scripts/validar_wf.py` | Validates every flag combination against the worker schema. |
 | `scripts/visor.py` | Generates `output/visor.html`, a self-contained A/B viewer. |
+| `webapp/` | Local web console for the endpoint (FastAPI + one static page). Holds the API key server-side, submits the same `/generate/sync` request the CLI does, and streams phase progress over SSE. |
 | `workflows/` | All workflows in ComfyUI **API** format (what is sent in each request). |
 | `docs/` | Parameter recipe and prompt findings (`reproducing-results-from-scratch.md`), character LoRAs (`loras.md`), and what each lever actually does plus the dead ends not worth retrying (`levers-and-dead-ends.md`). |
 | `output/` | Everything generated, organized by experiment, each with its own `README.md`. |
@@ -49,6 +50,27 @@ python scripts/call_endpoint.py --steps 30 --cfg 6 --seed 552827645330068 `
 
 The image URL is printed to stdout and the whole response is saved to
 `output/general/last_response.json`.
+
+### Or from the browser
+
+```powershell
+python webapp/server.py        # http://127.0.0.1:8800
+```
+
+Same endpoint, same `wf.json`, same flags — the page is only a front end for
+`build_workflow`. The API key stays in the server process; the browser never
+sees it.
+
+What it shows is **phase** progress, not a percentage. The pyworker only
+exposes `/generate/sync` and `/health`, there is no per-step callback, and
+ComfyUI's own port is not published, so a real progress bar is impossible
+without changing the template. Phases come from polling the Vast API for the
+worker's state, which is where the time actually goes anyway: a cold start is
+~7 min and the render is ~18 s.
+
+It also runs the stranded-worker check (`unstick`, below) before submitting,
+so a job that would otherwise sit at "queued" for the whole timeout turns into
+a cold start on a different machine instead.
 
 ### Flags
 
@@ -420,6 +442,33 @@ worker that stops itself when idle and is woken by the next request.
 >
 > If you really want a reserved cold slot, you need `max_workers=2` (1 warm +
 > 1 cold), assuming 2 GPUs rented is acceptable.
+
+### When the worker is stranded on a full machine
+
+A worker that stops itself when idle keeps its **disk** on the host but
+releases the **GPU**. If another tenant takes that GPU before the next
+request, the instance can never start again: it is pinned to that one host.
+With `max_workers=1` the autoscaler does not rent a replacement either, because
+from its side the slot is occupied. The symptom is a request that sits queued
+until it times out, with no error anywhere.
+
+```powershell
+python scripts/mizuki.py unstick --dry-run   # diagnose, spends nothing
+python scripts/mizuki.py unstick             # destroy it so a new one is rented
+```
+
+`gen` and the web console run this check automatically before submitting
+(`--no-preflight` opts out). The detection is a probe, not a guess: it asks
+`vastai start instance`, and only the *"required resources are currently
+unavailable"* answer counts — confirmed against
+`vastai search offers machine_id=<id>` returning nothing. `--dry-run` skips the
+probe, because starting a startable instance is not free.
+
+Destroying is the whole fix: the disk is re-downloaded from R2 on the new host
+in the usual cold start. Note that `renew_provisioning.py --update-workers`
+does **not** help here, and does not help with a disk change either — a rolling
+update restarts the container on the same rented hardware, where the disk size
+was fixed at rent time.
 
 ---
 
