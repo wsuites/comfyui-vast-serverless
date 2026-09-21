@@ -84,6 +84,28 @@ pixels), which is what reads as detail.
 - **The style LoRA at half strength is the worst of both worlds**: no texture
   gain at all, and the highest saturation of any variant.
 - **The hands pass on these poses.** Measured, not guessed — see below.
+- **The `beta` scheduler does not buy back the skin texture.** The theory was
+  sound and wrong: `beta` spends more steps in the low-noise tail, where
+  surface detail gets resolved, so it should read as paint rather than
+  airbrush. Measured on 10 seeds per arm, bare text2img at 1024, same seeds
+  and prompt, everything else held at the current baseline:
+
+  | scheduler | texture | saturation | s/img |
+  |---|---|---|---|
+  | `karras` (baseline) | 6.62 | 69.3 | 29 |
+  | `beta` (alpha 0.6 / beta 0.6) | 6.37 | **−4 %** | 68.8 |
+  | `beta57` (alpha 0.5 / beta 0.7) | 6.48 | **−2 %** | 67.9 |
+
+  Both beta arms come out *below* karras. The schedule is not the lever; the
+  style LoRA is (see the table above). Reproduce with
+  `python scripts/ab_modelo.py --arms wai,wai_beta,wai_beta57 --seeds 10`.
+  `beta` needs `BetaSamplingScheduler` + `SamplerCustom` instead of `KSampler`,
+  which is why those arms build a different graph.
+
+  These numbers are ~6, not the ~4.8 of the table above, because the table is
+  the full scene pipeline (collage, detail pass, upscale) and this is bare
+  text2img. Same metric, different content: only the deltas inside one run
+  compare.
 
 ### What works
 
