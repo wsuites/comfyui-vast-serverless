@@ -296,6 +296,28 @@ def build_workflow(args) -> dict:
     return wf
 
 
+def preflight() -> None:
+    """Replace a worker that cannot come back, before asking it for a render.
+
+    The web console does this before every job, which is why the same failure
+    looks self-healing there and terminal here: a worker stranded on a full
+    machine will accept the request and sit on it until the timeout, and the
+    only visible difference from a slow render is how long you waited. It is
+    one CLI call and it does nothing in the common case.
+
+    Never fatal. If the check itself breaks, the request is still worth
+    sending - the worker may well be fine.
+    """
+    try:
+        import vast_state
+        report = vast_state.unstick()
+    except Exception as exc:                            # noqa: BLE001
+        print(f"pre-flight check skipped: {exc}", file=sys.stderr)
+        return
+    if report.get("acted"):
+        print(f"pre-flight: {report.get('detail')}", file=sys.stderr)
+
+
 async def main() -> int:
     p = argparse.ArgumentParser()
     p.add_argument("--workflow", default=str(ROOT / "workflows" / "wf.json"))
@@ -335,6 +357,8 @@ async def main() -> int:
     p.add_argument("--cost", type=int, default=100,
                    help="cost units for the autoscaler")
     p.add_argument("--timeout", type=float, default=900.0)
+    p.add_argument("--no-unstick", action="store_true",
+                   help="skip the pre-flight check for a stranded worker")
     p.add_argument("--out", default=str(ROOT / "output" / "general" / "last_response.json"))
     args = p.parse_args()
 
@@ -345,6 +369,9 @@ async def main() -> int:
             "workflow_json": workflow,
         }
     }
+
+    if not args.no_unstick:
+        preflight()
 
     client = Serverless(api_key=resolve_api_key())
     try:

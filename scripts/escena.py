@@ -160,7 +160,16 @@ async def main() -> int:
     p.add_argument("--y", type=int, default=380)
     p.add_argument("--out", default="output/scenes")
     p.add_argument("--timeout", type=float, default=900.0)
+    p.add_argument("--no-unstick", action="store_true",
+                   help="skip the pre-flight check for a stranded worker")
     a = p.parse_args()
+
+    # A sweep sends several requests back to back; a worker stranded on a full
+    # machine would eat every one of them at the full timeout each. Checking
+    # once up front costs one CLI call. See call_endpoint.preflight.
+    if not a.no_unstick:
+        from call_endpoint import preflight
+        preflight()
 
     dst = registrar_run(ROOT / a.out, a, {"seeds": (a.seed_scene, a.seed_character,
                                                     a.seed_fusion)})
