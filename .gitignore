@@ -21,3 +21,10 @@ res_*.json
 .DS_Store
 Thumbs.db
 .opencode/
+
+# monorepo
+node_modules/
+.astro/
+dist/
+.turbo/
+*.tsbuildinfo

@@ -1,0 +1,26 @@
+{
+  "name": "comfy-vast",
+  "private": true,
+  "version": "0.1.0",
+  "description": "ComfyUI on Vast.ai serverless: unified CLI toolchain plus a local web UI",
+  "type": "module",
+  "packageManager": "pnpm@10.13.1",
+  "engines": {
+    "node": ">=20"
+  },
+  "scripts": {
+    "cli": "node packages/cli/bin/cv.mjs",
+    "cv": "node packages/cli/bin/cv.mjs",
+    "build": "pnpm -r build",
+    "typecheck": "pnpm -r typecheck",
+    "clean": "pnpm -r clean",
+    "web:dev": "pnpm --filter @comfy-vast/web dev",
+    "web:build": "pnpm --filter @comfy-vast/web build",
+    "web:preview": "pnpm --filter @comfy-vast/web preview",
+    "api": "python webapp/server.py",
+    "dev": "node packages/cli/bin/cv.mjs web up --dev",
+    "up": "node packages/cli/bin/cv.mjs web up",
+    "tunnel": "node packages/cli/bin/cv.mjs web up --tunnel",
+    "doctor": "node packages/cli/bin/cv.mjs doctor"
+  }
+}
