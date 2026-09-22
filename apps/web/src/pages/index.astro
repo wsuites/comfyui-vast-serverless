@@ -1,0 +1,25 @@
+---
+import ActiveJobs from '../components/ActiveJobs.astro'
+import Base from '../layouts/Base.astro'
+import CompareView from '../components/CompareView.astro'
+import GalleryView from '../components/GalleryView.astro'
+import Header from '../components/Header.astro'
+import SceneView from '../components/SceneView.astro'
+import Tabs from '../components/Tabs.astro'
+import ZoomDialog from '../components/ZoomDialog.astro'
+
+const title = 'mizuki console'
+---
+
+<Base title={title}>
+  <Header title={title} />
+  <ActiveJobs />
+  <Tabs />
+  <SceneView />
+  <CompareView />
+  <GalleryView />
+  <ZoomDialog />
+  <script>
+    import '../scripts/main'
+  </script>
+</Base>

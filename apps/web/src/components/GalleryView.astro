@@ -1,0 +1,28 @@
+---
+// Gallery tab: every job this console has run, read back from
+// output/web/index.jsonl so it survives a server restart.
+---
+
+<main id="view-gallery" class="wide" hidden>
+  <section>
+    <div class="panel">
+      <div class="filters">
+        <select id="g_kind">
+          <option value="">All runs</option>
+          <option value="scene">Scene only</option>
+          <option value="arm">A/B arms only</option>
+        </select>
+        <select id="g_arm"><option value="">Any arm</option></select>
+        <input id="g_search" type="search" placeholder="search prompt or seed" />
+        <button type="button" id="g_refresh">Refresh</button>
+        <span class="hint" id="g_count"></span>
+      </div>
+      <p class="note" style="margin:0">Read from
+      <code>output/web/index.jsonl</code>, written when each job finishes, so it
+      survives restarting the server. Entries whose files were deleted are
+      dropped on read.</p>
+    </div>
+    <div id="g_empty" class="empty" style="margin-top:16px">Nothing recorded yet.</div>
+    <div id="g_items"></div>
+  </section>
+</main>

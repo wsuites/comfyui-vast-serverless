@@ -1,0 +1,11 @@
+---
+// The jobs the server has in memory, above the tabs because a job is not a
+// property of the tab that happened to submit it: a compare arm and a scene
+// render land in the same list. Filled at runtime by src/scripts/jobs.ts.
+// Hidden until the first poll comes back with something.
+---
+
+<section id="active-jobs" class="active-jobs" hidden>
+  <span class="active-jobs-title">Jobs <span id="active-jobs-count"></span></span>
+  <div id="active-jobs-list" class="active-jobs-list"></div>
+</section>

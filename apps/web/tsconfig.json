@@ -1,0 +1,23 @@
+{
+  "extends": ["astro/tsconfigs/strict", "../../tsconfig.base.json"],
+  "compilerOptions": {
+    // The client modules under src/scripts are plain browser ES modules, and
+    // the middleware runs on Node; both sets of globals have to be in scope.
+    "lib": ["ES2023", "DOM", "DOM.Iterable"],
+    // @types/node is not a declared dependency of this package (the lockfile is
+    // shared and cannot be touched here), so point TypeScript at the copy pnpm
+    // already materialised for the workspace. Build-time only: nothing at
+    // runtime depends on this path.
+    "typeRoots": [
+      "../../node_modules/@types",
+      "../../node_modules/.pnpm/node_modules/@types"
+    ],
+    "types": ["node"],
+    "jsx": "preserve",
+    "allowJs": true,
+    "checkJs": true,
+    "noEmit": true
+  },
+  "include": [".astro/types.d.ts", "**/*"],
+  "exclude": ["dist"]
+}

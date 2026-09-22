@@ -1,0 +1,12 @@
+---
+interface Props {
+  title: string
+}
+
+const { title } = Astro.props
+---
+
+<header>
+  <h1>{title}</h1>
+  <div id="worker" class="spacer"><span class="dot off"></span>checking worker&hellip;</div>
+</header>
