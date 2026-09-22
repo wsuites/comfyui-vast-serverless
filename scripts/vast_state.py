@@ -135,6 +135,11 @@ def _number(value: Any) -> float | None:
 # STALL_AFTER seconds is called wedged, and the clock resets the instant any
 # part of it stops holding.
 STALL_AFTER = 150.0
+# Seconds a running instance may sit with ready_ever False before it counts as
+# dead rather than slow. Above the 4-7 min a real cold start takes, below the
+# 15 min a request waits in the queue, so the replacement happens while the
+# job that triggered it can still be served.
+BOOT_CAP = 720.0
 
 _stall_since: float | None = None
 
@@ -420,7 +425,8 @@ def free_offers(machine_id: Any) -> int | None:
     return len(data) if isinstance(data, list) else None
 
 
-def stranded(inst: dict, probe: bool = True) -> str | None:
+def stranded(inst: dict, probe: bool = True,
+             work: dict | None = None) -> str | None:
     """Reason the instance cannot come back, or None if it is fine.
 
     The probe is a real ``vastai start``, which means a stopped-but-healthy
@@ -430,6 +436,31 @@ def stranded(inst: dict, probe: bool = True) -> str | None:
     that a dry run cannot spend money.
     """
     status = (inst.get("actual_status") or "").lower()
+    if status == "running" and work is not None:
+        # A worker that is running but never finished booting. This is the
+        # hole 52098270 fell through on 2026-09-22: the container came up,
+        # provisioning printed PROVISIONING_OK, and the pyworker's benchmark
+        # never returned a score, so ``ready_ever`` stayed False for 22
+        # minutes while the page cheerfully showed "loading models". Nothing
+        # below fires for it, because the instance record says "running" and
+        # is telling the truth - the machine is up, it is the worker on it
+        # that is dead.
+        #
+        # There is no error field to read: ``workers()`` exposes ready_ever,
+        # perf and started_at, and nothing else that distinguishes "still
+        # downloading" from "will never finish". So the only honest test is
+        # the clock, and the cap has to sit above a legitimate cold start
+        # (measured 4-7 min for ~22 GB of models) with room to spare.
+        if not work.get("ready_ever"):
+            start = inst.get("start_date") or work.get("started_at")
+            if start:
+                waited = time.time() - float(start)
+                if waited > BOOT_CAP:
+                    return (f"instance {inst.get('id')} has been running for "
+                            f"{waited / 60:.0f} min and the worker never became "
+                            f"ready (perf {work.get('measured_perf') or 0:.0f}); "
+                            f"its benchmark is not coming back")
+        return None
     if status not in ("exited", "stopped", "offline", ""):
         return None
     # An instance on its way up is not stranded, it is slow.
@@ -503,7 +534,7 @@ def unstick(dry_run: bool = False) -> dict:
         if (inst.get("actual_status") or "").lower() == "running":
             return {"acted": False, "detail": "worker is serving"}
 
-    reason = stranded(inst, probe=not dry_run)
+    reason = stranded(inst, probe=not dry_run, work=work)
     if not reason:
         return {"acted": False,
                 "detail": f"instance {inst.get('id')} can still start"}
