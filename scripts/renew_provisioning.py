@@ -59,6 +59,99 @@ export MODEL_LOG=/var/log/portal/comfyui.log;
 [ -r /tmp/.acc_probe ] || sed -i 's/&& \[\[ -r "$script" \]\] //' \
     /opt/instance-tools/bin/boot_default.sh /etc/vast_boot.d/25-first-boot.sh
 rm -f /tmp/.acc_probe
+# --- admin SSH tunnel (hosts with filtered inbound ports) --------------------
+# Outbound cloudflared quick tunnel: needs no credentials (nothing secret may
+# live here: the template is readable) and bypasses host firewalls entirely,
+# since the connection goes OUT to Cloudflare. The URL is random per boot and
+# is reported to Discord; without DISCORD_WEBHOOK the tunnel still runs, just
+# unannounced. Best effort only: backgrounded with its own retry loop, it must
+# never block or break the boot.
+# Client side (needs cloudflared locally):
+#   cloudflared access tcp --hostname <host> --url localhost:2222
+#   ssh -i ~/.ssh/xcl -p 2222 root@localhost
+(
+_dc() {
+  [ -n "$DISCORD_WEBHOOK" ] || return 0
+  curl -fsSL -m 10 -H 'Content-Type: application/json' -A 'mizuki-tunnel/1.0' \
+    -d "{\"content\":\"$1\",\"username\":\"mizuki-tunnel\"}" \
+    "$DISCORD_WEBHOOK" >/dev/null 2>&1 || true
+}
+CF=/usr/local/bin/cloudflared
+[ -x "$CF" ] || curl -fsSL -o "$CF" \
+  https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-linux-amd64 \
+  && chmod +x "$CF" || exit 0
+WHO="${VAST_CONTAINERLABEL:-$(hostname)}"
+while true; do
+  "$CF" tunnel --no-autoupdate --url ssh://localhost:22 > /tmp/cf-ssh.log 2>&1 &
+  CFPID=$!
+  URL=""
+  for _ in $(seq 1 60); do
+    sleep 2
+    URL=$(grep -o 'https://[^ ]*\.trycloudflare\.com' /tmp/cf-ssh.log | head -1)
+    [ -n "$URL" ] && break
+    kill -0 $CFPID 2>/dev/null || break
+  done
+  if [ -n "$URL" ]; then
+    _dc ":lock: **SSH tunnel UP** \`$WHO\` $URL || local: cloudflared access tcp --hostname ${URL#https://} --url localhost:2222 + ssh -p 2222 root@localhost"
+  fi
+  wait $CFPID
+  _dc ":warning: SSH tunnel DOWN on \`$WHO\`, retrying in 15s"
+  sleep 15
+done
+) > /tmp/cf-bootstrap.log 2>&1 &
+# --- worker serving tunnel (hosts with filtered inbound ports) ---------------
+# The pyworker does NOT serve on its own bind: it REPORTS a url to the Vast
+# autoscaler, and that url is built from env vars (vastai-sdk,
+# serverless/server/lib/metrics.py):
+#
+#     get_url() -> f"https://{PUBLIC_IPADDR}:{VAST_TCP_PORT_3000}"
+#
+# The autoscaler hands that url to the client verbatim. On a host that
+# firewalls its forwarded ports the reported url times out from outside and
+# every request dies in the queue - measured repeatedly on 2026-09-22.
+#
+# Fix: bring up a NAMED cloudflared tunnel (stable hostname, no random
+# quick-tunnel url) pointed at the local pyworker, then export PUBLIC_IPADDR
+# and VAST_TCP_PORT_3000 so the pyworker REPORTS the tunnel instead. It is a
+# deliberate lie to the autoscaler, which is why it is opt-in via
+# CF_WORKER_HOSTNAME: with it empty, the boot is byte-identical to before.
+#
+# USE_SSL is NOT set: cloudflared terminates TLS at the edge and speaks plain
+# HTTP to https://localhost:3000 --no-tls-verify is handled by the tunnel flag
+# --url https://localhost:3000 --no-tls-verify below. The reported scheme is
+# https because that is what the edge serves.
+#
+# Ordered BEFORE start_server.sh on purpose: the pyworker reads PUBLIC_IPADDR
+# once at import (metrics.py get_url is @cache), so exporting after it starts
+# has no effect.
+#
+# Both values come from the environment, not from this string: the onstart is
+# part of the template and can be read back. CF_WORKER_TOKEN in particular is
+# an account env var (like the S3 credentials), masked in `vastai show
+# env-vars`. With either unset the whole block is a no-op.
+if [ -n "${CF_WORKER_HOSTNAME:-}" ] && [ -n "${CF_WORKER_TOKEN:-}" ]; then
+  CF=/usr/local/bin/cloudflared
+  if [ ! -x "$CF" ]; then
+    curl -fsSL -o "$CF" \
+      https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-linux-amd64 \
+      && chmod +x "$CF"
+  fi
+  if [ -x "$CF" ]; then
+    setsid nohup "$CF" tunnel --no-autoupdate run --token "$CF_WORKER_TOKEN" \
+      --url https://localhost:3000 --no-tls-verify \
+      > /tmp/cf-worker.log 2>&1 &
+    # wait for the edge to register the connection, then lie to the pyworker
+    for _ in $(seq 1 30); do
+      grep -q "Registered tunnel connection" /tmp/cf-worker.log 2>/dev/null && break
+      sleep 2
+    done
+    export PUBLIC_IPADDR="$CF_WORKER_HOSTNAME"
+    export VAST_TCP_PORT_3000=443
+    echo "[onstart] pyworker url overridden -> https://$CF_WORKER_HOSTNAME:443"
+  else
+    echo "[onstart] cloudflared unavailable; keeping the host's own url"
+  fi
+fi
 entrypoint.sh &
 wget -O - "https://raw.githubusercontent.com/vast-ai/pyworker/main/start_server.sh" | bash"""
 
@@ -156,13 +249,30 @@ def main() -> int:
     env_webhook = f' -e DISCORD_WEBHOOK="{webhook}"' if webhook else ""
     print("Discord webhook:", "enabled" if webhook else "NOT set (no notifications)")
 
+    # Named tunnel that makes the pyworker reachable through Cloudflare on
+    # hosts whose forwarded ports are firewalled. Both are optional: with
+    # either empty the onstart's tunnel block is a no-op and the worker keeps
+    # reporting its own ip:port, exactly as before.
+    #
+    # NOTE: only the non-secret HOSTNAME goes in the template env (the template
+    # is world-readable via `vastai show template`). CF_WORKER_TOKEN is a Vast
+    # ACCOUNT env var, injected into every worker like the S3 credentials and
+    # masked in `vastai show env-vars`; nothing here writes it.
+    cf_host = config.ENV.get("CF_WORKER_HOSTNAME", "").strip()
+    cf_env = f' -e CF_WORKER_HOSTNAME="{cf_host}"' if cf_host else ""
+    print("worker tunnel:", f"hostname {cf_host}" if cf_host else "disabled",
+          "(token must be a Vast account env var)")
+    onstart = ONSTART
+
     template_env = (
         '-p 3000:3000 '
         '-e COMFYUI_ARGS="--disable-auto-launch --port 18188" '
         f'-e HF_TOKEN={HF_TOKEN} '
         '-e BENCHMARK_TEST_WIDTH=512 -e BENCHMARK_TEST_HEIGHT=512 '
         '-e BENCHMARK_TEST_STEPS=20 '
+        f'-e R2_PUBLIC_BASE="{R2_PUBLIC_BASE}" '
         f'-e PROVISIONING_SCRIPT="{url}"'
+        f'{cf_env}'
         f'{env_webhook}'
     )
 
@@ -172,7 +282,7 @@ def main() -> int:
            "--image", IMAGE, "--image_tag", IMAGE_TAG,
            "--ssh", "--direct", "--disk_space", DISK_SPACE,
            "--env", template_env,
-           "--onstart-cmd", ONSTART,
+           "--onstart-cmd", onstart,
            "--search_params", SEARCH_PARAMS,
            "--no-default")   # without forced verified=true
     new_hash = current_hash()

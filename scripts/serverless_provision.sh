@@ -246,15 +246,20 @@ watch_progress() {
 
 dc ":rocket: **provisioning STARTS** \`$WHO\` · ${GPU:-GPU?} · IP $IP"
 log "=== start ==="
-watch_progress & WATCH_PID=$!
 
 # The explicit 'exit 1' (credentials, ComfyUI not found, pip) do NOT trigger
 # the ERR trap, only the EXIT. Here that gap is closed: any exit != 0 that
 # does not already come from on_err is reported with its log tail.
 ERR_YA_AVISADO=0
+# NOT started here: watch_progress measures PIP_CACHE_DIR and MODELS_DIR, and a
+# background subshell keeps the variable values as of fork time. Started at
+# this point both were still unset, so it measured /tmp and reported a flat
+# "pip:1MB models:1MB" while gigabytes were downloading. It now starts below,
+# once both paths exist.
+WATCH_PID=""
 on_exit() {
     local st=$?
-    kill "$WATCH_PID" 2>/dev/null || true
+    [ -n "$WATCH_PID" ] && kill "$WATCH_PID" 2>/dev/null || true
     if [ "$st" != 0 ] && [ "$ERR_YA_AVISADO" = 0 ]; then
         dc ":x: **provisioning ABORTED** \`$WHO\` (exit $st) after $(elapsed)"
         dc_log 40
@@ -295,6 +300,10 @@ NODES_DIR="$COMFY_DIR/custom_nodes"
 mkdir -p "$MODELS_DIR"/{checkpoints,loras,upscale_models} "$MODELS_DIR/ultralytics/bbox" "$NODES_DIR"
 hito "[1/5] COMFY_DIR=$COMFY_DIR"
 
+# now that PIP_CACHE_DIR and MODELS_DIR are both set, the watcher measures the
+# right directories (see the note where WATCH_PID is declared)
+watch_progress & WATCH_PID=$!
+
 # --- [2/5] validate S3 credentials before anything ------------------------------
 missing=""
 for v in S3_ACCESS_KEY_ID S3_SECRET_ACCESS_KEY S3_BUCKET_NAME S3_ENDPOINT_URL; do
@@ -306,40 +315,49 @@ if [ -n "$missing" ]; then
 fi
 hito "[2/5] S3 credentials present (bucket=$S3_BUCKET_NAME)"
 
-# --- [3/5] custom nodes ------------------------------------------------------
-install_node() {
-    local repo="$1" name="$2" recursive="${3:-}" norequirements="${4:-}"
+# --- [3/5] custom nodes: clone in PARALLEL ------------------------------------
+# Only the clone runs here. The pip requirements are deferred to a single
+# combined pass further down, so that cloning, pip and the model downloads all
+# overlap instead of running strictly one after the other. On a cold start
+# that turns ~5 serial network waits into ~1 wall-clock wait.
+CLONE_PIDS=()
+CLONE_NAMES=()
+clone_node() {
+    local repo="$1" name="$2" recursive="${3:-}"
     if [ -d "$NODES_DIR/$name" ]; then
         log "node already present: $name"
-    else
-        log "cloning $name"
-        if [ -n "$recursive" ]; then
-            git clone --depth 1 --recursive "$repo" "$NODES_DIR/$name"
-        else
-            git clone --depth 1 "$repo" "$NODES_DIR/$name"
-        fi
+        return 0
     fi
-    if [ -n "$norequirements" ]; then
-        log "$name: skipping its requirements.txt (deps declared in PIP_EXTRA)"
-    elif [ -f "$NODES_DIR/$name/requirements.txt" ]; then
-        # shellcheck disable=SC2086
-        pip install $PIP_ARGS --no-build-isolation -r "$NODES_DIR/$name/requirements.txt" \
-            || log "[WARN] requirements of $name failed (continuing)"
+    log "cloning $name"
+    if [ -n "$recursive" ]; then
+        git clone --depth 1 --recursive "$repo" "$NODES_DIR/$name"
+    else
+        git clone --depth 1 "$repo" "$NODES_DIR/$name"
     fi
 }
 
 for entry in "${NODES[@]:-}"; do
     [ -n "$entry" ] || continue          # the array may end up empty due to a toggle
     IFS='|' read -r repo name recursive norequirements <<< "$entry"
-    install_node "$repo" "$name" "$recursive" "$norequirements"
+    clone_node "$repo" "$name" "$recursive" &
+    CLONE_PIDS+=($!)
+    CLONE_NAMES+=("$name")
 done
 
-# shellcheck disable=SC2086
-pip install $PIP_ARGS --no-build-isolation "${PIP_EXTRA[@]}" \
-    || { log "[ERROR] failed installing node dependencies"; exit 1; }
-hito "[3/5] custom nodes ready (${#NODES[@]})"
-
 # --- [4/5] models from R2 ----------------------------------------------------
+# Launched in the BACKGROUND here, before waiting for the clones or pip: the
+# three network-heavy phases (git clones, pip, model downloads) now overlap
+# instead of running strictly one after the other. The wait happens further
+# down, right before the benchmark step needs the files.
+#
+# DEPENDENCY: the downloader below imports boto3, and boto3 is normally
+# installed by the combined pip pass that now runs AFTER this fork. That was a
+# real failure: "ModuleNotFoundError: No module named 'boto3'", provisioning
+# aborted at 1m15s. So boto3 is installed on its own first (it is in
+# PIP_CACHE_DIR after the first boot, so this is seconds).
+# shellcheck disable=SC2086
+pip install $PIP_ARGS boto3 \
+    || { log "[ERROR] could not install boto3 (needed to fetch models)"; exit 1; }
 export COMFY_MODELS_DIR="$MODELS_DIR"
 # A "key|ABSOLUTE destination" per line is passed to python. MODELS is relative
 # to models/ and EXTRA_FILES relative to COMFY_DIR, but here both are resolved.
@@ -358,11 +376,11 @@ COMFY_MODEL_LIST=$(
     done
 )
 export COMFY_MODEL_LIST
+(
 python3 - <<'PY' || { log "[ERROR] model download failed"; exit 1; }
-import os, sys, concurrent.futures as cf
+import os, sys, subprocess, concurrent.futures as cf
 from pathlib import Path
 import boto3
-from boto3.s3.transfer import TransferConfig
 
 models_dir = Path(os.environ["COMFY_MODELS_DIR"])
 bucket = os.environ["S3_BUCKET_NAME"]
@@ -386,8 +404,62 @@ s3 = boto3.client(
     aws_secret_access_key=os.environ["S3_SECRET_ACCESS_KEY"],
     region_name=os.environ.get("S3_REGION", "auto"),
 )
-cfg = TransferConfig(multipart_threshold=64 * 1024**2, max_concurrency=8,
-                     multipart_chunksize=64 * 1024**2)
+# Presigned GET against the S3 endpoint, NOT the public r2.dev URL.
+# Measured 2026-09-22 on worker 52056650 (machine 148725), same host,
+# same object, same moment: pub-*.r2.dev returned 28 KB/s on the
+# 500MB-510MB range and 150 KB/s on 0-10MB, while the presigned URL from
+# 20ee...r2.cloudflarestorage.com returned 9.6 MB/s and 12.4 MB/s. The
+# public development domain is throttled for that worker's IP; the S3
+# endpoint is not.
+#
+# --speed-limit/--speed-time turn a silent stall into a retry: without them
+# a connection that drops to 0 B/s hangs until the whole fetch (and the
+# provisioning) times out, which is exactly how the anima object aborted 3
+# attempts in a row at ~512 MB. With them curl aborts the stalled connection
+# after 30s below 10 KB/s, and -C - resumes from the byte it got to.
+#
+# FALLBACKS: same bytes on a different origin, used when the R2 fetch does
+# not complete. Useful because the failure is route-specific: the wai 6.9 GB
+# object downloaded fine on the same host that stalled on anima.
+CURL = ["curl", "-4", "-fsSL", "--retry", "2", "--retry-delay", "3",
+        "--retry-all-errors", "--connect-timeout", "15",
+        "--speed-limit", "30720", "--speed-time", "25", "-C", "-"]
+
+FALLBACKS = {
+    "comfy-stack/models/diffusion_models/anima-aesthetic-v1.0.safetensors":
+        "https://huggingface.co/circlestone-labs/Anima/resolve/main/"
+        "split_files/diffusion_models/anima-aesthetic-v1.0.safetensors",
+    "comfy-stack/models/text_encoders/qwen_3_06b_base.safetensors":
+        "https://huggingface.co/circlestone-labs/Anima/resolve/main/"
+        "split_files/text_encoders/qwen_3_06b_base.safetensors",
+    "comfy-stack/models/vae/qwen_image_vae.safetensors":
+        "https://huggingface.co/circlestone-labs/Anima/resolve/main/"
+        "split_files/vae/qwen_image_vae.safetensors",
+}
+
+PROBE = ["curl", "-4", "-fsSL", "-o", "/dev/null", "--max-time", "8",
+         "-w", "%{speed_download}"]
+
+
+def probe_speed(url, offset=0):
+    """Bytes/s over a 2 MB ranged GET starting at ``offset``. 0.0 on failure.
+
+    Probing AT THE RESUME POINT matters: measured 2026-09-22, the same R2 url
+    served 12 MB/s at offset 0 and 5 KB/s at 600 MB on the anima object, so a
+    probe at 0 would pick exactly the route that stalls later.
+    Measured 2026-09-22: R2 and HuggingFace can differ by 3 orders of
+    magnitude for the SAME worker, and the slow one can still trickle bytes
+    forever (5 KB/s on anima). Probing first and downloading from whichever
+    answers faster avoids spending --retry 8 on a dead route, which is how the
+    previous version still stalled for 11 minutes.
+    """
+    rng = f"{offset}-{offset + 2_000_000}"
+    try:
+        p = subprocess.run([*PROBE, "-r", rng, url],
+                           capture_output=True, text=True, timeout=20)
+        return float(p.stdout.strip() or 0)
+    except Exception:
+        return 0.0
 
 def fetch(item):
     key, rel = item
@@ -400,12 +472,65 @@ def fetch(item):
     if dst.exists() and dst.stat().st_size == remote:
         return f"ok (cache) {rel}"
     tmp = dst.with_suffix(dst.suffix + ".part")
-    s3.download_file(bucket, key, str(tmp), Config=cfg)
-    if tmp.stat().st_size != remote:
-        tmp.unlink(missing_ok=True)
-        return f"WRONG SIZE: {rel}"
-    tmp.rename(dst)
-    return f"ok (downloaded {remote/1e6:.0f}MB) {rel}"
+    # The old fetcher (boto3 download_file) left random-suffixed leftovers
+    # (e.g. .part.9a90397C). Reclaim the largest one as the resume point so a
+    # half-downloaded object is not thrown away, and drop the rest.
+    leftovers = sorted(dst.parent.glob(dst.name + ".part.*"),
+                       key=lambda p: p.stat().st_size, reverse=True)
+    if leftovers:
+        if not tmp.exists() or leftovers[0].stat().st_size > tmp.stat().st_size:
+            leftovers[0].replace(tmp)
+        for p in leftovers[1:]:
+            p.unlink(missing_ok=True)
+    if tmp.exists() and tmp.stat().st_size == remote:
+        tmp.rename(dst)
+        return f"ok (resumed complete) {rel}"
+    if tmp.exists() and tmp.stat().st_size > remote:
+        tmp.unlink()             # corrupt: larger than the object itself
+    # Presigned GET against the S3 endpoint, NOT the public r2.dev URL.
+    # Measured 2026-09-22 on worker 52056650 (machine 148725), same host,
+    # same object, same moment: pub-*.r2.dev returned 28 KB/s on the
+    # 500MB-510MB range and 150 KB/s on 0-10MB, while the presigned URL from
+    # 20ee...r2.cloudflarestorage.com returned 9.6 MB/s and 12.4 MB/s. The
+    # public development domain is throttled for that worker's IP; the S3
+    # endpoint is not. That throttling is what stalled the anima object at
+    # ~512 MB on every attempt and aborted provisioning 3 times.
+    url = s3.generate_presigned_url(
+        "get_object", Params={"Bucket": bucket, "Key": key}, ExpiresIn=7*24*3600)
+    candidates = [(url, "r2")]
+    alt = FALLBACKS.get(key)
+    if alt:
+        candidates.append((alt, "hf"))
+    # Probe every origin and download from the fastest. Only worth the extra
+    # 2 MB GET when there is a real choice; with one origin go straight in.
+    if len(candidates) > 1:
+        resume = tmp.stat().st_size if tmp.exists() else 0
+        scored = sorted(((probe_speed(u, resume), u, o) for u, o in candidates),
+                        reverse=True)
+        candidates = [(u, o) for _, u, o in scored]
+        print("    probe " + " ".join(
+            f"{o}={s/1e6:.1f}MB/s" for s, _, o in scored), flush=True)
+        # A source that cannot even answer the probe is not worth a long fetch;
+        # keep it only as the last resort so a transient probe failure does not
+        # delete the only viable origin.
+        if scored[0][0] <= 0:
+            candidates = [(u, o) for _, u, o in scored]
+    attempt = ""
+    size = 0
+    for cand, origin in candidates:
+        # curl -C - resumes from tmp's current size on whichever origin is
+        # used, so switching origin keeps what the previous one already got:
+        # the bytes are the same object (R2 mirrors the HF file).
+        proc = subprocess.run([*CURL, "-o", str(tmp), cand],
+                              capture_output=True, text=True, timeout=3600)
+        size = tmp.stat().st_size if tmp.exists() else 0
+        if size == remote:
+            tmp.rename(dst)
+            tag = "downloaded" if not attempt else f"downloaded via {origin} after {attempt}"
+            return f"ok ({tag} {remote/1e6:.0f}MB) {rel}"
+        attempt += f"{origin}({size/1e6:.0f}MB) "
+    return (f"WRONG SIZE: {rel} ({size} != {remote}) after {attempt}"
+            f"{(' curl: ' + proc.stderr.strip()[:200]) if proc.returncode else ''}")
 
 errors = []
 with cf.ThreadPoolExecutor(max_workers=4) as ex:
@@ -419,28 +544,82 @@ if errors:
     sys.exit(1)
 print("MODELS_OK")
 PY
+) &
+R2_PID=$!
 
-# Downloads by direct URL (public HuggingFace). They run after R2 so that a
-# failure here does not invalidate what was already downloaded, but they count
-# the same: if one fails, the worker is not marked ready.
+# --- [3/4] custom nodes: wait for clones, then ONE combined pip ----------------
+# The clones were forked before the model download; wait for them all. A failed
+# clone is fatal exactly as before (set -e propagated it when it was serial).
+CLONE_FAIL=0
+for i in "${!CLONE_PIDS[@]}"; do
+    if ! wait "${CLONE_PIDS[$i]}"; then
+        log "[ERROR] git clone failed: ${CLONE_NAMES[$i]}"
+        CLONE_FAIL=1
+    fi
+done
+[ "$CLONE_FAIL" = 0 ] || exit 1
+
+# One pip resolution for every requirements.txt plus the extras. Installing a
+# single combined requirement set lets pip solve them together and downloads
+# overlapping wheels once; before, each node's pip run resolved against the
+# same cache separately. Per-node failures stay non-fatal (they were before).
+REQS=()
+for entry in "${NODES[@]:-}"; do
+    IFS='|' read -r _repo name _rec norequirements <<< "$entry"
+    if [ -z "$name" ] || [ -n "$norequirements" ]; then continue; fi
+    if [ -f "$NODES_DIR/$name/requirements.txt" ]; then
+        REQS+=(-r "$NODES_DIR/$name/requirements.txt")
+    fi
+done
+if [ "${#REQS[@]}" -gt 0 ]; then
+    # shellcheck disable=SC2086
+    pip install $PIP_ARGS --no-build-isolation "${REQS[@]}" \
+        || log "[WARN] some node requirements failed (continuing)"
+fi
+# shellcheck disable=SC2086
+pip install $PIP_ARGS --no-build-isolation "${PIP_EXTRA[@]}" \
+    || { log "[ERROR] failed installing node dependencies"; exit 1; }
+hito "[3/5] custom nodes ready (${#NODES[@]})"
+
+# Downloads by direct URL (public HuggingFace), in PARALLEL. They overlap with
+# the pip pass above and the R2 download still running. A failure in any of them
+# is fatal, exactly as it was when this loop ran serially.
+url_fetch() {
+    local url="$1" rel="$2" dst="$COMFY_DIR/$2"
+    if [ -s "$dst" ]; then
+        log "  ok (cache) $rel"
+        return 0
+    fi
+    mkdir -p "$(dirname "$dst")"
+    # same stall guard as the R2 fetcher: die after 30s under 10 KB/s and resume
+    if curl -4 -fsSL --retry 3 --retry-all-errors \
+            --speed-limit 10240 --speed-time 30 -C - -o "$dst.part" "$url"; then
+        mv "$dst.part" "$dst"
+        log "  ok (downloaded $(du -h "$dst" | cut -f1)) $rel"
+        return 0
+    fi
+    rm -f "$dst.part"
+    log "[ERROR] could not download $url"
+    return 1
+}
+URL_PIDS=()
+URL_RELS=()
 for e in "${URL_FILES[@]:-}"; do
     IFS='|' read -r url rel <<< "$e"
     [ -n "$url" ] || continue
-    dst="$COMFY_DIR/$rel"
-    if [ -s "$dst" ]; then
-        log "  ok (cache) $rel"
-        continue
-    fi
-    mkdir -p "$(dirname "$dst")"
-    if curl -fsSL --retry 3 -o "$dst.part" "$url"; then
-        mv "$dst.part" "$dst"
-        log "  ok (downloaded $(du -h "$dst" | cut -f1)) $rel"
-    else
-        rm -f "$dst.part"
-        log "[ERROR] could not download $url"
-        exit 1
-    fi
+    url_fetch "$url" "$rel" &
+    URL_PIDS+=($!)
+    URL_RELS+=("$rel")
 done
+
+# wait for the R2/python downloader (forked way above) before the benchmark
+wait "$R2_PID" || { log "[ERROR] model download failed"; exit 1; }
+
+URL_FAIL=0
+for i in "${!URL_PIDS[@]}"; do
+    wait "${URL_PIDS[$i]}" || { log "[ERROR] url download failed: ${URL_RELS[$i]}"; URL_FAIL=1; }
+done
+[ "$URL_FAIL" = 0 ] || exit 1
 
 hito "[4/5] models ready"
 

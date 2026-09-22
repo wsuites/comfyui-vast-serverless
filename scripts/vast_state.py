@@ -17,6 +17,7 @@ Everything here is blocking on purpose; async callers push it to a thread.
 from __future__ import annotations
 
 import json
+import socket
 import subprocess
 import time
 from typing import Any, Iterator
@@ -102,6 +103,144 @@ def endpoint() -> dict:
     return data[0] if data else {}
 
 
+def _number(value: Any) -> float | None:
+    """Float, or None when the host reported nothing usable for the field."""
+    if value is None:
+        return None
+    try:
+        return float(value)
+    except (TypeError, ValueError):
+        return None
+
+
+# ----------------------------------------------------- wedged request slots
+#
+# ``reqs_working`` is the autoscaler's own counter, not a reading of the card. A
+# request that dies between the autoscaler and ComfyUI - a client that hung up,
+# a worker restarted mid-render - leaves the count incremented with nothing
+# behind it. The endpoint then reports cur_load 100 for a worker that is doing
+# nothing, routes no new work to it, and every later request sits in the queue
+# until the client's own timeout fires.
+#
+# Measured 2026-09-22 on worker 52041444: status "idle", reqs_working 1,
+# cur_load 100.0, gpu_util 0.0 at 36 C, held for over an hour. Two jobs died
+# with "Timed out after 918.9s waiting for worker" and the card never warmed.
+# A reboot clears it, but the count survives the restart by several minutes
+# before the autoscaler reconciles it (see reboot()), so the stall clock going
+# back to zero is the signal, not the worker coming back up.
+#
+# Detection needs patience, not cleverness. gpu_util comes from Vast's own
+# polling (tens of seconds), so a request dispatched a moment ago legitimately
+# reads "counted but idle" for a sample or two. Only a condition that survives
+# STALL_AFTER seconds is called wedged, and the clock resets the instant any
+# part of it stops holding.
+STALL_AFTER = 150.0
+
+_stall_since: float | None = None
+
+
+# ------------------------------------------------------ worker reachability
+#
+# The autoscaler's router hands the client a raw address - ``https://<public
+# ip>:<host port for 3000/tcp>`` - and the client posts the payload straight
+# there. Vast never checks that address is reachable from where the client is
+# sitting; the worker's own heartbeat goes out from the machine, so a host
+# whose forwarded ports are firewalled still reports "ready".
+#
+# Measured 2026-09-22 on instance 52041444 (machine 142161): ICMP answered in
+# 111 ms, every TCP port timed out - 42026 (ssh), 42033 (pyworker), 443. The
+# route call returned that worker in 0.3 s. Every request then hung until the
+# client's own timeout, leaving ``reqs_working`` incremented behind it. The
+# wedged counter was the symptom; an unroutable machine was the cause.
+#
+# Probed with a bare TCP connect and never with the route call: routing
+# reserves a request slot, so using it as a health check would wedge the very
+# counter it is meant to diagnose.
+#
+# One exception, and it is the reason this probe reported a dead worker while
+# renders kept coming back: when CF_WORKER_HOSTNAME is set, the onstart in
+# renew_provisioning.py overrides PUBLIC_IPADDR/VAST_TCP_PORT_3000 before the
+# pyworker imports metrics.get_url, so the url REPORTED to the autoscaler - and
+# handed to the client - is the Cloudflare tunnel, not the host's ip:port. The
+# instance record still carries the raw ip and the forwarded host port, which
+# on those hosts is firewalled by definition (the tunnel exists because of it).
+# Probing the record therefore always fails on exactly the machines the tunnel
+# was added to rescue. Probe what the client will actually post to.
+PROBE_PORT = "3000/tcp"
+PROBE_TIMEOUT = 4.0
+PROBE_EVERY = 30.0
+
+# Kept in sync with the onstart by construction: both read the same variable,
+# and the port is the 443 the onstart exports as VAST_TCP_PORT_3000.
+CF_WORKER_HOSTNAME = ENV.get("CF_WORKER_HOSTNAME", "").strip()
+CF_WORKER_PORT = 443
+
+_probe_cache: tuple[float, str | None, bool | None] = (0.0, None, None)
+
+
+def worker_address(inst: dict) -> str | None:
+    """host:port the endpoint router would hand a client for this instance.
+
+    With the worker tunnel enabled that is the tunnel hostname for every
+    instance, because that is what the pyworker reports about itself.
+    """
+    if CF_WORKER_HOSTNAME:
+        return f"{CF_WORKER_HOSTNAME}:{CF_WORKER_PORT}"
+    ip = inst.get("public_ipaddr")
+    mapping = (inst.get("ports") or {}).get(PROBE_PORT) or []
+    port = mapping[0].get("HostPort") if mapping else None
+    if not ip or not port:
+        return None
+    return f"{str(ip).strip()}:{port}"
+
+
+def reachable(inst: dict) -> bool | None:
+    """True/False if the worker's serving port answers. None if unknown.
+
+    Cached for PROBE_EVERY seconds: describe() runs on every page poll and a
+    connect timeout is four seconds of a request handler's life.
+    """
+    global _probe_cache
+    target = worker_address(inst)
+    if not target:
+        return None
+    age, cached_target, cached = _probe_cache
+    now = time.time()
+    if cached_target == target and now - age < PROBE_EVERY:
+        return cached
+    host, _, port = target.partition(":")
+    try:
+        sock = socket.create_connection((host, int(port)), timeout=PROBE_TIMEOUT)
+        sock.close()
+        ok: bool | None = True
+    except OSError:
+        ok = False
+    except (TypeError, ValueError):
+        ok = None
+    _probe_cache = (now, target, ok)
+    return ok
+
+
+def _stalled_for(work: dict, gpu_util: float | None) -> float:
+    """Seconds this worker has counted work while its GPU sat idle. 0 if not.
+
+    Endpoint-wide on purpose: a wedged slot is a property of the worker, not
+    of whichever job happens to be waiting behind it.
+    """
+    global _stall_since
+
+    wedged = (bool(work.get("reqs_working"))
+              and (work.get("status") or "").lower() == "idle"
+              and gpu_util is not None and gpu_util <= 0)
+    if not wedged:
+        _stall_since = None
+        return 0.0
+    now = time.time()
+    if _stall_since is None:
+        _stall_since = now
+    return now - _stall_since
+
+
 def describe(insts: list[dict], works: list[dict]) -> dict:
     """Merge both views into a single phase, detail and worker record."""
     if not insts and not works:
@@ -124,6 +263,21 @@ def describe(insts: list[dict], works: list[dict]) -> dict:
         "status": work.get("status"),
         "ready": bool(work.get("ready_ever")),
         "reqs": work.get("reqs_working") or 0,
+        # Telemetry the host reports to Vast, not a live meter: it is refreshed
+        # on Vast's own polling cadence (tens of seconds), so a 20 s render can
+        # start and finish between two samples and never show up as load. Read
+        # it as "is the card busy at all", never as a per-step progress bar.
+        #
+        # gpu_util is a percentage, 0-100. cpu_util from the same record is
+        # deliberately not relayed: it has been seen as both 0.216 and 1.167 on
+        # this endpoint, so its unit is not knowable from here, and a number
+        # whose scale is a guess is worse than no number.
+        "gpu_util": _number(inst.get("gpu_util")),
+        "gpu_temp": inst.get("gpu_temp"),
+        # GB in use against the card's total, which Vast reports in MB.
+        "vram": inst.get("vmem_usage"),
+        "vram_total": (float(inst["gpu_totalram"]) / 1024
+                       if inst.get("gpu_totalram") else None),
     }
     if start:
         worker["hours"] = max(0.0, (time.time() - float(start)) / 3600)
@@ -132,11 +286,45 @@ def describe(insts: list[dict], works: list[dict]) -> dict:
     status = (inst.get("actual_status") or "").lower()
     msg = (inst.get("status_msg") or "").strip()
 
+    stalled = _stalled_for(work, worker["gpu_util"])
+    worker["stalled"] = stalled or None
+    worker["address"] = worker_address(inst)
+    worker["reachable"] = reachable(inst)
+
+    # Before anything about phases: if the serving port does not answer from
+    # here, the client cannot post to this worker whatever Vast believes. Say
+    # that instead of "Rendering", because the request is going to sit in the
+    # queue until it times out and no restart of ComfyUI will change it.
+    if worker["reachable"] is False:
+        # Two different failures share this branch, and they want opposite
+        # remedies: a firewalled host is disposable, a down tunnel is not -
+        # replacing the machine would just rebuild the same broken edge.
+        if CF_WORKER_HOSTNAME:
+            detail = (f"Worker tunnel down at {worker['address']} - the "
+                      f"pyworker reports this hostname to the autoscaler and "
+                      f"it does not answer. Check cloudflared on the worker")
+        else:
+            detail = (f"Worker unreachable at {worker['address']} - the "
+                      f"machine answers ping but its forwarded ports do not. "
+                      f"Requests cannot be delivered; replace it")
+        return {"phase": "generating" if work.get("reqs_working") else "provisioning",
+                "detail": detail,
+                "worker": worker}
+
     # Order matters here, and it is the opposite of the obvious one.
     #
-    # Work in flight beats every other signal: the request is demonstrably on
-    # the GPU, whatever the instance record claims.
+    # Work in flight beats every other signal - once it has been corroborated.
+    # A counted request with a cold card is not a render (see STALL_AFTER); say
+    # so, because the alternative is a progress line that reads "Rendering" for
+    # the fifteen minutes it takes the request to time out in the queue.
     if work.get("reqs_working"):
+        if stalled > STALL_AFTER:
+            return {"phase": "generating",
+                    "detail": (f"Worker idle with {work['reqs_working']} "
+                               f"request(s) still counted against it for "
+                               f"{stalled / 60:.0f} min - the slot is wedged, "
+                               f"nothing is rendering"),
+                    "worker": worker}
         return {"phase": "generating",
                 "detail": f"Rendering - {work['reqs_working']} request(s) in flight",
                 "worker": worker}
@@ -324,6 +512,45 @@ def unstick(dry_run: bool = False) -> dict:
     report["acted"] = True
     return report
 
+
+def reboot(instance_id: str | int | None = None) -> dict:
+    """Stop/start the worker's container. The way to clear a wedged slot.
+
+    It works, but not on the clock you expect. Measured 2026-09-22 on worker
+    52041444, held at ``reqs_working 1 / cur_load 100`` with the GPU idle for
+    over an hour:
+
+    * 05:24 reboot issued, 05:25 ``status: rebooting``
+    * 05:25 worker back (``started_at`` moves), still ``reqs_working 1``
+    * 05:28 still 1 - the count outlives the process that earned it
+    * 05:33 ``reqs_working 0``, ``cur_load 0``, status Ready
+
+    So the counter is the autoscaler's accounting, reconciled on its own
+    cadence, and the window between "the worker is back" and "the slot is
+    free" is minutes long. Do not read a reboot as failed at three minutes;
+    watch until the count drops. The
+    container keeps its disk, so the models do not download again - but the
+    stop does release the GPU, and a machine that fills in that window leaves
+    the instance stranded. ``unstick()`` is the way out of that, and the
+    caller should be told, which is why the hazard is in the return value and
+    not only in this comment.
+    """
+    insts = instances()
+    target = str(instance_id or (insts[0].get("id") if insts else "") or "")
+    if not target:
+        return {"ok": False, "detail": "no instance to reboot"}
+
+    ok, out = _vastai_raw("reboot", "instance", target, timeout=120)
+    # The stall clock is measuring a worker that is about to stop existing.
+    global _stall_since
+    _stall_since = None
+    return {
+        "ok": ok,
+        "instance": target,
+        "detail": (out.strip().splitlines() or ["rebooting"])[-1] if ok else out.strip(),
+        "hazard": ("The stop releases the GPU. If the machine fills before the "
+                   "start, the instance is stranded and has to be replaced."),
+    }
 
 # ------------------------------------------------------------------ results
 
