@@ -123,3 +123,8 @@ explicitly:
   relaunch: the disk persists.
 - In serverless, worker restarts are normal. Everything not in the
   provisioning script is lost on every replacement.
+- **In serverless, SSH itself is not guaranteed.** The host may filter the
+  direct port *and* the `sshN.vast.ai` proxy may reject the key; that is a
+  property of the renting, not of your setup. The way in is the outbound
+  Cloudflare tunnel the `onstart` starts. See the README sections
+  *Worker tunnel* and *SSH to the worker*.

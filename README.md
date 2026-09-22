@@ -55,19 +55,51 @@ The image URL is printed to stdout and the whole response is saved to
 ### Or from the browser
 
 ```powershell
-python webapp/server.py        # http://127.0.0.1:8800
+pnpm install                   # once
+pnpm web:build                 # once, and after any change under apps/web
+pnpm up                        # http://127.0.0.1:4321
 ```
 
+`pnpm up` is `cv web up`: it starts the FastAPI process on loopback, embeds the
+Astro server in the same process, and asks for the HTTP Basic credentials in
+`WEBAPP_USER` / `WEBAPP_PASS`. Add `--tunnel` to publish it through Cloudflare.
+
 Same endpoint, same `wf.json`, same flags — the page is only a front end for
-`build_workflow`. The API key stays in the server process; the browser never
-sees it.
+`build_workflow`. The API key stays in the Python process; the browser never
+sees it, and neither does the Astro layer. The front end is Astro with
+TypeScript under `apps/web/src/`; `webapp/server.py` now serves JSON and
+rendered files only, and refuses to bind anything but loopback, because
+authentication lives in Astro and exposing the API directly would bypass it.
+See `docs/monorepo-contract.md`.
+
+Three tabs:
+
+- **Scene** — the full `wf.json` pipeline. Model family (WAI or Anima), LoRA
+  strength, steps, cfg, seed, batch, the face-pass prompt, background removal
+  and its four mask controls, and the request limits.
+- **Compare A/B** — one prompt, two arms from `scripts/ab_modelo.py`
+  (`wai`, `wai_nolora`, `wai_beta`, `wai_beta57`, `anima`), rendered side by
+  side. It is the bare text2img graph, not the scene, which is what makes the
+  numbers comparable with `docs/levers-and-dead-ends.md`. Both sides are forced
+  onto **one shared seed** — a comparison against two seeds measures noise.
+  One worker and one GPU means the arms run in series, and across families
+  ComfyUI reloads ~5 GB between them.
+- **Gallery** — everything this page has generated, with its parameters, read
+  back from `output/web/index.jsonl` so it survives a server restart. Entries
+  whose files were deleted are dropped on read.
+
+The arm list, the background models and the face-pass defaults are served from
+`/api/options` rather than hard-coded in the page, so it cannot drift from the
+scripts.
 
 What it shows is **phase** progress, not a percentage. The pyworker only
 exposes `/generate/sync` and `/health`, there is no per-step callback, and
 ComfyUI's own port is not published, so a real progress bar is impossible
 without changing the template. Phases come from polling the Vast API for the
 worker's state, which is where the time actually goes anyway: a cold start is
-~7 min and the render is ~18 s.
+~3 min on a healthy host (measured `PROVISIONING_OK` in 3m06s) and ~18 s for
+the render. On a host with bad peering the cold start stretches to 30 min or
+aborts — see the note about screening the host in 15 s in *Troubleshooting*.
 
 It also runs the stranded-worker check (`unstick`, below) before submitting,
 so a job that would otherwise sit at "queued" for the whole timeout turns into
@@ -90,6 +122,20 @@ a cold start on a different machine instead.
 | `--timeout` | 900 | Seconds. Includes cold start. |
 | `--out` | `output/general/last_response.json` | Where to dump the response. |
 | `--remove-bg` | off | Cuts the character out with BiRefNet (node 70, model with `--rmbg-model`). |
+| `--family` | `wai` | `anima` swaps the checkpoint for the three-loader set (UNET + Qwen3 CLIP + VAE) and switches every sampler to `er_sde`/`simple`. |
+| `--anima-model` | the pinned UNET | Another Anima file, with `--family anima`. |
+| `--lora` | the one in `wf.json` (0.5) | Style LoRA strength. At `0` the node is **deleted**, not set to zero: a `LoraLoader` at 0.0 still loads the file. SDXL only. |
+| `--no-face` | off | Drops the FaceDetailer pass (node `17`) and its YOLO provider. |
+| `--detail-prompt` | the one in `wf.json` | Prompt the face pass repaints with. See the trap below. |
+| `--detail-negative` | the one in `wf.json` | Negative for the same pass. |
+
+**About `--detail-prompt`:** the FaceDetailer resamples inside the face mask
+with its **own** prompt (node `42`), so whatever that prompt names beats the
+main one there. The value shipped in `wf.json` ends in `red eyes, blushing`,
+which silently repaints the eye colour the scene prompt asked for — an Anima
+render that came out amber-eyed came back red after the face pass. Override it,
+or drop the trailing attributes, whenever the character's face is specified
+upstream.
 
 **About `--no-upscale`:** ignoring the upscaler nodes is not enough. The
 `SaveImage` (node `7`) must be re-hung directly from the FaceDetailer and
@@ -182,20 +228,70 @@ endpoint <name> ($VAST_ENDPOINT_ID)
                    -e COMFYUI_ARGS="--disable-auto-launch --port 18188"
                    -e HF_TOKEN=...
                    -e PROVISIONING_SCRIPT=<R2 URL>
+                   -e CF_WORKER_HOSTNAME=<named tunnel hostname>   (optional)
               onstart:
                    export SERVERLESS=true BACKEND=comfyui-json
+                   [cloudflared worker tunnel + url override]    <- optional
                    entrypoint.sh &                      <- starts supervisord
                    start_server.sh | bash               <- starts the pyworker
 ```
 
 The `S3_ACCESS_KEY_ID`, `S3_SECRET_ACCESS_KEY`, `S3_BUCKET_NAME`,
-`S3_ENDPOINT_URL` and `S3_REGION` credentials are **account environment
-variables** in Vast (`vastai show env-vars`), not in the template. Vast
-injects them into every worker.
+`S3_ENDPOINT_URL`, `S3_REGION` and (optional) `CF_WORKER_TOKEN` credentials are
+**account environment variables** in Vast (`vastai show env-vars`), not in the
+template. Vast injects them into every worker.
+
+### Worker tunnel: serving hosts whose ports are firewalled
+
+The pyworker does **not** serve on its own bind, it **reports a URL** to the
+Vast autoscaler, and that URL is built from environment variables
+(`vastai-sdk`, `serverless/server/lib/metrics.py`):
+
+```python
+def get_url() -> str:
+    use_ssl = os.environ.get("USE_SSL", "false") == "true"
+    worker_port = os.environ[f"VAST_TCP_PORT_{os.environ['WORKER_PORT']}"]
+    return f"http{'s' if use_ssl else ''}://{os.environ['PUBLIC_IPADDR']}:{worker_port}"
+```
+
+The autoscaler hands that URL to the client verbatim
+(`RouteResponse.get_url()`). On a host that firewalls its forwarded ports the
+reported URL times out from outside and every request dies in the queue —
+measured repeatedly on 2026-09-22, across five different machines.
+
+The fix, opt-in via `CF_WORKER_HOSTNAME`, is a **named** cloudflared tunnel
+(not a quick tunnel: the URL must be stable) pointed at the local pyworker,
+after which the `onstart` overrides `PUBLIC_IPADDR` and
+`VAST_TCP_PORT_3000` so the pyworker reports the tunnel instead. It is a
+deliberate lie to the autoscaler, and it runs **before** `start_server.sh`
+because `get_url` is `@cache`d at import.
+
+One-time setup:
+
+```powershell
+cloudflared tunnel login
+cloudflared tunnel create mizuki-worker
+cloudflared tunnel route dns mizuki-worker mizuki-py.<your-domain>
+cloudflared tunnel token mizuki-worker          # -> Vast account env var
+vastai create env-var CF_WORKER_TOKEN <token>   # secret: NOT in the template
+```
+
+Then `CF_WORKER_HOSTNAME=mizuki-py.<your-domain>` in `.env` (the hostname is not
+secret and travels in the template env; the token stays a masked account env
+var). With it empty the boot is byte-identical to before.
+
+> The `onstart` also starts an outbound **quick** tunnel for admin SSH
+> (`ssh://localhost:22`), whose random `*.trycloudflare.com` URL is posted to
+> Discord. From the client:
+> `ssh -o ProxyCommand="cloudflared access ssh --hostname <url>" root@placeholder`.
+> This is what to use when the host filters port 22 and the `sshN.vast.ai`
+> proxy rejects the key.
 
 `serverless_provision.sh` runs via `PROVISIONING_SCRIPT` **before** the worker
-is marked ready. It installs Impact-Pack, Impact-Subpack and
-UltimateSDUpscale, and pulls these 4 models from R2:
+is marked ready. What it installs and downloads is driven by the `FEAT_*`
+toggles at the top of the script (see
+[Turning worker features on and off](#turning-worker-features-on-and-off)).
+With everything on it pulls ~20 GB, the four always-present files being:
 
 ```
 comfy-stack/models/checkpoints/waiIllustriousSDXL_v170.safetensors   6.9 GB
@@ -203,6 +299,11 @@ comfy-stack/models/loras/stuffy_ai_style_ilxl_v2_goofy.safetensors   114 MB
 comfy-stack/models/ultralytics/bbox/face_yolov8m.pt                   52 MB
 comfy-stack/models/upscale_models/4x_NMKD-Siax_200k.pth               67 MB
 ```
+
+...plus the RMBG (BiRefNet ~1 GB), ControlNet union (2.5 GB), pose/hands
+weights, and the Anima stack (5.25 GB across three files) when their toggles
+are on. The Anima files have a HuggingFace fallback — see
+[R2 and HuggingFace are throttled per route](#r2-and-huggingface-are-throttled-per-route).
 
 If the script fails it exits with code != 0 and the worker is **not** marked
 ready, so provisioning errors show up as explicit errors in the logs instead
@@ -242,6 +343,43 @@ from there.
 > Changing the template triggers a worker replacement: the autoscaler spins
 > up a new one and provisions from scratch (a few minutes and a few cents).
 > That is normal; it settles on a cold worker on its own.
+
+### The provisioning runs its network phases in parallel
+
+The phases used to run strictly one after the other. They now overlap: the git
+clones, the single combined `pip install`, the R2 model download and the
+`URL_FILES` downloads all start before any of them is awaited, and the script
+only waits at the points where the next step actually needs the result.
+
+Shape of the current flow:
+
+```
+validate S3 -> fork clones (background)
+            -> install boto3 -> fork R2 downloader (background)
+            -> wait clones -> one combined pip -> fork URL_FILES (background)
+            -> wait R2 + URL_FILES -> benchmark -> PROVISIONING_OK
+```
+
+Two traps that were hit while doing it, both with `set -euo pipefail`:
+
+- **Ordering dependency.** The R2 downloader imports `boto3`, which the
+  combined pip installs — and that pip now runs *after* the fork. Result:
+  `ModuleNotFoundError: No module named 'boto3'`, provisioning aborted at
+  1m15s. `boto3` is now installed on its own before the fork (seconds, it is
+  in the pip cache after the first boot).
+- **A failed background job must still fail the script.** Without an explicit
+  `wait "$PID"` the failure is invisible to `set -e`; every forked job is
+  waited on individually and its non-zero exit is turned into `exit 1`, as it
+  was when serial.
+
+> Parallelizing does **not** make a slow link fast. It removes the *serial*
+> waits, so on a healthy host it recovers the minutes the phases used to spend
+> waiting for each other; on a host with bad peering the ceiling is still the
+> instance's own bandwidth. Real ceiling measured: ~2x, not 4x.
+>
+> **Do not parallelize two `pip install`s on the same venv.** They step on each
+> other in `site-packages`. One combined `pip install -r a -r b ... "${PIP_EXTRA[@]}"`
+> is used instead, which also lets pip resolve the overlapping wheels once.
 
 ---
 
@@ -431,8 +569,22 @@ vastai update endpoint $VAST_ENDPOINT_ID --max_workers 0 --cold_workers 0 --min_
 vastai update endpoint $VAST_ENDPOINT_ID --max_workers 1 --cold_workers 1 --min_load 0 --target_util 0.9
 ```
 
-Current config: `max_workers=1`, `cold_workers=0`, `min_load=0`. A single
-worker that stops itself when idle and is woken by the next request.
+Current config as intended: `max_workers=1`, `cold_workers=0`, `min_load=0`.
+A single worker that stops itself when idle and is woken by the next request.
+
+> ⚠️ **The live endpoint drifted from this.** Measured 2026-09-22: it was
+> carrying `cold_workers=1` with `max_workers=1`, the exact combination the
+> warning below describes. The symptom in the autoscaler log is workers being
+> destroyed and re-created (`Destroying worker ...` / `Creating 1 workers`)
+> rather than the tight 5-second loop of a warm worker, so it hides for a
+> while. Fix it with:
+>
+> ```powershell
+> vastai update endpoint $VAST_ENDPOINT_ID --cold_workers 0
+> ```
+>
+> This is a config that lives **only** in the endpoint, not in `.env` or the
+> template, so nothing in the repo would have caught the drift.
 
 > ⚠️ **Do not set `cold_workers=1` with `max_workers=1`.** As soon as there
 > is a warm worker, the autoscaler sees 0 cold workers, tries to create one,
@@ -847,6 +999,19 @@ the SDXL one: Anima is a 2B DiT with its own encoder and VAE, **5.25 GB**
 across three files (3.90 + 1.11 + 0.24). At 18 GB it did not fit in the 4.1 GB
 that were free. 26 leaves ~6 GB of headroom with both stacks installed.
 
+Confirmed on the live workers 2026-09-22: with the full feature set
+(`FEAT_ANIMA` included) the writable layer sits at **~21 GB of 26 (79%)** once
+every model is present, leaving ~5.6 GB free. A mid-provisioning sample showed
+20 GB used, which is the same picture.
+
+> ⚠️ **Watch the disk during a restart, not just after.** `restart_instance`
+> keeps `/workspace`, and the resumable fetcher keeps `.part` files, so a
+> failed attempt can momentarily hold *both* the partial and the final copy of
+> a large object. On 2026-09-22 a worker was seen at `models` 17 GB → 8.9 GB →
+> re-download while the model set wobbled; the final state was correct, but if
+> the disk had been 18 GB instead of 26 the second download would not have fit
+> and provisioning would have deadlocked.
+
 **How much disk you ask for does not affect availability.** Pool machines
 offer between 288 and 1,352 GB, so `disk_space>=16`, `>=24` or `>=60` return
 exactly the same 7 offers at the same prices. The only thing that changes is
@@ -888,7 +1053,7 @@ not lowered further on purpose:
 | 0.125 (the previous) | 7 | $2.25/month |
 
 With **a single viable offer the autoscaler relaxes the price ceiling and
-rents above `dph_total`** (see [The phantom `verified=true`](#the-phantom-verifiedtrue)),
+rents above `dph_total`** (see [`verified=true`: removed on purpose](#verifiedtrue-removed-on-purpose-and-why-that-is-a-trade)),
 which is exactly the surprise to avoid. `0.11` keeps the same 7 offers as the
 previous `0.125` and lowers the ceiling 27 cents: it costs nothing.
 
@@ -902,6 +1067,84 @@ $3.20/month at 16 GB (and $12/month at the 60 GB of before). The
 models), so at $1.30/TB that is **~3 cents per start**. Requiring <$1/TB cuts
 the range from 123 to 22 offers to save cents a month: not worth it. That is
 why the filter is at `inet_down_cost<=0.005` ($5/TB).
+
+> `inet_down_cost` is the **price** of the transfer, not its speed. Do not
+> confuse it with `inet_down` / `inet_up`, which are the **NIC link speed** the
+> host self-reports — see the next section.
+
+### `inet_down` / `inet_up` do not filter for a usable network
+
+They look like the answer and they are not. `inet_down` / `inet_up` are the
+host's **declared link speed**, and on this market the declaration has no
+relation to the bandwidth a worker actually gets. Measured 2026-09-22, per
+machine, next to what actually happened on it:
+
+| machine  | declared `inet_down` | what actually happened                     |
+| -------- | -------------------- | ------------------------------------------ |
+| 142161   | 558.7 Mbps           | forwarded ports filtered, no SSH, no serve |
+| 149297   | 578.4 Mbps           | forwarded ports filtered                   |
+| 148725   | 215.3 Mbps           | R2 throttled, provisioning aborted 3x      |
+| 52559    | 158.2 Mbps           | forwarded ports filtered                   |
+| 148710   | 184.6 Mbps           | GitHub 455 KB/s, HuggingFace 2.5 KB/s      |
+| **151197** | **549.6 Mbps**     | **Ookla measured 3.71 Mbit/s**             |
+
+The three highest declarations are among the worst machines. On `151197` the
+NIC reports a 10 Gbps link (`/sys/class/net/eth0/speed`) and it delivered
+3.71 Mbit/s — a factor of ~1500. The number is informative only in that it
+cannot be trusted.
+
+What actually works to screen a host is to **measure it**: `speedtest-cli`
+distinguishes a good host from a bad one in 15 seconds, and the real origins
+matter more than a generic speedtest, because the throttling is often
+per-route (see [R2 and HuggingFace are throttled per route](#r2-and-huggingface-are-throttled-per-route)).
+
+### R2 and HuggingFace are throttled per route
+
+Two separate, reproducible failure modes were measured on 2026-09-22, and they
+look alike from the outside (a model download that never finishes) but have
+different causes and different fixes.
+
+**1. The public `r2.dev` domain is throttled; the S3 endpoint is not.**
+Same worker (52056650, machine 148725), same object, same moment:
+
+| origin                                         | range 500-510 MB | range 0-10 MB |
+| ---------------------------------------------- | ---------------- | ------------- |
+| `pub-*.r2.dev` (Public Development URL)          | **28 KB/s**          | 150 KB/s      |
+| presigned `*.r2.cloudflarestorage.com`           | **9.6 MB/s**         | 12.4 MB/s     |
+
+The provisioning still needs the public `r2.dev` URL for `PROVISIONING_SCRIPT`
+(that is what the worker provisioner fetches), but the **model downloads use a
+presigned URL against the S3 endpoint**, never `r2.dev`.
+
+**2. An object can stall at a fixed offset, and the route that stalls is not
+always the same one.** The `anima-aesthetic-v1.0.safetensors` (3.9 GB) object
+stalled at ~512 MB on every attempt, on two machines, while the
+`waiIllustriousSDXL` (6.9 GB) downloaded fine on the same host. From a local
+machine the same object pulled at 18 MB/s, so the object in R2 is healthy —
+it is the worker→Cloudflare route that degrades. Measured at the resume
+offset, R2 gave **0.02 MB/s** where HuggingFace gave **1.53 MB/s**, and the
+same R2 URL at offset 0 gave 3.24 MB/s. **A probe at offset 0 picks exactly
+the route that stalls later.**
+
+The downloader now:
+
+- probes every candidate origin **at the current resume offset** and uses the
+  fastest (`probe_speed`, a 2 MB ranged GET);
+- has a **HuggingFace fallback** for the three Anima files
+  (`circlestone-labs/Anima`, identical sizes), so a dead R2 route does not
+  abort provisioning;
+- runs `curl -C -` so a dropped connection **resumes** instead of restarting
+  from byte 0 (this is the whole reason `boto3`'s `download_file` could never
+  finish: it restarts on retry, so it died at ~512 MB three times in a row);
+- reclaims the random-suffixed `.part.*` leftovers the old `boto3` fetcher
+  left behind, so an interrupted download is not thrown away;
+- aborts a stalled connection after 25 s under 30 KB/s
+  (`--speed-limit/--speed-time`) instead of hanging until the whole fetch
+  times out.
+
+> **`boto3`'s `download_file` does not resume.** `TransferConfig` re-downloads
+> from byte 0 on retry and raises `RetriesExceededError` if the link keeps
+> dropping. For a multi-GB object on a bad route that never converges.
 
 ### Hourly price
 
@@ -924,7 +1167,7 @@ grab them.
 > that is idle most of the time, prioritize disk. If you are going to put
 > many hours on it, lower `dph_total` and accept paying more for disk.
 
-### `verified=true`: removing it cost dearly
+### `verified=true`: removed on purpose (and why that is a trade)
 
 For a while this repo **removed** `verified=true` from the filter, because
 with the budget of then it left a single offer:
@@ -940,25 +1183,53 @@ how a worker came in at $0.201/h with the ceiling at $0.15 — but the
 conclusion treated the symptom. The damage was done by **running out of
 offers**, not by verification.
 
-**And removing `verified` had a much worse hidden cost: unusable workers.**
-Measured on 2026-08-16 with two consecutive unverified machines (139268 and
-147722): both advertised direct ports (`direct_port_count` 100 and 200) that
-were actually **filtered**. The worker provisions fine, the pyworker starts,
-the autoscaler marks it `idle` and routes to `https://<ip>:<port>`... but
-that port *times out* from any external network, so **the pyworker receives
-zero requests** (`num_requests_recieved: 0`) and every call dies by timeout.
+**Removing `verified` has the hidden cost of unusable workers.** Measured on
+2026-08-16 with two consecutive unverified machines (139268 and 147722): both
+advertised direct ports (`direct_port_count` 100 and 200) that were actually
+**filtered**. The worker provisions fine, the pyworker starts, the autoscaler
+marks it `idle` and routes to `https://<ip>:<port>`... but that port *times
+out* from any external network, so **the pyworker receives zero requests**
+(`num_requests_recieved: 0`) and every call dies by timeout.
 
-The good lever is `storage_cost`, which costs cents:
+**As of 2026-09-22 the `verified` filter is out of the workergroup.** With the
+current `.env` parameters (which include seven `machine_id notin` vetoes):
+
+| Filter | Offers | Notes |
+|---|---|---|
+| **no `verified`** (current) | **7** | cheapest $0.134/h (RTX 5080, reliab 0.995) |
+| `verified=true` | **2** | 97663 and 36242, both RTX 5070 Ti, reliab >0.99 |
+
+Two offers is exactly the region where the autoscaler relaxes the ceiling, so
+`verified=true` is not the safe lever here. The filter was **removed**, and the
+protection moved to the runtime: the per-route probe and the HuggingFace
+fallback (above) plus the `machine_id notin` list of machines that were
+measured bad. The list currently holds **148233, 139268, 147722, 142161,
+149297, 148725, 52559**.
+
+The good lever is still `storage_cost`, which costs cents:
 
 | Configuration | Offers | Cheapest GPU | Disk ceiling at 18 GB |
 |---|---|---|---|
 | without `verified`, `storage<=0.11` | 7 | $0.107/h | $1.98/month |
-| **`verified`, `storage<=0.20`** <- current | **11** | **$0.108/h** | $3.60/month |
+| `verified`, `storage<=0.20` | **11** | $0.108/h | $3.60/month |
 | `verified`, `storage<=0.11` | **1** ⚠️ | $0.134/h | $1.98/month |
 
 Loosening the disk recovers the range **and** the GPU price stays the same
 ($0.108 vs $0.107). You pay at most $1.62/month more of disk in exchange for
 the machines actually working.
+
+> **Pushing a filter change to the workergroup is not just `--from-env`.**
+> `cv endpoint update --workergroup --from-env` rewrites the filters it knows
+> about but **leaves a previous `verified` in place** — the API merges rather
+> than replaces. Removing it needs the raw call:
+>
+> ```powershell
+> vastai update workergroup $VAST_WORKERGROUP_ID --endpoint_id $VAST_ENDPOINT_ID `
+>   --search_params "<the full query, without verified>" -n
+> ```
+>
+> Confirm with `vastai show workergroups --raw` that `search_query.verified`
+> is **absent**, not `false`.
 
 #### How to diagnose this quickly
 
@@ -1064,7 +1335,34 @@ the instance's bandwidth, not the origin. The workergroup filter does not fix
 it either: `search_query` filters by `inet_down_cost<=0.005` (network price,
 not speed) and the pool's 10 offers already advertise `inet_down` between 190
 and 1368 Mbit/s. The bad host advertised **1376 Mbit/s** and delivered 3. The
-data is self-reported and no filter saves you.
+data is self-reported and no filter saves you (see
+[`inet_down` / `inet_up` do not filter for a usable network](#inet_down--inet_up-do-not-filter-for-a-usable-network)).
+
+**Screen the host in 15 seconds instead of 30 minutes.** Before waiting on a
+provisioning, from the worker:
+
+```bash
+/venv/main/bin/pip install -q speedtest-cli
+/venv/main/bin/speedtest-cli --simple       # general bandwidth, ~15 s
+```
+
+A host that measures a few Mbit/s down will not finish a ~22 GB cold start
+inside the autoscaler's window. To see *which phase* will be slow, probe the
+real origins (each is a 2 MB ranged GET) — a generic speedtest does **not**
+touch these routes and cannot see per-route throttling:
+
+```bash
+U="<presigned R2 url>"
+curl -4 -s -o /dev/null -w 'R2      %{speed_download} B/s\n' --max-time 15 -r 500000000-502000000 "$U"
+curl -4 -sL -o /dev/null -w 'GitHub  %{speed_download} B/s\n' --max-time 15 -r 0-2000000 https://github.com/facebookresearch/sam2
+curl -4 -sL -o /dev/null -w 'HF      %{speed_download} B/s\n' --max-time 15 -r 0-2000000 \
+  https://huggingface.co/circlestone-labs/Anima/resolve/main/split_files/vae/qwen_image_vae.safetensors
+```
+
+Measured on a good host (2026-09-22, machine 148710's successor): R2 11 MB/s.
+On a bad one (machine 151197): Ookla 3.71 Mbit/s, GitHub 455 KB/s, HuggingFace
+2.5 KB/s — all slow at once, which is the signature of an upstream problem
+rather than per-route throttling.
 
 ### `HF_TOKEN must be set when BACKEND is set!`
 
@@ -1095,6 +1393,106 @@ well, not an alternative to fixing it.
 Caveats: a stopped instance **does not reserve the GPU**. The host can rent
 that hardware to someone else and then it will not start when you want to
 power it on. It is cheap precisely because it guarantees nothing.
+
+### The dashboard says the worker is active but nothing is being served
+
+The Vast dashboard (and `actual_status: running`, and
+`status_msg: success, running ...`) describe the **container**, not whether the
+worker can receive a request. A host can report the worker as active while its
+forwarded ports are firewalled, in which case the autoscaler has nowhere to
+deliver work and every request times out in the queue.
+
+The `webapp` already detects this before submitting and says so:
+*"Worker unreachable at `<ip>:<port>` - the machine answers ping but its
+forwarded ports do not. Requests cannot be delivered; replace it"*
+(`scripts/vast_state.py`, the `reachable` check — it probes the worker's
+address rather than trusting the status fields). The fix is to destroy the
+worker so the autoscaler rents another machine:
+
+```powershell
+python scripts/mizuki.py unstick --dry-run
+python scripts/mizuki.py unstick
+```
+
+Order of checks when it looks alive but serves nothing:
+
+```powershell
+# from outside: does the serving port answer at all?
+python -c "import socket;socket.create_connection(('<ip>',<port3000>),10)"
+# from inside the worker (over a tunnel/SSH): is the pyworker up?
+curl -k -s -o /dev/null -w '%{http_code}\n' https://127.0.0.1:3000/health   # 404 == alive
+```
+
+`/health` returning **404** is the healthy answer: that route does not exist,
+but responding proves the process is up. With `http://` instead of `https://`
+it gives *Empty reply from server* and looks dead when it is not.
+
+### SSH to the worker: port 22 times out or the `sshN.vast.ai` proxy rejects the key
+
+Two independent things, and they can happen together. Diagnose which one you
+have by testing both routes (from `vastai show instances --raw`: the direct
+port is in `ports['22/tcp']`, the proxy in `ssh_host`/`ssh_port`):
+
+| Direct `public_ipaddr:<mapped port>` | Proxy `sshN.vast.ai:<ssh_port>` | Meaning |
+|---|---|---|
+| TCP timeout | TCP ok, `Permission denied (publickey)` | host filters the direct port; the proxy works but does not accept the key |
+| TCP timeout | TCP timeout | host filters everything |
+| TCP ok | — | use the direct route |
+
+```bash
+ssh -i ~/.ssh/xcl -o IdentitiesOnly=yes -p <direct> root@<ip>
+ssh -i ~/.ssh/xcl -o IdentitiesOnly=yes -p <proxy>  root@<sshN.vast.ai>
+```
+
+Facts measured on 2026-09-22, so they are not re-litigated:
+
+- **Which key works is per-boot.** On one machine `~/.ssh/xcl` authenticated
+  through the proxy; after a container restart the same key was rejected and
+  a different proxy port was handed out. When the proxy rejects everything,
+  use the tunnel route below.
+- **`vastai attach ssh <id> <key>` returns `success` but does not propagate**
+  to an already-running container, and `vastai execute` only works on
+  **stopped** instances. Neither is a way in.
+- **The CLI cannot hand you a credential.** `show ssh-keys` returns only the
+  public halves (`private_key: null`), `ssh-url` gives the URL and nothing
+  else, and `create ssh-key` *generates* a new local pair rather than
+  recovering one.
+- **The way in when both routes fail** is the outbound tunnel the `onstart`
+  starts (`ssh://localhost:22`, URL posted to Discord):
+
+  ```bash
+  ssh -i ~/.ssh/xcl -o IdentitiesOnly=yes \
+    -o ProxyCommand="cloudflared access ssh --hostname <url>.trycloudflare.com" \
+    root@placeholder
+  ```
+
+  The hostname is a placeholder; the `ProxyCommand` decides the destination.
+  Use a fresh `-o UserKnownHostsFile=NUL` (or the equivalent on your OS) the
+  first time, or SSH warns that the host key for `placeholder` changed.
+
+### `provisioning ABORTED ... model download failed`
+
+The R2 downloader failed and the worker was not marked ready. The bare log
+line hides the cause; read the traceback above it
+(`/var/log/portal/provisioning.log`):
+
+```bash
+grep -nE 'Traceback|Error|WRONG|MISSING|FAILURES' /var/log/portal/provisioning.log | tail -20
+sed -n '<line-40>,<line>p' /var/log/portal/provisioning.log
+```
+
+Three causes seen in practice, all fixed in the script but worth recognising:
+
+- **`ModuleNotFoundError: No module named 'boto3'`** — the downloader was
+  forked before the pip that installs `boto3`. Fixed by installing `boto3`
+  before the fork; if it reappears, the ordering regressed.
+- **`RetriesExceededError` from `s3transfer`** — the old `boto3`
+  `download_file`, which restarts from byte 0 on every retry, against a link
+  that keeps dropping. Fixed by the resumable `curl -C -` fetcher.
+- **`WRONG SIZE`** — `curl` finished but the file does not match the object's
+  `Content-Length`. Either the route died mid-transfer or R2 served a partial
+  object; the `.part` is kept, so the next attempt resumes instead of
+  restarting.
 
 ### Discord notifications
 
@@ -1139,9 +1537,10 @@ Clip skip. Node `60` (`CLIPSetLastLayer`) must be at `-2`. With `-1`,
 ### A model or custom node is missing
 
 The request fails in ComfyUI with the name of the node or file. Add it to
-`serverless_provision.sh` (the `WANTED` list for models, `install_node` for
-nodes), upload it to R2 and run
-`vastai update workers $VAST_WORKERGROUP_ID`.
+`serverless_provision.sh` (the `MODELS` / `EXTRA_FILES` arrays for R2-backed
+files, `URL_FILES` for direct HuggingFace URLs, `NODES` for custom nodes; the
+inputs are collected by `COMFY_MODEL_LIST` into the python downloader),
+upload it to R2 and run `vastai update workers $VAST_WORKERGROUP_ID`.
 
 ---
 
@@ -1152,21 +1551,33 @@ nodes), upload it to R2 and run
       permanent. `renew_provisioning.py` remains the publish command (upload
       to R2, verify content and re-point template + workergroup), but there
       is nothing left to renew on a calendar.
-- [ ] **Parallelize the provisioning.** Today the 5 phases run in series.
-      Phase 3 (custom nodes: PyPI + GitHub) and phase 4 (R2 models) do not
-      depend on each other and use different resources; overlapping them
-      takes the shorter one off the critical path. The `URL_FILES` loop
-      (loose HuggingFace weights) is one `curl` after another and
-      parallelizes in four lines. Real ceiling measured: **~2x**, not 4x —
-      the bottleneck is the instance's bandwidth, not the number of streams.
-      **Do not parallelize two `pip install`s on the same venv**: they step
-      on each other in `site-packages` and give intermittently corrupted
-      environments. And the `trap on_err` with background processes needs
-      explicit `wait`, or failures stop reporting.
+- [x] ~~**Parallelize the provisioning.**~~ Done 2026-09-22: the git clones,
+      the combined pip install, the R2 downloader and the `URL_FILES`
+      downloads now overlap (see *The provisioning runs its network phases in
+      parallel*). Real ceiling confirmed at ~2x, not 4x — the bottleneck is
+      the instance's bandwidth, not the number of streams. Two pip installs
+      are still never run concurrently on the same venv. Background failures
+      are turned into `exit 1` by an explicit `wait` per job.
+- [ ] **Fail fast on a bad host.** A speedtest at the start of the
+      provisioning is the missing piece: today a host with a saturated
+      upstream burns 30 min and aborts, when `/venv/main/bin/speedtest-cli
+      --simple` answers in 15 s. Not added yet because it writes to the
+      worker's venv from the provisioning; decide where it lives (a fixed
+      threshold that does `exit 1`, so the autoscaler destroys the machine in
+      a minute instead of thirty).
 - [ ] **`--bbox` not implemented.** The node is already identified
       (`AILab_CropObject`, see *Character resolution*); what is missing is
       wiring it between BiRefNet and the scaling into the box.
 - [ ] **`HF_TOKEN=hf_placeholder_not_used`** in the template. Replace with a
-      real one if downloads from HuggingFace are ever added.
+      real one if downloads from HuggingFace are ever added. The Anima
+      fallback already points at HuggingFace and works without a token for
+      these public repos.
 - [ ] The URLs of generated images expire after 7 days. If they must be kept,
       download them or move them inside R2.
+- [ ] **The worker named tunnel is only half-verified.** The tunnel itself is
+      confirmed end to end (`$CF_WORKER_HOSTNAME/generate/sync` reaches the
+      pyworker), but a full **job** has not yet been submitted through the
+      overridden URL on a host whose ports are filtered — the machines stood
+      up on 2026-09-22 either provisioned before the override existed or had
+      healthy ports. First cold start on a filtered host with
+      `CF_WORKER_HOSTNAME` set is the acceptance test.

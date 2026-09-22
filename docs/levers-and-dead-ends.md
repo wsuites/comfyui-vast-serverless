@@ -233,7 +233,74 @@ the face came out correct in the collage, was smudged by the fusion at denoise
 invisible unless you zoom into the face of the final upscale. Identity now
 travels in `--detail-prompt`, which reaches both passes.
 
+**The same bug was still live in `workflows/wf.json`.** Fixing the collage
+pipeline did not fix the endpoint one, which numbers its nodes differently:
+node `42` feeds `53` feeds the FaceDetailer at `17`, and it read
+`masterpiece, ultra-detailed face, perfect eyes, smooth skin, red eyes,
+blushing`. Found on 2026-09-21 by putting the bare Anima render next to the
+same seed with the face pass on: amber eyes in one, red in the other, plus a
+changed hair clip and earring. Nothing errors and nothing logs it — the face is
+simply repainted to a different character's spec.
+
+Rule: a prompt that resamples a masked region beats the prompt that generated
+it. Any node feeding a detailer is identity, not quality, no matter how much
+`masterpiece, ultra-detailed` padding surrounds it. `call_endpoint.py` now
+takes `--detail-prompt` / `--detail-negative` and the web page exposes both,
+showing the shipped default so the baked-in attributes are visible.
+
+**The face pass had no upper bound on how many faces it would repaint.**
+On 2026-09-22 two requests sat at the endpoint with no images coming back. The
+worker log said it: `0: 640x640 300 faces, 8.3ms`. 300 is not a coincidence, it
+is ultralytics' `max_det` default, and on a noisy Anima frame the YOLO provider
+hit it. Every box it hands over is an independent sampling pass inside one 900 s
+request, and ComfyUI runs one prompt at a time, so the second request queued
+behind the first at the pyworker layer while ComfyUI itself reported
+`running 1 pending 0`. Both finished eventually - 815 s for one image.
+
+Neither `FaceDetailer` nor `UltralyticsDetectorProvider` exposes a count:
+the detailer's only related inputs are `bbox_threshold` and `drop_size`, both
+of which move *which* boxes survive, not how many. The lever is a detailer
+hook. `SEGSOrderedFilterDetailerHookProvider` sorts the SEGS by
+`area(=w*h)` and takes a slice, and FaceDetailer runs the hook's
+`post_detection` after detection and before the sampling loop, so the discarded
+boxes cost nothing. It goes on FaceDetailer's optional `detailer_hook` input -
+one node added, nothing rewired.
+
+`call_endpoint.py` now inserts it as node `903` with `take_count` 6 by default
+(`--face-cap N`, `0` to lift it), largest first: the face that carries the frame
+is the big one, and the 290 twelve-pixel hits are exactly what burns the budget.
+The default applies to every caller, including the web and `mizuki.py`, which
+build their args namespace by hand.
+
+Rule: any per-detection loop needs a cap before it needs tuning. A detector
+that returns its own maximum is a timeout, not a bad render.
+
 ---
+
+**The wedged request slot, and the reboot that looks like it failed.**
+On 2026-09-22 worker 52041444 sat at `status: idle`, `reqs_working 1`,
+`cur_load 100`, GPU 0 % at 36 C for over an hour. `reqs_working` is the
+autoscaler's counter, not a reading of the card: a request that dies between
+the autoscaler and ComfyUI leaves the count incremented with nothing behind
+it. The endpoint then routes no new work to that worker and everything queues
+until the client's own timeout - that is what killed two jobs with
+`Timed out after 918.9s waiting for worker`.
+
+`vastai reboot instance` clears it. What misleads is the clock: the worker was
+back at 05:25 with a fresh `started_at` and still read `reqs_working 1` at
+05:28; it only dropped to 0 / Ready around 05:33. I called the reboot a
+failure at the three-minute mark and was wrong. The signal is the count, not
+the worker coming back up.
+
+Detection lives in `scripts/vast_state.py` (`STALL_AFTER = 150 s`): counted
+work + idle status + GPU at 0, held long enough to outlast Vast's polling
+cadence. The header shows `slot wedged <mm:ss>` and a `reboot` button;
+`POST /api/worker/reboot` refuses with 409 while a render is genuinely in
+flight, because the stall flag - not the raw count - is what says the card is
+free to interrupt.
+
+Rule: the fix for a wedged slot is a restart, and the restart is not finished
+when the process is back. Watch the counter.
 
 ## The hands pass: closed, with the measurement
 
