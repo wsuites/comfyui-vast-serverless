@@ -28,3 +28,6 @@ node_modules/
 dist/
 .turbo/
 *.tsbuildinfo
+
+# Measurement output from scripts/deploy_loop.py
+logs/

@@ -739,16 +739,25 @@ alive() { [ "$(curl -s -m 8 -o /dev/null -w '%{http_code}' http://127.0.0.1:1818
 bye() { send ":octagonal_sign: **worker SHUTTING DOWN** \`$WHO\` (signal received after $(el) of life)"; exit 0; }
 trap bye TERM HUP INT
 
-# 1) wait for ComfyUI to open (up to 60 min)
+# 1) wait for ComfyUI to open. 40 probes x 15 s = 10 min, which is the whole
+# cold-start budget; the previous 60 min was dead patience, because the
+# autoscaler gives up on a worker and recycles it long before then, so the
+# failure message arrived after the evidence had been destroyed. A heads-up
+# with the log tail goes out at the halfway mark, while the boot can still be
+# watched live.
 up=0
-for _ in $(seq 1 240); do
+for i in $(seq 1 40); do
     if alive; then up=1; break; fi
+    if [ "$i" = 20 ]; then
+        send ":hourglass: **ComfyUI still not up** \`$WHO\` after $(el) - last log lines:"
+        tail -n 25 /var/log/portal/comfyui.log 2>/dev/null | { c=$(cat); send "\`\`\`${c: -1400}\`\`\`"; }
+    fi
     sleep 15
 done
 if [ "$up" = 1 ]; then
     send ":white_check_mark: **ComfyUI UP** \`$WHO\` in $(el) since provisioning ended"
 else
-    send ":warning: **ComfyUI did not open 18188** \`$WHO\` after $(el)"
+    send ":warning: **ComfyUI did not open 18188** \`$WHO\` after $(el) - giving up"
     tail -n 25 /var/log/portal/comfyui.log 2>/dev/null | { c=$(cat); send "\`\`\`${c: -1400}\`\`\`"; }
     exit 0
 fi
