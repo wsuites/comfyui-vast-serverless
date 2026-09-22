@@ -300,6 +300,41 @@ NODES_DIR="$COMFY_DIR/custom_nodes"
 mkdir -p "$MODELS_DIR"/{checkpoints,loras,upscale_models} "$MODELS_DIR/ultralytics/bbox" "$NODES_DIR"
 hito "[1/5] COMFY_DIR=$COMFY_DIR"
 
+# --- the card has to be ours -------------------------------------------------
+# Vast rents a GPU, not a machine, and nothing stops a host from packing other
+# tenants onto the same card. Measured 2026-09-22 on machine 146299: seven
+# compute processes, 23568 of 24564 MiB taken, 494 MiB free. Everything still
+# looked healthy from outside - the 512x512 benchmark fits in the scraps and
+# reports a normal score, so PROVISIONING_OK was emitted and the first real
+# 1024 render fell back to tiled VAE and then timed out.
+#
+# The fraction, not an absolute floor: this endpoint rents 16 GB cards as well
+# as 24 GB ones, and a clean 16 GB card has less free than a crowded 24 GB one.
+MIN_FREE_VRAM_FRACTION="${MIN_FREE_VRAM_FRACTION:-0.85}"
+if command -v nvidia-smi >/dev/null 2>&1; then
+    vram_line=$(nvidia-smi --query-gpu=memory.total,memory.free \
+                           --format=csv,noheader,nounits 2>/dev/null | head -1)
+    vram_total=$(echo "$vram_line" | cut -d, -f1 | tr -d ' ')
+    vram_free=$(echo "$vram_line" | cut -d, -f2 | tr -d ' ')
+    if [ -n "$vram_total" ] && [ "$vram_total" -gt 0 ] 2>/dev/null; then
+        # integer math: free * 100 / total, compared against the fraction * 100
+        pct_free=$(( vram_free * 100 / vram_total ))
+        min_pct=$(awk -v f="$MIN_FREE_VRAM_FRACTION" 'BEGIN{printf "%d", f*100}')
+        if [ "$pct_free" -lt "$min_pct" ]; then
+            log "[ERROR] GPU already in use by another tenant:"
+            log "[ERROR]   ${vram_free} of ${vram_total} MiB free (${pct_free}%,"
+            log "[ERROR]   need ${min_pct}%). Processes on the card:"
+            nvidia-smi --query-compute-apps=pid,used_memory \
+                       --format=csv 2>&1 | sed 's/^/[ERROR]   /' | tee -a "$MODEL_LOG"
+            log "[ERROR] Refusing to provision: models would download onto a card"
+            log "[ERROR] that cannot render. Replace this machine."
+            dc ":no_entry: **GPU OVERSUBSCRIBED** \`$WHO\` - ${vram_free}/${vram_total} MiB free. Replacing."
+            exit 1
+        fi
+        hito "[1/5] GPU clear: ${vram_free}/${vram_total} MiB free (${pct_free}%)"
+    fi
+fi
+
 # now that PIP_CACHE_DIR and MODELS_DIR are both set, the watcher measures the
 # right directories (see the note where WATCH_PID is declared)
 watch_progress & WATCH_PID=$!
