@@ -196,8 +196,16 @@ def render(deadline: float) -> dict:
                     "images": len(snap.get("images") or []),
                     "error": snap.get("error")}
         time.sleep(3)
+    # Give up on it properly. Leaving the job running would have the next
+    # cycle measure a worker that is still busy with this one, and the whole
+    # point of the run is that each number stands on its own.
+    try:
+        api(f"/api/jobs/{jid}/cancel", {})
+        log("    job cancelled after exceeding the render budget")
+    except (urllib.error.URLError, OSError, ValueError) as exc:
+        log(f"    could not cancel {jid}: {exc}")
     return {"id": jid, "state": "timeout", "images": 0,
-            "error": "job never finished"}
+            "error": f"job never finished within {RENDER_BUDGET:.0f}s"}
 
 
 # ---------------------------------------------------------------------- cycle
