@@ -453,8 +453,12 @@ def rent(tmpl: dict, skip: Iterable[Any] = ()) -> dict | None:
     env = rent_env(tmpl)
     for offer in pool[:6]:
         mid, oid = offer.get("machine_id"), offer.get("id")
+        # Says which number decided this, so a bad pick is attributable:
+        # either we had timed the card or we are spending a cycle to time it.
+        rank = ("untimed" if offer.get("_new")
+                else f"{offer.get('_cost', 0):.0f}s measured")
         log(f"  renting offer {oid} machine {mid}: {offer.get('gpu_name')} "
-            f"dlperf {offer['_dlperf']:.0f} at {offer['_dph']:.4f}/h")
+            f"({rank}) at {offer['_dph']:.4f}/h")
         data = cli_json(
             "create", "instance", str(oid),
             "--template_hash", str(tmpl.get("hash_id")),
@@ -472,7 +476,10 @@ def rent(tmpl: dict, skip: Iterable[Any] = ()) -> dict | None:
             continue
         return {"instance": str(iid), "machine": str(mid),
                 "dph": offer["_dph"], "gpu": offer.get("gpu_name"),
-                "dlperf": offer["_dlperf"], "rented_at": time.time()}
+                # What we expected this card to cost, so the row that records
+                # what it actually cost can be compared against the pick.
+                "expected": offer.get("_cost"), "untimed": bool(offer.get("_new")),
+                "rented_at": time.time()}
     log("  every offer refused the booking")
     return None
 
@@ -805,7 +812,8 @@ def cmd_status() -> int:
     pool = offers()
     print(f"{len(pool)} offers under {DPH_CEILING:.3f}/h")
     for o in pool[:5]:
-        print(f"  {str(o.get('gpu_name')):<16} dlperf {o['_dlperf']:>5.0f} "
+        rank = "untimed" if o.get("_new") else f"{o.get('_cost', 0):.0f}s"
+        print(f"  {str(o.get('gpu_name')):<16} {rank:>8} "
               f"{o['_dph']:.4f}/h  machine {o.get('machine_id')}")
     return 0
 
