@@ -356,8 +356,23 @@ def http(url: str, payload: Any = None, timeout: float = PROBE_TIMEOUT,
         url, data=data,
         headers={"Content-Type": "application/json"} if data else {},
     )
-    with urllib.request.urlopen(req, timeout=timeout) as resp:
-        body = resp.read()
+    try:
+        with urllib.request.urlopen(req, timeout=timeout) as resp:
+            body = resp.read()
+    except urllib.error.HTTPError as exc:
+        # ComfyUI puts the whole reason a prompt was rejected in the error
+        # body - `node_errors` names the node and the field it did not like.
+        # urllib discards it, which is how a validation failure reaches the
+        # page as a bare "HTTP Error 400: Bad Request" and looks like a
+        # transport problem. Fold the body into the message; the exception
+        # stays an HTTPError, so callers probing with URLError still catch it.
+        try:
+            detail = exc.read().decode("utf-8", "replace").strip()
+        except Exception:  # noqa: BLE001 - a body we cannot read is not the error
+            detail = ""
+        if detail:
+            exc.msg = f"{exc.msg}: {detail[:800]}"
+        raise
     if raw:
         return body
     return json.loads(body) if body else None
@@ -646,6 +661,47 @@ def down(why: str = "requested") -> int:
 
 
 # --- dispatch ----------------------------------------------------------------
+
+def missing_inputs(url: str, workflow: dict, timeout: float = 20.0) -> list[str]:
+    """The loader values in ``workflow`` that this worker cannot satisfy.
+
+    ComfyUI validates every combo input against what it can actually see on
+    disk, and rejects the whole prompt with a 400 when one does not match. That
+    is the correct answer, but it arrives after the worker is rented and reads
+    like a broken endpoint. Asking ``/object_info`` the same question first
+    turns "HTTP Error 400: Bad Request" into the name of the missing file - and
+    lets a caller wait for a model that is still downloading behind the ready
+    signal instead of failing against it.
+
+    Values arriving as a list are links to another node, not choices, and are
+    skipped. An ``/object_info`` we cannot read is not evidence of anything, so
+    it reports nothing missing and leaves the verdict to the server.
+    """
+    specs: dict[str, dict] = {}
+    missing: list[str] = []
+    for node in workflow.values():
+        if not isinstance(node, dict):
+            continue
+        cls = node.get("class_type")
+        if not cls:
+            continue
+        if cls not in specs:
+            try:
+                info = http(f"{url}/object_info/{cls}", timeout=timeout)
+                specs[cls] = (info or {}).get(cls, {}).get(
+                    "input", {}).get("required", {}) or {}
+            except Exception:                              # noqa: BLE001
+                specs[cls] = {}
+        for field, value in (node.get("inputs") or {}).items():
+            if isinstance(value, (list, dict)):
+                continue
+            spec = specs[cls].get(field)
+            # A combo input is declared as [[option, ...], {...}].
+            if isinstance(spec, list) and spec and isinstance(spec[0], list):
+                if value not in spec[0]:
+                    missing.append(f"{cls}.{field}={value}")
+    return missing
+
 
 def submit(url: str, workflow: dict, client_id: str = "fleet") -> str:
     """Queue a prompt. Returns ComfyUI's own prompt id.

@@ -57,6 +57,11 @@ from vast_state import reboot as _vast_reboot
 OUT_DIR = ROOT / "output" / "web"
 HISTORY = OUT_DIR / "index.jsonl"
 POLL_SECONDS = 5
+# How long a request waits for a model that is still downloading behind the
+# ready signal. The deferred set is ~5.6 GB and lands in about a minute on a
+# healthy origin; past this the file is not coming and the caller deserves the
+# name of it rather than another minute of billing.
+MODEL_WAIT = 300.0
 
 
 async def _vast_state() -> dict:
@@ -286,16 +291,46 @@ async def _run_job(job: Job) -> None:
             raise RuntimeError(f"Worker {inst.get('instance')} is up but its "
                                "ComfyUI port is not published")
 
+        # A worker can come ready with the deferred half of its models still
+        # landing: provisioning signals ready on the blocking set and keeps
+        # downloading the rest behind it. Submitting into that window is what
+        # produced a rented RTX 3090 answering "HTTP Error 400: Bad Request" to
+        # every anima request on 2026-09-23 - ComfyUI was right, the VAE really
+        # was not there. Wait for the files this workflow names, on the phase
+        # the page is already showing, and name them if they never arrive.
+        deadline = time.time() + MODEL_WAIT
+        while True:
+            missing = await asyncio.to_thread(fleet.missing_inputs, url, workflow)
+            if not missing:
+                break
+            if time.time() >= deadline:
+                raise RuntimeError(
+                    f"Worker {inst.get('instance')} is missing "
+                    + ", ".join(missing)
+                    + f" after {MODEL_WAIT:.0f}s")
+            job.emit("renting", "Worker up - still downloading "
+                                + ", ".join(m.split("=")[-1] for m in missing))
+            await asyncio.sleep(5)
+
         # "generating", not "submitting": the stepper only moves forward, so
         # emitting an earlier phase here is silently dropped and the page sits
         # on "renting GPU" for the whole render.
         job.emit("generating", f"Rendering on {inst.get('gpu')} "
                                f"(instance {inst.get('instance')})")
         started = time.time()
+        # ``fleet.tick()``'s idle release reads ``last_job`` from the state
+        # file, and a page render is the only kind of use that never went
+        # through ``fleet.render()``. Without these two calls the daemon
+        # measures idle from ``ready_at`` and destroys a worker that is
+        # serving the page - mid-render, ten minutes after it came ready.
+        # Once on either side of the wait: the first claims the worker before
+        # a long batch starts, the second resets the clock once it is served.
+        await asyncio.to_thread(fleet.touch)
         prompt_id = await asyncio.to_thread(fleet.submit, url, workflow, "web")
         raw = await asyncio.to_thread(
             fleet.wait_job, url, prompt_id, float(job.params["timeout"]),
         )
+        await asyncio.to_thread(fleet.touch)
         job.latency = time.time() - started
 
         blobs = await asyncio.to_thread(fleet.images, url, raw)
