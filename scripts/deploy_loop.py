@@ -37,12 +37,17 @@ instead of against memory.
 from __future__ import annotations
 
 import argparse
+import atexit
 import json
+import os
+import random
+import subprocess
 import sys
 import time
 import urllib.error
 import urllib.request
 from pathlib import Path
+from typing import Any
 
 ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(ROOT / "scripts"))
@@ -71,6 +76,14 @@ LATENCY_TARGET = 13.0
 # The autoscaler polls on its own schedule; a reset is not visible to it
 # instantly and a fresh instance does not appear the second it is asked for.
 POLL = 15.0
+# The hourly price the operator set. The workergroup carries the same number in
+# ``dph_total<=``, and twice on 2026-09-23 the autoscaler rented straight past
+# it anyway - machine 45524 at 0.354 and again at 0.701 while the filter was in
+# place and that machine was not in the offer list the same filter returned. The
+# server-side ceiling is therefore a preference, not a guarantee, and the only
+# enforcement that holds is this one: price the instance the moment it appears
+# and take it down if it is over.
+DPH_CEILING = 0.220
 
 API = "http://127.0.0.1:8800"
 
@@ -87,7 +100,18 @@ RESET_HELP = {
 
 PROMPT = ("1girl, solo, standing, simple background, looking at viewer, "
           "detailed face")
-SEED = 20260922
+
+
+def seed() -> int:
+    """A fresh seed per job.
+
+    This was a constant, and that quietly broke the measurement it fed.
+    ComfyUI caches on node inputs, so the second job of a cycle - same prompt,
+    same seed - was answered out of cache without the sampler running at all.
+    Warm renders came back in under five seconds against a thirteen second
+    target and looked like a pass. Only a changing seed measures the GPU.
+    """
+    return random.randrange(1, 2**31)
 
 
 def log(msg: str) -> None:
@@ -106,11 +130,18 @@ def api(path: str, payload: dict | None = None, timeout: float = 30.0) -> dict:
 
 
 def api_up() -> bool:
-    try:
-        api("/api/status", timeout=5)
-        return True
-    except (urllib.error.URLError, OSError, ValueError):
-        return False
+    # ``/api/status`` asks Vast for the live picture, so it answers in a
+    # second or two normally and much slower right after a destroy, when the
+    # upstream is busy. A single short probe turned that into "start the
+    # console first" and killed run13 before cycle 1.
+    for attempt in range(3):
+        try:
+            api("/api/status", timeout=20)
+            return True
+        except (urllib.error.URLError, OSError, ValueError):
+            if attempt < 2:
+                time.sleep(3)
+    return False
 
 
 # --------------------------------------------------------------------- reset
@@ -161,6 +192,87 @@ def announce_reset(kind: str, auto: bool) -> dict:
     return {"kind": kind, "instance": iid, "started": started, "note": f"{verb} sent"}
 
 
+def enforce_price(inst: dict) -> bool:
+    """Destroy and veto an instance the autoscaler rented above the ceiling.
+
+    Returns True when the instance was taken down. The price is read off the
+    live record rather than the offer that was searched, because the two do not
+    always agree: the autoscaler rents from a list of its own and has twice been
+    seen picking a machine the same filters exclude. Vetoing the machine as well
+    as destroying the instance is what stops it coming straight back - a destroy
+    on its own just buys the identical machine again a few seconds later.
+    """
+    dph = inst.get("dph_total")
+    try:
+        dph = float(dph)
+    except (TypeError, ValueError):
+        return False
+    if dph <= DPH_CEILING + 1e-9:
+        return False
+    iid, mid = str(inst.get("id") or ""), inst.get("machine_id")
+    log(f"    OVER CEILING: instance {iid} on machine {mid} at {dph:.3f}/h"
+        f" (ceiling {DPH_CEILING:.3f}); destroying and vetoing")
+    veto_machine(mid)
+    try:
+        vs._vastai_raw("destroy", "instance", iid, "-y", timeout=120)
+    except OSError as exc:
+        log(f"    could not destroy {iid}: {exc}")
+    return True
+
+
+def veto_machine(mid: Any) -> bool:
+    """Add a machine to the workergroup's exclusion list, permanently.
+
+    A machine that boots and then renders nothing is indistinguishable from a
+    slow one until the budget is gone, and the autoscaler will hand it back on
+    the next cycle because nothing told it otherwise. Machine 141696 cost run9
+    two cycles that way. The list lives in the workergroup rather than in this
+    script so the veto also holds for the web UI and for every later run.
+    """
+    mid = str(mid or "").strip()
+    if not mid:
+        return False
+    # The filters are rebuilt from .env, not from the workergroup the API
+    # echoes back: that copy carries defaults the server added on its own
+    # (``verified=true``, ``rented=false``), and writing them back would
+    # quietly restore a filter that was removed here on purpose.
+    envf = ROOT / ".env"
+    try:
+        lines = envf.read_text(encoding="utf-8").splitlines()
+    except OSError as exc:
+        log(f"    could not read .env to veto {mid}: {exc}")
+        return False
+    key = "VAST_SEARCH_PARAMS="
+    idx = next((i for i, ln in enumerate(lines) if ln.startswith(key)), None)
+    if idx is None:
+        log(f"    no {key.rstrip('=')} in .env; cannot veto {mid}")
+        return False
+    params = lines[idx][len(key):].strip()
+    head, sep, tail = params.partition("machine_id notin [")
+    if not sep:
+        new_params = f"{params} machine_id notin [{mid}]"
+    else:
+        current = [x.strip() for x in tail.split("]", 1)[0].split(",") if x.strip()]
+        if mid in current:
+            return True
+        rest = tail.split("]", 1)[1]
+        new_params = head + sep + ",".join(current + [mid]) + "]" + rest
+    wg = vs.ENV.get("VAST_WORKERGROUP_ID", "")
+    if not wg:
+        log(f"    no VAST_WORKERGROUP_ID in .env; cannot veto {mid}")
+        return False
+    ok, out = vs._vastai_raw("update", "workergroup", str(wg),
+                             "--endpoint_id", str(vs.ENDPOINT_ID),
+                             "--search_params", new_params, timeout=60)
+    if not ok:
+        log(f"    could not veto machine {mid}: {out}")
+        return False
+    lines[idx] = key + new_params
+    envf.write_text("\n".join(lines) + "\n", encoding="utf-8")
+    log(f"    machine {mid} vetoed; the autoscaler will not offer it again")
+    return True
+
+
 def wait_cleared(kind: str, deadline: float, old: str | None,
                  old_start: float | None = None) -> bool:
     """Confirm the reset really happened before starting the boot clock.
@@ -171,14 +283,24 @@ def wait_cleared(kind: str, deadline: float, old: str | None,
     id in the list is the destroy having landed, not the reset having failed.
 
     A `paused` cycle cannot rely on catching the stopped status. The endpoint
-    runs with cold_workers=1, so the autoscaler restarts the instance within
-    seconds of the stop and the window is usually narrower than one poll - the
-    2026-09-22 run failed every paused cycle waiting for a state that had
-    already been and gone. The restart moves ``start_date`` while keeping the
-    id, so a moved start is the same evidence arriving late.
+    runs with cold_workers=1, so the autoscaler starts the instance again
+    within seconds of the stop, and the instance record keeps no trace of it:
+    the id survives and ``start_date`` is the original rental, not the last
+    boot. Both 2026-09-22 runs failed every paused cycle for that reason while
+    the stop was in fact landing - the cycle after it paid a second checkpoint
+    load, which is what a restarted container costs and what gave it away.
+
+    So the evidence is taken from the worker instead of the record: a stop that
+    happened takes the endpoint's worker down, and one that silently no-ops
+    leaves it serving. The cycle wants the second case to fail.
     """
     if old is None:
         return True
+    # What the stop looked like from here, sampled once a minute. Four runs
+    # have now failed this wait while the cycle after it paid a second
+    # checkpoint load, so the evidence is written down instead of inferred.
+    last_note = 0.0
+    base_vram: float | None = None
     while time.time() < deadline:
         insts = vs.instances()
         if not insts:
@@ -187,22 +309,45 @@ def wait_cleared(kind: str, deadline: float, old: str | None,
         if iid != old:
             return True
         status = (insts[0].get("actual_status") or "").lower()
-        if status in ("exited", "stopped", "offline"):
+        cur = (insts[0].get("cur_state") or "").lower()
+        if status in ("exited", "stopped", "offline") or cur in ("stopped", "exited"):
             # A destroy that only stopped the machine has not cleared a fresh
             # cycle; the autoscaler would restart it instead of renting.
             if kind == "paused":
                 return True
-        if kind == "paused" and old_start is not None:
-            now_start = insts[0].get("start_date")
-            if now_start is not None and float(now_start) > float(old_start) + 1:
+        if kind == "paused":
+            worker = vs.state().get("worker") or {}
+            if not worker.get("ready"):
                 return True
-        time.sleep(POLL)
+            # A restart keeps the id and the rental date but cannot keep the
+            # checkpoints: VRAM falling back to an empty container is the stop
+            # having landed, and is the only trace that survives it.
+            vram = worker.get("vram")
+            if isinstance(vram, (int, float)):
+                if base_vram is None:
+                    base_vram = float(vram)
+                elif base_vram > 1.0 and float(vram) < base_vram / 2:
+                    log(f"    stop landed: VRAM fell {base_vram:.1f} -> "
+                        f"{float(vram):.1f} GB")
+                    return True
+            if old_start is not None:
+                now_start = insts[0].get("start_date")
+                if now_start is not None and float(now_start) > float(old_start) + 1:
+                    return True
+            if time.time() - last_note > 60:
+                last_note = time.time()
+                log(f"    still serving: status {status or '?'}/{cur or '?'}, "
+                    f"ready {worker.get('ready')}, vram {worker.get('vram')}")
+        # The restart window is narrow enough that the ordinary cadence steps
+        # straight over it.
+        time.sleep(POLL / 3 if kind == "paused" else POLL)
     return False
 
 
 # ------------------------------------------------------------------ provision
 
-def wait_ready(deadline: float, seen: list[str], old: str | None = None) -> dict:
+def wait_ready(deadline: float, seen: list[str], old: str | None = None,
+               restart: bool = False) -> dict:
     """Poll until a worker reports ready, recording every phase it passes.
 
     The phase list is the interesting part of a failure: "stuck in
@@ -214,8 +359,28 @@ def wait_ready(deadline: float, seen: list[str], old: str | None = None) -> dict
     reports ready in five seconds is that stale row, not a boot. Cycle 4 of the
     2026-09-22 run passed that way; ignoring the old id is what makes the
     number a measurement instead of a coincidence.
+
+    The caller reads that id out of a JSON payload, where it is an int, so it
+    is normalised here: comparing it against ``str(worker["id"])`` is always
+    unequal, which silently disabled this guard for every run before
+    2026-09-23.
+
+    ``restart`` inverts that guard for a stopped instance. The autoscaler starts
+    the very same id back up, so demanding a different one can only time out --
+    which is the whole of cycle 2's 608s failure in run10 and run11. The stop is
+    not taken on trust either: ``wait_cleared`` has already watched the instance
+    reach a stopped state before this is called, which is the evidence the id
+    comparison was standing in for. It has to come from there because the gap is
+    not always visible from here -- in run11 the autoscaler had the machine back
+    in ``running`` three seconds after the stop landed, faster than this loop
+    polls. What the restart really cost is then read off the warmup number: a
+    container that came back with empty VRAM pays for the checkpoints again, and
+    a stop that did nothing renders in three seconds and says so.
     """
+    old = str(old) if old is not None else None
     last = None
+    last_inst = None
+    tried: list[str] = []
     while time.time() < deadline:
         st = vs.state()
         phase, detail = st.get("phase"), st.get("detail")
@@ -224,8 +389,31 @@ def wait_ready(deadline: float, seen: list[str], old: str | None = None) -> dict
             seen.append(phase)
             last = phase
         worker = st.get("worker") or {}
-        if worker.get("ready") and (old is None or str(worker.get("id")) != old):
-            return {"ready": True, "worker": worker}
+        # Every instance id the autoscaler puts under this endpoint counts as an
+        # attempt. A boot that misses its budget after three attempts is the
+        # autoscaler discarding machines, not a slow provision, and the two ask
+        # for opposite fixes -- so name the machines instead of reporting a
+        # single opaque timeout.
+        iid = str(worker.get("id") or "") or None
+        if iid and (restart or iid != old) and iid != last_inst:
+            if last_inst is not None:
+                log(f"    autoscaler dropped instance {last_inst} and moved on")
+            label = f"{iid}@{worker.get('machine')}"
+            tried.append(label)
+            log(f"    attempt {len(tried)}: instance {iid} on machine "
+                f"{worker.get('machine')} ({worker.get('gpu')})")
+            last_inst = iid
+            # Price it before waiting ten minutes for it to boot. An instance
+            # over the ceiling is not a deployment worth measuring, and every
+            # poll it survives is money.
+            insts = [i for i in vs.instances() if str(i.get("id")) == iid]
+            if insts and enforce_price(insts[0]):
+                last_inst = None
+                tried[-1] += " (over ceiling)"
+                time.sleep(POLL)
+                continue
+        if worker.get("ready") and (old is None or restart or iid != old):
+            return {"ready": True, "worker": worker, "tried": tried}
         # A worker that will never be ready should be replaced rather than
         # waited on. This is the same call the web UI makes before every job,
         # so exercising it here is the point, not a convenience.
@@ -233,24 +421,37 @@ def wait_ready(deadline: float, seen: list[str], old: str | None = None) -> dict
         if report.get("acted"):
             log(f"    unstick would act: {report.get('detail')}")
         time.sleep(POLL)
-    return {"ready": False, "worker": (vs.state().get("worker") or {})}
+    return {"ready": False, "worker": (vs.state().get("worker") or {}),
+            "tried": tried}
 
 
 # --------------------------------------------------------------------- render
 
 def render(deadline: float) -> dict:
     """Submit one job through the same endpoint the web form posts to."""
-    job = api("/api/jobs", {"prompt": PROMPT, "seed": SEED,
+    job = api("/api/jobs", {"prompt": PROMPT, "seed": seed(),
                             "width": 1024, "height": 1024,
                             "timeout": RENDER_BUDGET})
     jid = job["job_id"]
     log(f"    job {jid} submitted")
     last = None
+    wedged_since: float | None = None
     while time.time() < deadline:
         snap = api(f"/api/jobs/{jid}")
         if snap.get("phase") != last:
             log(f"    job: {snap.get('phase')} - {snap.get('detail')}")
             last = snap.get("phase")
+        # The endpoint reports an idle worker still carrying the requests a
+        # previous abandoned job left counted against it. Nothing is rendering
+        # and nothing will; waiting out the budget only buys a second failed
+        # cycle on the same machine. Name it and get out.
+        if "wedged" in (snap.get("detail") or "").lower():
+            wedged_since = wedged_since or time.time()
+            if time.time() - wedged_since > 45:
+                return {"id": jid, "state": "wedged", "images": 0,
+                        "error": "worker slot wedged by abandoned requests"}
+        else:
+            wedged_since = None
         if snap["state"] in ("done", "error", "cancelled"):
             return {"id": jid, "state": snap["state"],
                     "latency": snap.get("latency"),
@@ -293,13 +494,20 @@ def cycle(n: int, kind: str, auto: bool) -> dict:
     # A warm cycle measures the worker that is already there, so the id it
     # starts from is the id it must see. The other two replaced it.
     ready = wait_ready(t0 + BOOT_BUDGET, seen,
-                       old=None if kind == "warm" else step.get("instance"))
+                       old=None if kind == "warm" else step.get("instance"),
+                       restart=kind == "paused")
     row["boot_seconds"] = round(time.time() - t0, 1)
     row["phases"] = seen
+    row["attempts"] = ready.get("tried") or []
     if not ready["ready"]:
         row["result"] = "fail"
+        tried = row["attempts"]
         row["error"] = f"no ready worker within {BOOT_BUDGET:.0f}s"
+        if len(tried) > 1:
+            row["error"] += f" across {len(tried)} machines"
         log(f"  FAIL: {row['error']} (last phase {seen[-1] if seen else '?'})")
+        if tried:
+            log(f"    tried: {', '.join(tried)}")
         return row
     w = ready["worker"]
     row["worker"] = {"id": w.get("id"), "machine": w.get("machine"),
@@ -313,18 +521,35 @@ def cycle(n: int, kind: str, auto: bool) -> dict:
     # reads and is not the number the endpoint serves all day. It is still a
     # real cost of the cold start, so it is measured - just as warmup, against
     # the boot budget, and the latency claim is read from the render after it.
-    if kind != "warm":
-        t_warm = time.time()
-        first = render(t_warm + WARMUP_BUDGET)
-        row["warmup_seconds"] = round(time.time() - t_warm, 1)
-        row["warmup"] = first
-        if first["state"] != "done" or not first["images"]:
+    # A warm cycle pays this too. Cycle 3 of the 2026-09-23 run timed a worker
+    # whose VRAM had been emptied under it and reported 36.7 s as the endpoint's
+    # warm latency, next to 3.1 s from the same machine minutes earlier. On a
+    # genuinely warm worker this render costs ~3 s; buying that removes the
+    # question from every number below it.
+    t_warm = time.time()
+    first = render(t_warm + WARMUP_BUDGET)
+    row["warmup_seconds"] = round(time.time() - t_warm, 1)
+    row["warmup"] = first
+    if first["state"] != "done" or not first["images"]:
+        # The machine booted, benchmarked and then rendered nothing. That is a
+        # bad machine, not a bad deployment: veto it and let the caller run the
+        # cycle again on the replacement the autoscaler is now forced to rent.
+        row["error"] = ("first render after boot: "
+                        + (first.get("error") or f"ended {first['state']}"))
+        log(f"  FAIL: {row['error']}")
+        if veto_machine(w.get("machine")):
+            row["result"] = "retry"
+            row["vetoed"] = w.get("machine")
+            try:
+                vs._vastai_raw("destroy", "instance", str(w.get("id")), "-y",
+                               timeout=120)
+                log(f"    instance {w.get('id')} destroyed; retrying the cycle")
+            except OSError as exc:
+                log(f"    could not destroy {w.get('id')}: {exc}")
+        else:
             row["result"] = "fail"
-            row["error"] = ("first render after boot: "
-                            + (first.get("error") or f"ended {first['state']}"))
-            log(f"  FAIL: {row['error']}")
-            return row
-        log(f"    models resident after {row['warmup_seconds']:.0f}s")
+        return row
+    log(f"    models resident after {row['warmup_seconds']:.0f}s")
 
     t1 = time.time()
     job = render(t1 + RENDER_BUDGET)
@@ -348,6 +573,19 @@ def cycle(n: int, kind: str, auto: bool) -> dict:
     return row
 
 
+def pid_alive(pid: int) -> bool:
+    """True if a process with this id exists, on Windows as well as POSIX."""
+    if os.name == "nt":
+        out = subprocess.run(["tasklist", "/FI", f"PID eq {pid}", "/NH"],
+                             capture_output=True, text=True).stdout
+        return str(pid) in out
+    try:
+        os.kill(pid, 0)
+    except (ProcessLookupError, PermissionError) as exc:
+        return isinstance(exc, PermissionError)
+    return True
+
+
 def main() -> int:
     ap = argparse.ArgumentParser(description=__doc__)
     ap.add_argument("--cycles", type=int, default=len(PLAN))
@@ -365,6 +603,25 @@ def main() -> int:
         plan.append(PLAN[len(plan) % len(PLAN)])
     plan = plan[:args.cycles]
 
+    # Two harnesses pointed at one endpoint destroy each other's workers, and
+    # the phase trace that comes out reads exactly like autoscaler churn: the
+    # 2026-09-23 runs lost an hour to three overlapping copies before the
+    # process list gave it away. Refuse to be the second one.
+    lock = ROOT / "logs" / "deploy_loop.lock"
+    if lock.exists():
+        try:
+            prev = int(lock.read_text().strip())
+        except ValueError:
+            prev = None
+        if prev is not None and pid_alive(prev):
+            print(f"another deploy_loop is already running (pid {prev}).\n"
+                  f"Stop it first, or delete {lock} if it is stale.",
+                  file=sys.stderr)
+            return 2
+        lock.unlink()
+    lock.write_text(str(os.getpid()))
+    atexit.register(lambda: lock.unlink(missing_ok=True))
+
     if not api_up():
         print(f"The console API is not answering on {API}.\n"
               f"Start it first:  cv web up", file=sys.stderr)
@@ -375,16 +632,35 @@ def main() -> int:
     out.parent.mkdir(exist_ok=True)
 
     rows = []
+    aborted = False
     for i, kind in enumerate(plan, 1):
-        try:
-            row = cycle(i, kind, args.yes)
-        except KeyboardInterrupt:
-            log("aborted by operator")
+        # A machine that boots and renders nothing has been vetoed by the time
+        # the cycle returns "retry", so the attempt after it lands somewhere
+        # else. Two retries is the point where the fault stops being the
+        # machine and starts being the deployment.
+        for attempt in range(3):
+            try:
+                row = cycle(i, kind, args.yes)
+            except KeyboardInterrupt:
+                log("aborted by operator")
+                aborted = True
+                break
+            except Exception as exc:                   # noqa: BLE001
+                row = {"cycle": i, "reset": kind, "result": "fail",
+                       "error": f"{type(exc).__name__}: {exc}"}
+                log(f"  FAIL: {row['error']}")
+            if row.get("result") == "retry":
+                row["attempt"] = attempt + 1
+                with out.open("a", encoding="utf-8") as fh:
+                    fh.write(json.dumps(row) + "\n")
+                if attempt < 2:
+                    log(f"  retrying cycle {i} on another machine")
+                    continue
+                row["result"] = "fail"
+                row["error"] += " (every machine offered rendered nothing)"
             break
-        except Exception as exc:                       # noqa: BLE001
-            row = {"cycle": i, "reset": kind, "result": "fail",
-                   "error": f"{type(exc).__name__}: {exc}"}
-            log(f"  FAIL: {row['error']}")
+        if aborted:
+            break
         rows.append(row)
         with out.open("a", encoding="utf-8") as fh:
             fh.write(json.dumps(row) + "\n")

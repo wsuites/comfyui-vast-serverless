@@ -31,3 +31,6 @@ dist/
 
 # Measurement output from scripts/deploy_loop.py
 logs/
+
+# Local CodeGraph index: machine-specific, rebuilt on demand.
+.codegraph/
