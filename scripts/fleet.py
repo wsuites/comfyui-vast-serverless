@@ -33,6 +33,7 @@ import time
 import urllib.error
 import urllib.parse
 import urllib.request
+from contextlib import suppress
 from pathlib import Path
 from typing import Any, Iterable
 
@@ -88,6 +89,14 @@ COMFY_KEY = f"{COMFY_PORT}/tcp"
 READY_CHECKPOINT = ENV.get("FLEET_CHECKPOINT", "waiIllustriousSDXL_v170.safetensors")
 
 STATE_PATH = ROOT / "logs" / "fleet.json"
+LEASE_PATH = ROOT / "logs" / "fleet.lease"
+
+# How long a lease stands without a refresh. Short on purpose: the loops that
+# hold one refresh every few seconds, so the only thing this number sizes is
+# how long an orphan outlives the process that was working on it. Make it
+# generous and a crashed API buys exactly the overnight bill IDLE_AFTER exists
+# to prevent.
+LEASE_TTL = float(ENV.get("FLEET_LEASE_TTL", "120"))
 
 
 def log(msg: str) -> None:
@@ -421,6 +430,50 @@ def touch() -> None:
     save_state(state)
 
 
+def lease(iid: Any = "", ttl: float | None = None) -> None:
+    """Claim the worker while a boot or a render is in flight.
+
+    ``tick()`` finds instances by label rather than through the state file, so
+    anything wearing our label the state file does not name is an orphan and
+    gets destroyed. That is right after a crash and wrong during the minutes
+    ``up()`` spends in ``wait_ready`` before it has a record worth writing: the
+    daemon would destroy the worker the API rented thirty seconds ago. Until
+    now nothing ran ``tick()`` on a timer, so the window never opened. It opens
+    the moment the daemon and the API share a machine, which is the point of
+    running them on a server at all.
+
+    The lease is what tells the two apart - a marker with an expiry that says a
+    live process is working on this. An empty ``iid`` covers the gap between
+    ``create`` and knowing the id, and protects every instance for that tick.
+    """
+    LEASE_PATH.parent.mkdir(parents=True, exist_ok=True)
+    tmp = LEASE_PATH.with_suffix(".tmp")
+    tmp.write_text(json.dumps({
+        "instance": str(iid or ""),
+        "until": time.time() + (LEASE_TTL if ttl is None else ttl),
+        "pid": os.getpid(),
+    }), encoding="utf-8")
+    tmp.replace(LEASE_PATH)
+
+
+def leased() -> dict | None:
+    """The live lease, or None. An expired file reads the same as no file."""
+    try:
+        held = json.loads(LEASE_PATH.read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return None
+    if float(held.get("until") or 0) < time.time():
+        return None
+    return held
+
+
+def lease_clear() -> None:
+    """Drop the claim. Called when we release on purpose, so the next tick
+    does not have to wait out the expiry to reconcile."""
+    with suppress(OSError):
+        LEASE_PATH.unlink()
+
+
 # --- bring-up ----------------------------------------------------------------
 
 def funds_short() -> float | None:
@@ -529,6 +582,9 @@ def wait_ready(rec: dict, deadline: float) -> str | None:
     ever_alive = False
     dead_streak = 0
     while time.time() < deadline:
+        # Held every pass, not once at entry: a boot legitimately runs past
+        # BOOT_CAP on a cold disk, and the lease has to outlast the wait.
+        lease(iid)
         inst = find(iid)
         if inst is None:
             log(f"  instance {iid} vanished before it was ready")
@@ -582,6 +638,10 @@ def up(attempts: int = 3, boot_cap: float | None = None) -> dict | None:
     skip: list[str] = []
 
     for attempt in range(1, attempts + 1):
+        # Taken before the first look at the account, with no id yet: between
+        # create and the state write there is nothing that names the instance,
+        # so the blank lease has to cover whatever is wearing the label.
+        lease("")
         fleet = ours()
         # Never keep two. The extras are the expensive kind of bug.
         for extra in fleet[1:]:
@@ -653,6 +713,9 @@ def up(attempts: int = 3, boot_cap: float | None = None) -> dict | None:
 def down(why: str = "requested") -> int:
     """Release everything we own and forget it."""
     n = 0
+    # Dropped first: releasing on purpose outranks any claim, and leaving it
+    # behind would have the next tick protect an instance that is already gone.
+    lease_clear()
     for inst in ours():
         if destroy(inst.get("id"), why):
             n += 1
@@ -720,14 +783,22 @@ def submit(url: str, workflow: dict, client_id: str = "fleet") -> str:
 
 
 def wait_job(url: str, prompt_id: str, timeout: float = 300.0) -> dict:
-    """Block until the prompt leaves the history as finished. Raises on timeout."""
+    """Block until the prompt leaves the history as finished. Raises on timeout.
+
+    Holds the lease while it waits. This loop is the one place that reliably
+    knows a render is still running, and a long one outlives IDLE_AFTER.
+    """
     deadline = time.time() + timeout
+    last_held = 0.0
     while time.time() < deadline:
         try:
             hist = http(f"{url}/history/{prompt_id}", timeout=15)
         except (urllib.error.URLError, OSError, ValueError):
             time.sleep(1.0)
             continue
+        if time.time() - last_held > LEASE_TTL / 4:
+            lease(load_state().get("instance") or "")
+            last_held = time.time()
         entry = (hist or {}).get(prompt_id)
         if entry:
             status = (entry.get("status") or {})
@@ -805,14 +876,23 @@ def tick() -> dict:
     state file is a cache. Anything labelled ours that the state file does not
     know about gets destroyed, because the only way for that to happen is a
     crash mid-rental, and the alternative to destroying it is paying for it.
+
+    The one other way for that to happen is a rental still in progress, which
+    is not a crash and must not be destroyed. A live lease is the difference;
+    an expired one is not, which is what keeps a dead API from parking a GPU.
     """
     state = load_state()
     fleet = ours()
     known = str(state.get("instance") or "")
+    hold = leased()
 
     for inst in fleet:
         iid = str(inst.get("id"))
         if iid != known:
+            if hold is not None and hold.get("instance") in ("", iid):
+                log(f"  instance {iid} is leased by pid {hold.get('pid')}; "
+                    f"leaving it alone")
+                continue
             destroy(iid, "not in the fleet state")
         elif over_ceiling(inst):
             veto(inst.get("machine_id"), "priced over the ceiling while running")
@@ -826,6 +906,12 @@ def tick() -> dict:
 
     state = load_state()
     if state.get("ready_at"):
+        # A render that outruns IDLE_AFTER is not idle, and touch() only fires
+        # on either side of the submit. Without this the reaper reaps the job
+        # it is meant to be protecting, halfway through.
+        if hold is not None:
+            return {"worker": state.get("instance"), "url": state.get("url"),
+                    "leased": True}
         idle = time.time() - float(state.get("last_job") or state["ready_at"])
         if idle > IDLE_AFTER:
             log(f"  idle for {idle:.0f}s; releasing the worker")

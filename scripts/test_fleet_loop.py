@@ -252,6 +252,12 @@ def install(v):
                               "onstart": "echo hi", "disk_space": 30}
     fleet.veto = lambda m, r="": False    # never poison .env from a test
     fleet.save_state = lambda s: None
+    # Same reason as veto: the lease is a real file under logs/, and a suite
+    # that leaves one behind hands the next live tick a claim on an instance
+    # that never existed. test_lease.py covers the lease on its own.
+    fleet.lease = lambda *a, **k: None
+    fleet.leased = lambda: None
+    fleet.lease_clear = lambda: None
     fleet.load_state = lambda: ({} if not v.insts
                                 else {"instance": list(v.insts)[-1]})
     vs.instances = v.instances

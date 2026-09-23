@@ -300,6 +300,12 @@ async def _run_job(job: Job) -> None:
         # the page is already showing, and name them if they never arrive.
         deadline = time.time() + MODEL_WAIT
         while True:
+            # Held through the wait as well as the render. A worker that comes
+            # up missing a model can sit here for MODEL_WAIT seconds without a
+            # single job to touch(), and it is the daemon's own tick that would
+            # collect it - the two only run side by side now that both live on
+            # the server.
+            await asyncio.to_thread(fleet.lease, inst.get("instance") or "")
             missing = await asyncio.to_thread(fleet.missing_inputs, url, workflow)
             if not missing:
                 break
