@@ -270,6 +270,18 @@ def install(v):
     fleet.lease = lambda *a, **k: None
     fleet.leased = lambda: None
     fleet.lease_clear = lambda: None
+    # Ranking reads logs/fleet_loop.jsonl through measured_seconds(), and that
+    # file is whatever the developer's own live runs left behind: full of 3090
+    # rows on the machine this was written on, absent on a fresh clone. With it
+    # empty every card is untimed, the tie falls to inet_down, and the fake
+    # 4090 wins - so the two ranking assertions below passed here and failed on
+    # a clean checkout. That is exactly backwards for the suite whose job is to
+    # gate the live runs that cost money.
+    #
+    # So the history is stated rather than inherited. 82s is the 3090's
+    # measured median on the served graph; the fake 4090 stays untimed, which
+    # is the case the ranking actually has to get right.
+    fleet.measured_seconds = lambda: {"RTX 3090": 82.0}
     fleet.load_state = lambda: ({} if not v.insts
                                 else {"instance": list(v.insts)[-1]})
     vs.instances = v.instances

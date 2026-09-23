@@ -34,3 +34,7 @@ logs/
 
 # Local CodeGraph index: machine-specific, rebuilt on demand.
 .codegraph/
+
+# The Linux deploy builds its interpreter inside the checkout.
+.venv/
+venv/
