@@ -59,6 +59,15 @@ BOOT_BUDGET = 600.0
 # deliberately far above that, because the failure this catches is a job that
 # hangs for a quarter of an hour, not one that is a few seconds slow.
 RENDER_BUDGET = 300.0
+# The first render after a boot additionally pays for the checkpoint load, so
+# it gets its own ceiling. Measured at 60 s on a healthy 5080 and over 300 s on
+# a machine that then served warm renders at 66 s - a slow warmup predicts a
+# slow endpoint, which is why it is recorded rather than merely tolerated.
+WARMUP_BUDGET = 420.0
+# What a request is supposed to cost once the models are resident. Cycles are
+# not failed on it - a passing cycle with a slow machine is a real deployment,
+# and the run summary is where that shows up.
+LATENCY_TARGET = 13.0
 # The autoscaler polls on its own schedule; a reset is not visible to it
 # instantly and a fresh instance does not appear the second it is asked for.
 POLL = 15.0
@@ -117,6 +126,9 @@ def announce_reset(kind: str, auto: bool) -> dict:
     insts = vs.instances()
     iid = str(insts[0].get("id")) if insts else None
     status = (insts[0].get("actual_status") or "?").lower() if insts else "none"
+    # The restart of a stopped instance keeps the id and moves this, which is
+    # the only durable trace a `paused` cycle leaves. See wait_cleared.
+    started = insts[0].get("start_date") if insts else None
     log(f"  current: instance {iid or '(none)'}, status {status}")
 
     if kind == "warm":
@@ -146,16 +158,24 @@ def announce_reset(kind: str, auto: bool) -> dict:
     if not ok:
         raise RuntimeError(f"{verb} {iid} failed: {out}")
     log(f"    {verb} sent to instance {iid}")
-    return {"kind": kind, "instance": iid, "note": f"{verb} sent"}
+    return {"kind": kind, "instance": iid, "started": started, "note": f"{verb} sent"}
 
 
-def wait_cleared(kind: str, deadline: float, old: str | None) -> bool:
+def wait_cleared(kind: str, deadline: float, old: str | None,
+                 old_start: float | None = None) -> bool:
     """Confirm the reset really happened before starting the boot clock.
 
     Without this the cycle would time a worker that was never reset and report
     a suspiciously fast cold start. The old instance id matters because the
     autoscaler can rent a replacement while this is still looking: a different
     id in the list is the destroy having landed, not the reset having failed.
+
+    A `paused` cycle cannot rely on catching the stopped status. The endpoint
+    runs with cold_workers=1, so the autoscaler restarts the instance within
+    seconds of the stop and the window is usually narrower than one poll - the
+    2026-09-22 run failed every paused cycle waiting for a state that had
+    already been and gone. The restart moves ``start_date`` while keeping the
+    id, so a moved start is the same evidence arriving late.
     """
     if old is None:
         return True
@@ -171,6 +191,10 @@ def wait_cleared(kind: str, deadline: float, old: str | None) -> bool:
             # A destroy that only stopped the machine has not cleared a fresh
             # cycle; the autoscaler would restart it instead of renting.
             if kind == "paused":
+                return True
+        if kind == "paused" and old_start is not None:
+            now_start = insts[0].get("start_date")
+            if now_start is not None and float(now_start) > float(old_start) + 1:
                 return True
         time.sleep(POLL)
     return False
@@ -257,7 +281,8 @@ def cycle(n: int, kind: str, auto: bool) -> dict:
 
     t0 = time.time()
     if kind != "warm":
-        if not wait_cleared(kind, t0 + 300, step.get("instance")):
+        if not wait_cleared(kind, t0 + 300, step.get("instance"),
+                            step.get("started")):
             row["result"] = "fail"
             row["error"] = "the worker was never reset; cycle not measurable"
             log(f"  FAIL: {row['error']}")
@@ -282,6 +307,25 @@ def cycle(n: int, kind: str, auto: bool) -> dict:
     log(f"  ready in {row['boot_seconds']:.0f}s on {w.get('gpu')} "
         f"(machine {w.get('machine')})")
 
+    # ``ready`` means the pyworker's benchmark passed, not that the workflow's
+    # checkpoints are in VRAM: ComfyUI loads those on the first prompt that
+    # asks for them. So the first render after a boot pays for ~7 GB of disk
+    # reads and is not the number the endpoint serves all day. It is still a
+    # real cost of the cold start, so it is measured - just as warmup, against
+    # the boot budget, and the latency claim is read from the render after it.
+    if kind != "warm":
+        t_warm = time.time()
+        first = render(t_warm + WARMUP_BUDGET)
+        row["warmup_seconds"] = round(time.time() - t_warm, 1)
+        row["warmup"] = first
+        if first["state"] != "done" or not first["images"]:
+            row["result"] = "fail"
+            row["error"] = ("first render after boot: "
+                            + (first.get("error") or f"ended {first['state']}"))
+            log(f"  FAIL: {row['error']}")
+            return row
+        log(f"    models resident after {row['warmup_seconds']:.0f}s")
+
     t1 = time.time()
     job = render(t1 + RENDER_BUDGET)
     row["render_seconds"] = round(time.time() - t1, 1)
@@ -294,9 +338,13 @@ def cycle(n: int, kind: str, auto: bool) -> dict:
 
     row["result"] = "pass"
     row["within_budget"] = (kind == "warm" or row["boot_seconds"] <= BOOT_BUDGET)
-    log(f"  PASS: boot {row['boot_seconds']:.0f}s, "
+    lat = job.get("latency")
+    row["on_target"] = bool(lat is not None and lat <= LATENCY_TARGET)
+    warm = f", warmup {row['warmup_seconds']:.0f}s" if "warmup_seconds" in row else ""
+    log(f"  PASS: boot {row['boot_seconds']:.0f}s{warm}, "
         f"render {row['render_seconds']:.0f}s "
-        f"(endpoint latency {job.get('latency')})")
+        f"(endpoint latency {lat}"
+        f"{'' if row['on_target'] else f' - over the {LATENCY_TARGET:.0f}s target'})")
     return row
 
 
@@ -342,15 +390,23 @@ def main() -> int:
             fh.write(json.dumps(row) + "\n")
 
     print()
-    print(f"{'#':>2}  {'cycle':7} {'result':7} {'boot':>7} {'render':>7}  note")
+    print(f"{'#':>2}  {'cycle':7} {'result':7} {'boot':>7} {'warmup':>7} "
+          f"{'lat':>7} {'machine':>8}  note")
     for r in rows:
         boot = f"{r['boot_seconds']:.0f}s" if r.get("boot_seconds") else "-"
-        rend = f"{r['render_seconds']:.0f}s" if r.get("render_seconds") else "-"
-        note = r.get("error") or (r.get("job") or {}).get("latency") or ""
+        warm = f"{r['warmup_seconds']:.0f}s" if r.get("warmup_seconds") else "-"
+        lat = (r.get("job") or {}).get("latency")
+        lat = f"{lat:.1f}s" if isinstance(lat, (int, float)) else "-"
+        mach = str((r.get("worker") or {}).get("machine") or "-")
         print(f"{r['cycle']:>2}  {r['reset']:7} {r.get('result','?'):7} "
-              f"{boot:>7} {rend:>7}  {note}")
+              f"{boot:>7} {warm:>7} {lat:>7} {mach:>8}  {r.get('error','')}")
     passed = sum(1 for r in rows if r.get("result") == "pass")
-    print(f"\n{passed}/{len(rows)} cycles passed. Log: {out}")
+    # Passing and being fast are separate claims: a cycle that boots and renders
+    # on a machine sharing its GPU is a working deployment and a bad one.
+    ontgt = sum(1 for r in rows if r.get("on_target"))
+    print(f"\n{passed}/{len(rows)} cycles passed, "
+          f"{ontgt}/{len(rows)} under the {LATENCY_TARGET:.0f}s latency target. "
+          f"Log: {out}")
     return 0 if passed == len(rows) else 1
 
 
