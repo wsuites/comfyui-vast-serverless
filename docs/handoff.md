@@ -14,33 +14,34 @@ Six criteria. Status at the time of writing:
 
 | # | Criterion | Status |
 |---|---|---|
-| 1 | 5 deployment cycles, no errors | **in flight** — run17 started 06:08:55, see below |
+| 1 | 5 deployment cycles, no errors | **met live** — run17, 5/5 |
 | 2 | unavailable machines handled | met live (run15: offer 49200843 refused, loop walked to the next) |
-| 3 | stopped -> running | met live (`scripts/paused_probe.py`, 3/3: 17.9s / 33.4s / 46.4s) |
-| 4 | create-if-none | met live, every `fresh` cycle |
-| 5 | cold start < 10 min | met live, 139-304s per host |
+| 3 | stopped -> running | met live (run17 cycle 2, 79.3s; `paused_probe.py` 3/3) |
+| 4 | create-if-none | met live, run17 cycles 1 and 4 |
+| 5 | cold start < 10 min | met live, 5/5 under 600s, worst 209.4s |
 | 6 | requests take 13s | **unresolved, and not a bug** — see "The 13s question" |
 
-## Right now
+## run17 — the clean live run
 
-A live run is in progress. Do not start a second one — three concurrent
-`deploy_loop.py` processes once fought over the same endpoint and each destroyed the
-others' workers.
+2026-09-23 06:08-06:33. Cost $0.134. Nothing left billing.
 
 ```
-process : python -u scripts/fleet_loop.py
-log     : logs/run17.log        (human)
-rows    : logs/fleet_loop.jsonl (one JSON object per cycle, appended)
-plan    : fresh -> paused -> warm -> fresh -> warm
-started : 06:08:55, cycle 1 renting machine 49903 (RTX 3090, 0.2009/h)
+#  cycle   result     boot  warmup      lat     base  gpu
+1  fresh   pass     209.4s   99.4s   78.26s   18.78s  RTX 3090
+2  paused  pass      79.3s  102.0s   80.01s   20.09s  RTX 3090
+3  warm    pass       3.6s   74.6s   79.82s    20.4s  RTX 3090
+4  fresh   pass     176.6s  101.0s    80.1s    19.0s  RTX 3090
+5  warm    pass       3.6s   77.4s   84.49s   19.57s  RTX 3090
+5/5 cycles passed, 5/5 booted under 600s, 0/5 under the 13s latency target.
 ```
 
-Check it with `tail -f logs/run17.log`. It prints a summary table at the end and exits
-non-zero if any cycle failed. Expect 20-40 minutes and roughly $0.35-0.45.
+`lat` is the full served graph, `base` the same render without the upscale tail. On a
+3090 the tail costs 61s of an 80s render.
 
-If it has finished by the time you read this, the last lines of the log are the answer.
-A cycle that failed on hardware rather than on the design retries on another machine up
-to 3 times before it counts against the run.
+To repeat it: `python -u scripts/fleet_loop.py`. Do not start a second one concurrently
+— three `deploy_loop.py` processes once fought over the same endpoint and each destroyed
+the others' workers. A cycle that fails on hardware rather than on the design retries on
+another machine up to 3 times before it counts against the run.
 
 ## Architecture: why we own the scheduler
 
@@ -231,3 +232,29 @@ against the live offer pool read-only (`python scripts/fleet.py status`) before 
 and grep for leftover `_dlperf` references — the last ranking change left three and they
 only fire inside `rent()`, which the offline suite did not exercise until
 `test_fleet_loop.py` existed.
+
+## The provisioning script does not re-run when you edit it
+
+Vast's image keeps one hash per provisioning phase in `/.provisioner_state/`:
+`apt.hash`, `pip.hash`, `git.hash`, `downloads.hash`, `provisioning_script.hash`, and the
+rest. On boot, a phase whose hash still matches is skipped, and `/.provisioning_complete`
+is created anyway. So the marker is a receipt, not a gate.
+
+The hash for the script is over its **URL**, not its body. `renew_provisioning.py` uploads
+to a fixed R2 key, so a fixed URL: an instance that already provisioned once will keep the
+version it first downloaded, forever, through any number of restarts. Deleting
+`/.provisioning_complete` and `/provisioning.sh` changes nothing — measured on instance
+52224586 on 2026-09-23, where a restart reported "provisioned" in zero seconds and
+`models/vae/` stayed empty.
+
+To force an existing instance onto a new script:
+
+```bash
+# instance must be stopped - `execute` is refused on running ones
+vastai execute <iid> "rm /.provisioner_state/provisioning_script.hash"
+vastai execute <iid> "rm /.provisioner_state/downloads.hash"   # also re-checks the model list
+vastai start instance <iid>
+```
+
+New rentals are unaffected: they have no state directory and always run the current
+script. This only bites when you are debugging a fix against a machine that is already up.
