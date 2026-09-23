@@ -226,11 +226,38 @@ def reachable(inst: dict) -> bool | None:
     return ok
 
 
+def _gpu_reporting(inst: dict) -> bool:
+    """False when the host is pushing no GPU telemetry, rather than reporting idle.
+
+    Measured 2026-09-23 on instance 52221873: gpu_util 0.0, gpu_temp 0.0 and
+    vmem_usage 0.0 all at once, while cpu_util read 68.4 and the box delivered
+    two 1024x1024 renders in 20.59s and 18.95s. A card that is powered is never
+    at 0 C, so the temperature is the tell - it separates "not reported" from a
+    genuine zero far more reliably than utilisation, which really can be 0
+    between two of Vast's samples.
+
+    Both are only trusted together: utilisation alone is legitimately 0 on an
+    idle card, and a host that reports one field reports all of them.
+    """
+    util = _number(inst.get("gpu_util"))
+    temp = _number(inst.get("gpu_temp"))
+    if util is None and temp is None:
+        return False
+    return not ((temp or 0) <= 0 and (util or 0) <= 0)
+
+
 def _stalled_for(work: dict, gpu_util: float | None) -> float:
     """Seconds this worker has counted work while its GPU sat idle. 0 if not.
 
     Endpoint-wide on purpose: a wedged slot is a property of the worker, not
     of whichever job happens to be waiting behind it.
+
+    A gpu_util of None means the host reports no telemetry, so this returns 0
+    and the worker is never called wedged. That is the deliberate choice: on
+    such a host "counted but idle" is indistinguishable from "counted and
+    rendering", and rebooting a working worker costs a cold start plus the
+    render it was in the middle of. Without the idle signal the check is two
+    conditions of evidence, not three, and two is not enough to accuse.
     """
     global _stall_since
 
@@ -259,6 +286,7 @@ def describe(insts: list[dict], works: list[dict]) -> dict:
     work = works[0] if works else {}
     start = inst.get("start_date") or work.get("started_at")
     dph = inst.get("dph_total")
+    reporting = _gpu_reporting(inst)
     worker = {
         "id": inst.get("id") or work.get("id"),
         "gpu": inst.get("gpu_name") or work.get("gpu_name"),
@@ -277,10 +305,14 @@ def describe(insts: list[dict], works: list[dict]) -> dict:
         # deliberately not relayed: it has been seen as both 0.216 and 1.167 on
         # this endpoint, so its unit is not knowable from here, and a number
         # whose scale is a guess is worse than no number.
-        "gpu_util": _number(inst.get("gpu_util")),
-        "gpu_temp": inst.get("gpu_temp"),
+        #
+        # None when the host reports no GPU telemetry at all - see
+        # _gpu_reporting(). An unreported card and an idle one are the same
+        # zero on the wire and must not be the same value here.
+        "gpu_util": _number(inst.get("gpu_util")) if reporting else None,
+        "gpu_temp": inst.get("gpu_temp") if reporting else None,
         # GB in use against the card's total, which Vast reports in MB.
-        "vram": inst.get("vmem_usage"),
+        "vram": inst.get("vmem_usage") if reporting else None,
         "vram_total": (float(inst["gpu_totalram"]) / 1024
                        if inst.get("gpu_totalram") else None),
     }
