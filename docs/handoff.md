@@ -238,7 +238,14 @@ only fire inside `rent()`, which the offline suite did not exercise until
 Vast's image keeps one hash per provisioning phase in `/.provisioner_state/`:
 `apt.hash`, `pip.hash`, `git.hash`, `downloads.hash`, `provisioning_script.hash`, and the
 rest. On boot, a phase whose hash still matches is skipped, and `/.provisioning_complete`
-is created anyway. So the marker is a receipt, not a gate.
+is created anyway.
+
+There are two gates in series, and clearing either one alone buys nothing. With the marker
+deleted and the hashes intact, the boot re-enters provisioning and leaves it again in zero
+seconds, every phase skipped. With the hashes deleted and the marker intact, the boot never
+enters provisioning at all — measured twice on 52224586, 15:45 and 15:55 UTC, both silent.
+Delete both, in the same stopped window, or expect another clean-looking boot with an empty
+`models/vae/`.
 
 The hash for the script is over its **URL**, not its body. `renew_provisioning.py` uploads
 to a fixed R2 key, so a fixed URL: an instance that already provisioned once will keep the
@@ -251,8 +258,9 @@ To force an existing instance onto a new script:
 
 ```bash
 # instance must be stopped - `execute` is refused on running ones
-vastai execute <iid> "rm /.provisioner_state/provisioning_script.hash"
-vastai execute <iid> "rm /.provisioner_state/downloads.hash"   # also re-checks the model list
+vastai execute <iid> "rm -f /.provisioning_complete"
+vastai execute <iid> "rm -f /.provisioner_state/provisioning_script.hash"
+vastai execute <iid> "rm -f /.provisioner_state/downloads.hash"   # also re-checks the model list
 vastai start instance <iid>
 ```
 
