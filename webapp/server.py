@@ -211,6 +211,14 @@ def _save_blobs(job: Job, blobs: list[tuple[str, bytes]]) -> list[str]:
     return saved
 
 
+def _human(n: float) -> str:
+    """Bytes in the largest unit that leaves a significant digit."""
+    for unit, size in (("GB", 1024 ** 3), ("MB", 1024 ** 2), ("KB", 1024)):
+        if n >= size:
+            return f"{n / size:.2f} {unit}"
+    return f"{int(n)} B"
+
+
 def _prune_output(keep: str | None = None) -> int:
     """Drop the oldest renders until the gallery fits under its cap.
 
@@ -254,10 +262,11 @@ def _prune_output(keep: str | None = None) -> int:
         total -= size
         freed += size
     if freed:
-        # :g not :.0f - a 0.5 GB cap printing as "0 GB cap" reads as the value
-        # that means disabled, which is the opposite of what just happened.
-        print(f"retention: freed {freed / 1024 ** 3:.2f} GB "
-              f"under a {RETENTION_GB:g} GB cap", file=sys.stderr)
+        # Report in the unit the number actually has. "freed 0.00 GB" is the
+        # line an operator reads when wondering whether retention did
+        # anything, and a 0 that means "yes, 40 MB" answers the wrong way.
+        print(f"retention: freed {_human(freed)} "
+              f"under a {_human(cap)} cap", file=sys.stderr)
     return freed
 
 
