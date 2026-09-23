@@ -80,7 +80,7 @@ rm -f /tmp/.acc_probe
 # proxy (ssh -p <port> root@sshN.vast.ai) is the way to address a specific one.
 #
 # Client side (needs cloudflared locally):
-#   cloudflared access tcp --hostname ssh-vast.whitesu.dev --url localhost:2222
+#   cloudflared access tcp --hostname ssh-vast.<your-domain> --url localhost:2222
 #   ssh -i ~/.ssh/xcl -p 2222 root@localhost
 (
 _dc() {

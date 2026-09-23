@@ -268,7 +268,7 @@ vastai show instances --raw | python -c "import sys,json;[print(i['id'],i['ssh_h
 ssh -i ~/.ssh/xcl -p <port> root@<ssh_host>
 
 # shell through the named tunnel instead (any instance, whichever Cloudflare picks)
-cloudflared access tcp --hostname ssh-vast.whitesu.dev --url localhost:2223
+cloudflared access tcp --hostname ssh-vast.<your-domain> --url localhost:2223
 ssh -i ~/.ssh/xcl -p 2223 root@localhost
 
 # are the tunnels actually up
@@ -341,7 +341,7 @@ multiple paths in one `ls` is a 400. The CLI's own `execute` is broken outright
 ### The two tunnels
 
 Both are cloudflared, both dial **out** to Cloudflare, so neither cares what the host
-firewalls. Both are named tunnels on `whitesu.dev`, and in both cases the split is the
+firewalls. Both are named tunnels on the same domain, and in both cases the split is the
 same: the **hostname** is public and lives in the template env, the **token** is a Vast
 *account* env var, masked in `vastai show env-vars` and never written into the template —
 the template is world-readable via `vastai show template`, and the provisioning `.sh` sits
@@ -349,10 +349,18 @@ on a public R2 URL.
 
 | | worker | admin ssh |
 |---|---|---|
-| hostname | `pyworker-vast.whitesu.dev` | `ssh-vast.whitesu.dev` |
+| hostname | `pyworker-vast.<your-domain>` | `ssh-vast.<your-domain>` |
 | token env var | `CF_WORKER_TOKEN` | `CF_SSH_TOKEN` |
 | local origin | `https://localhost:3000` | `ssh://localhost:22` |
 | purpose | the pyworker's *reported* url | shell on a firewalled host |
+
+`<your-domain>` is a placeholder on purpose: this repo is public, and a
+hostname that fronts an SSH tunnel is the one thing here worth not
+publishing. The live values are in `.env` (gitignored) as `CF_WORKER_HOSTNAME`
+and `CF_SSH_HOSTNAME` — read them from there, and note that the tunnel *names*
+(`mizuki-worker`, `mizuki-ssh`) are not the hostnames and are safe to say out
+loud: they are local labels, and the tokens are minted against them but live
+in the Vast account, not here.
 
 The worker one exists because the pyworker does not serve on its own bind — it **reports**
 a url built from env vars (`metrics.py: get_url() -> f"https://{PUBLIC_IPADDR}:{VAST_TCP_PORT_3000}"`)
@@ -366,7 +374,7 @@ lie to the autoscaler, which is why it is opt-in, and it must be ordered **befor
 To use the admin one:
 
 ```bash
-cloudflared access tcp --hostname ssh-vast.whitesu.dev --url localhost:2223
+cloudflared access tcp --hostname ssh-vast.<your-domain> --url localhost:2223
 ssh -i ~/.ssh/xcl -p 2223 root@localhost
 ```
 
