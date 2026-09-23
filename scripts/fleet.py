@@ -74,7 +74,10 @@ STATUS_GRACE = 90.0
 TEMPLATE_ID = int(ENV.get("VAST_TEMPLATE_ID", "0") or 0)
 CREATOR_ID = ENV.get("VAST_CREATOR_ID", "")
 DISK = ENV.get("VAST_DISK_SPACE", "26")
-LABEL = ENV.get("FLEET_LABEL", "mizuki-fleet")
+# Changing this while an instance is rented orphans it: ours() matches on the
+# label, so the old one stops being found, stops being reaped, and bills until
+# someone kills it by hand. Release the fleet first, then rename.
+LABEL = ENV.get("FLEET_LABEL", "pyworker-vast-fleet")
 
 # ComfyUI's port inside the container. Set by the template as
 # ``COMFYUI_ARGS="--disable-auto-launch --port 18188"`` and asserted by the

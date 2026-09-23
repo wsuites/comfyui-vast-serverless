@@ -37,6 +37,18 @@ sys.path.insert(0, str(ROOT / "scripts"))
 CHECKPOINT = "waiIllustriousSDXL_v170.safetensors"
 PNG = bytes.fromhex("89504e470d0a1a0a") + b"fake-png-body"
 
+
+def fleet_label() -> str:
+    """Whatever label the code under test is actually looking for.
+
+    Hardcoding it meant a rename made every instance the fake mints invisible
+    to ``ours()`` - which is the exact production failure a rename causes, and
+    the suite would have reported it as "nothing rented" rather than as a
+    label mismatch. Read late: ``install()`` may have moved it.
+    """
+    import fleet
+    return fleet.LABEL
+
 # What the fake GPU charges, per node class, scaled down 200x from the live
 # measurement on a PRO 4000 (full graph 101.87s, without the upscale 20.06s,
 # without upscale or face pass 11.39s). The shape matters more than the scale:
@@ -210,7 +222,7 @@ class Vast:
             now = time.time()
             self.insts[iid] = {
                 "id": int(iid), "machine_id": offer["machine_id"],
-                "label": "mizuki-fleet", "gpu_name": offer["gpu_name"],
+                "label": fleet_label(), "gpu_name": offer["gpu_name"],
                 "dph_total": offer["dph_total"], "start_date": now,
                 "_boot_at": now + self.BOOT, "_target": "running",
                 "_stale_until": 0.0, "_stale_status": "created",
