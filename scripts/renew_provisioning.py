@@ -81,6 +81,15 @@ CF=/usr/local/bin/cloudflared
   https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-linux-amd64 \
   && chmod +x "$CF" || exit 0
 WHO="${VAST_CONTAINERLABEL:-$(hostname)}"
+# Quick tunnels are handed out per source IP and rate limited. Retrying every
+# 15s asks for ~240 of them an hour from one address, and Cloudflare answers
+# "quick tunnel provisioning failed with status 429: error code: 1015" - so the
+# retry loop is what keeps the tunnel down once it has been down once. Measured
+# on instance 52224586, 2026-09-23: six hours of 15s retries, zero tunnels, and
+# a Discord channel with one DOWN line per attempt burying everything else.
+# Back off to 15 minutes, and say DOWN once per outage rather than per attempt.
+BACKOFF=15
+DOWN_REPORTED=0
 while true; do
   "$CF" tunnel --no-autoupdate --url ssh://localhost:22 > /tmp/cf-ssh.log 2>&1 &
   CFPID=$!
@@ -93,10 +102,19 @@ while true; do
   done
   if [ -n "$URL" ]; then
     _dc ":lock: **SSH tunnel UP** \`$WHO\` $URL || local: cloudflared access tcp --hostname ${URL#https://} --url localhost:2222 + ssh -p 2222 root@localhost"
+    BACKOFF=15
+    DOWN_REPORTED=0
   fi
   wait $CFPID
-  _dc ":warning: SSH tunnel DOWN on \`$WHO\`, retrying in 15s"
-  sleep 15
+  if [ "$DOWN_REPORTED" = 0 ]; then
+    # The reason lives in the tunnel's own log; without it a 1015 reads exactly
+    # like a network blip and gets retried forever instead of waited out.
+    WHY=$(grep -om1 'failed with status [0-9]*[^"]*' /tmp/cf-ssh.log | head -c 120)
+    _dc ":warning: SSH tunnel DOWN on \`$WHO\` ${WHY:-(no url)} - backing off, next report only when it changes"
+    DOWN_REPORTED=1
+  fi
+  sleep "$BACKOFF"
+  [ "$BACKOFF" -lt 900 ] && BACKOFF=$(( BACKOFF * 4 ))
 done
 ) > /tmp/cf-bootstrap.log 2>&1 &
 # --- worker serving tunnel (hosts with filtered inbound ports) ---------------

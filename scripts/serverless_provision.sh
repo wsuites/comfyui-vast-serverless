@@ -441,6 +441,24 @@ export COMFY_MODEL_LIST COMFY_MODEL_LIST_DEFERRED
 # the point where the endpoint starts serving.
 MODELS_CRITICAL_MARK="$COMFY_DIR/.critical_models_ok"
 rm -f "$MODELS_CRITICAL_MARK"
+# Same idea for the half that lands after the endpoint is already serving. A
+# reader that needs a deferred feature (anima needs three files, controlnet one)
+# can tell "still downloading" from "downloaded" from "gave up, here is what is
+# missing" instead of asking ComfyUI why a node rejected its input.
+DEFERRED_OK_MARK="$COMFY_DIR/.deferred_models_ok"
+DEFERRED_FAIL_MARK="$COMFY_DIR/.deferred_models_failed"
+rm -f "$DEFERRED_OK_MARK" "$DEFERRED_FAIL_MARK"
+
+# The deferred entries whose destination is not on disk. The list carries
+# absolute destinations already, so this is the same truth ComfyUI will see when
+# it builds its own file listing - not a guess from the downloader's exit code.
+deferred_missing() {
+    local key dest
+    while IFS='|' read -r key dest; do
+        [ -n "$dest" ] || continue
+        [ -f "$dest" ] || printf '%s ' "${dest##*/}"
+    done <<< "$COMFY_MODEL_LIST_DEFERRED"
+}
 
 # Same downloader for both passes; the list comes in through the environment.
 fetch_models() {
@@ -506,6 +524,21 @@ FALLBACKS = {
 
 PROBE = ["curl", "-4", "-fsSL", "-o", "/dev/null", "--max-time", "8",
          "-w", "%{speed_download}"]
+
+
+def say(*parts):
+    """Progress reporting must never be able to fail a download.
+
+    The deferred pass runs after the foreground script has returned, so its
+    inherited stdout can be closed at any moment. A print that raises there
+    takes the calling thread with it and, through the pool, the whole batch -
+    which is exactly how a 250 MB VAE went missing with no trace on
+    2026-09-23. Reporting is best effort from here on.
+    """
+    try:
+        print(*parts, flush=True)
+    except Exception:
+        pass
 
 
 def probe_speed(url, offset=0):
@@ -574,14 +607,12 @@ def fetch(item):
         resume = tmp.stat().st_size if tmp.exists() else 0
         scored = sorted(((probe_speed(u, resume), u, o) for u, o in candidates),
                         reverse=True)
+        # Sorting descending already does what we want with a source that
+        # cannot answer the probe: it goes last, and is still tried, so a
+        # transient probe failure never deletes the only viable origin.
         candidates = [(u, o) for _, u, o in scored]
-        print("    probe " + " ".join(
-            f"{o}={s/1e6:.1f}MB/s" for s, _, o in scored), flush=True)
-        # A source that cannot even answer the probe is not worth a long fetch;
-        # keep it only as the last resort so a transient probe failure does not
-        # delete the only viable origin.
-        if scored[0][0] <= 0:
-            candidates = [(u, o) for _, u, o in scored]
+        say(f"    probe {rel}: " + " ".join(
+            f"{o}={s/1e6:.1f}MB/s" for s, _, o in scored))
     attempt = ""
     size = 0
     for cand, origin in candidates:
@@ -601,30 +632,69 @@ def fetch(item):
 
 errors = []
 with cf.ThreadPoolExecutor(max_workers=4) as ex:
-    for res in ex.map(fetch, WANTED.items()):
-        print("  ", res, flush=True)
+    # submit + as_completed rather than map: map hands back results strictly in
+    # order, so one item raising ends the whole loop and the files that did
+    # succeed are never reported, and results only surface once everything
+    # ahead of them has finished. Here each file reports when it is done and
+    # an exception is recorded against that file instead of taking the batch
+    # down with it.
+    futures = {ex.submit(fetch, it): it[1] for it in WANTED.items()}
+    for fut in cf.as_completed(futures):
+        dest = futures[fut]
+        try:
+            res = fut.result()
+        except Exception as exc:                      # noqa: BLE001
+            res = f"CRASHED: {dest}: {type(exc).__name__}: {exc}"
+        say("  ", res)
         if not res.startswith("ok"):
             errors.append(res)
 
 if errors:
-    print("FAILURES:", errors, file=sys.stderr)
+    say("FAILURES: " + "; ".join(errors))
     sys.exit(1)
-print("MODELS_OK")
+say("MODELS_OK")
 PY
 }
 
 (
+    # This subshell outlives the script that spawned it: it keeps downloading
+    # behind the ready signal, while the foreground returns and its stdout -
+    # /var/log/provisioning.log - is closed underneath us. Everything printed
+    # after that moment went to a dead descriptor. On 2026-09-23 (instance
+    # 52224586) the write error propagated out of the thread pool and killed
+    # the deferred batch whole: three of the four files were already on disk,
+    # the VAE was the one still to fetch, and it left no bytes, no .part and no
+    # line anywhere - only the generic WARN below, because log() tees to a file
+    # it opens itself. The worker then served anima jobs it could not render.
+    # So own the destination rather than inheriting one, and make log() a plain
+    # append here so its tee does not write every line twice.
+    exec >>"$MODEL_LOG" 2>&1
+    log() { printf '[%s] provision: %s\n' "$(date '+%Y-%m-%d %H:%M:%S')" "$1"; }
     fetch_models "$COMFY_MODEL_LIST" || { log "[ERROR] model download failed"; exit 1; }
     : > "$MODELS_CRITICAL_MARK"
     if [ -n "$COMFY_MODEL_LIST_DEFERRED" ]; then
         log "[4/5] deferred models: downloading behind the ready signal"
-        if fetch_models "$COMFY_MODEL_LIST_DEFERRED"; then
+        # One retry: the failure mode worth retrying is a transient origin, and
+        # curl -C - resumes from whatever the first pass left in the .part.
+        if ! fetch_models "$COMFY_MODEL_LIST_DEFERRED"; then
+            log "[4/5] deferred models: retrying once"
+            sleep 5
+            fetch_models "$COMFY_MODEL_LIST_DEFERRED" || true
+        fi
+        missing=$(deferred_missing)
+        if [ -z "$missing" ]; then
+            : > "$DEFERRED_OK_MARK"
             log "[4/5] deferred models ready"
+            dc "[$WHO $(elapsed)] deferred models ready"
         else
-            # Not fatal: the endpoint is already serving, and a request for the
-            # feature these belong to is what would notice. Left in the log so
-            # a missing controlnet is read as this and not as a broken node.
-            log "[WARN] deferred model download failed; feature requests may hit missing files"
+            # Not fatal - the endpoint is already serving the features whose
+            # models did land. But it is not silent either: the file says which
+            # ones are missing, and the channel says it while someone can still
+            # act on it, instead of a request finding out hours later.
+            printf '%s\n' "$missing" > "$DEFERRED_FAIL_MARK"
+            log "[WARN] deferred models missing after retry: $missing"
+            dc "[$WHO $(elapsed)] :warning: deferred models MISSING: $missing"
+            dc_log 25
         fi
     fi
 ) &
