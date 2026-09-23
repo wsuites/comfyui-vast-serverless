@@ -39,11 +39,30 @@ FEAT_ANIMA=true            # Anima (ab_modelo.py A/B)               ~5.6 GB
 on() { [ "${1:-false}" = "true" ]; }
 
 # --- Models from R2.  "<key in the bucket>|<relative path inside models/>" ----
+#
+# TWO LISTS, and the split is what the cold-start budget rests on. MODELS is
+# what the endpoint cannot answer a single request without; MODELS_DEFERRED is
+# everything gated behind a feature flag, which no request uses until it asks
+# for that feature by name.
+#
+# Measured 2026-09-22 (run7, machine 151649, a healthy host): 23s renting, 193s
+# pulling the 14 GB image, 322s on ~22 GB of models - 564s to ready, against a
+# 600s budget. Both halves ran at ~70 MB/s, so nothing was stalling: the boot
+# was simply carrying 36 GB before answering anything. A host any slower than
+# that one misses the budget, and most of them are slower.
+#
+# Deferring the feature models takes the blocking set from ~22 GB to ~7.3 GB.
+# They keep downloading right after the endpoint reports ready, so the window
+# where a --pose or an anima request would find its file missing is the couple
+# of minutes after a cold start, and the node's own mid-request download is
+# still there as the floor under it.
 MODELS=(
   "comfy-stack/models/checkpoints/waiIllustriousSDXL_v170.safetensors|checkpoints/waiIllustriousSDXL_v170.safetensors"
   "comfy-stack/models/loras/stuffy_ai_style_ilxl_v2_goofy.safetensors|loras/stuffy_ai_style_ilxl_v2_goofy.safetensors"
 )
+MODELS_DEFERRED=()
 if on "$FEAT_FACE"; then
+  # 52 MB and on the default request path: not worth deferring.
   MODELS+=("comfy-stack/models/ultralytics/bbox/face_yolov8m.pt|ultralytics/bbox/face_yolov8m.pt")
 fi
 if on "$FEAT_UPSCALE"; then
@@ -53,7 +72,7 @@ if on "$FEAT_RMBG"; then
   # Mirrored on R2 to not depend on HuggingFace, which otherwise would
   # download them on the first request. The .py and config.json files are
   # mandatory: without them it does not load.
-  MODELS+=(
+  MODELS_DEFERRED+=(
     "comfy-stack/models/RMBG/BiRefNet/BiRefNet-general.safetensors|RMBG/BiRefNet/BiRefNet-general.safetensors"
     "comfy-stack/models/RMBG/BiRefNet/BiRefNet_config.py|RMBG/BiRefNet/BiRefNet_config.py"
     "comfy-stack/models/RMBG/BiRefNet/birefnet.py|RMBG/BiRefNet/birefnet.py"
@@ -64,7 +83,7 @@ fi
 if on "$FEAT_CONTROLNET"; then
   # Union: openpose, depth, canny... all in one model. The 'mesh' hands pass
   # uses it in depth mode, so it also needs it.
-  MODELS+=("comfy-stack/models/controlnet/controlnet-union-sdxl-1.0.safetensors|controlnet/controlnet-union-sdxl-1.0.safetensors")
+  MODELS_DEFERRED+=("comfy-stack/models/controlnet/controlnet-union-sdxl-1.0.safetensors|controlnet/controlnet-union-sdxl-1.0.safetensors")
 fi
 if on "$FEAT_ANIMA"; then
   # Anima is NOT an SDXL checkpoint: it is a 2B DiT (finetune of
@@ -80,7 +99,7 @@ if on "$FEAT_ANIMA"; then
   #
   # Mirror these to R2 first, same as BiRefNet, so provisioning does not
   # depend on HuggingFace. Source: circlestone-labs/Anima, split_files/.
-  MODELS+=(
+  MODELS_DEFERRED+=(
     "comfy-stack/models/diffusion_models/anima-aesthetic-v1.0.safetensors|diffusion_models/anima-aesthetic-v1.0.safetensors"
     "comfy-stack/models/text_encoders/qwen_3_06b_base.safetensors|text_encoders/qwen_3_06b_base.safetensors"
     "comfy-stack/models/vae/qwen_image_vae.safetensors|vae/qwen_image_vae.safetensors"
@@ -410,9 +429,22 @@ COMFY_MODEL_LIST=$(
         if [ -n "$k" ]; then echo "$k|$COMFY_DIR/$r"; fi
     done
 )
-export COMFY_MODEL_LIST
-(
-python3 - <<'PY' || { log "[ERROR] model download failed"; exit 1; }
+COMFY_MODEL_LIST_DEFERRED=$(
+    for e in "${MODELS_DEFERRED[@]:-}"; do
+        IFS='|' read -r k r <<< "$e"
+        if [ -n "$k" ]; then echo "$k|$MODELS_DIR/$r"; fi
+    done
+)
+export COMFY_MODEL_LIST COMFY_MODEL_LIST_DEFERRED
+# Written the moment the blocking set is on disk. The benchmark waits for this
+# file, not for the downloader to exit, so the deferred half keeps running past
+# the point where the endpoint starts serving.
+MODELS_CRITICAL_MARK="$COMFY_DIR/.critical_models_ok"
+rm -f "$MODELS_CRITICAL_MARK"
+
+# Same downloader for both passes; the list comes in through the environment.
+fetch_models() {
+    COMFY_MODEL_LIST="$1" python3 - <<'PY'
 import os, sys, subprocess, concurrent.futures as cf
 from pathlib import Path
 import boto3
@@ -579,6 +611,22 @@ if errors:
     sys.exit(1)
 print("MODELS_OK")
 PY
+}
+
+(
+    fetch_models "$COMFY_MODEL_LIST" || { log "[ERROR] model download failed"; exit 1; }
+    : > "$MODELS_CRITICAL_MARK"
+    if [ -n "$COMFY_MODEL_LIST_DEFERRED" ]; then
+        log "[4/5] deferred models: downloading behind the ready signal"
+        if fetch_models "$COMFY_MODEL_LIST_DEFERRED"; then
+            log "[4/5] deferred models ready"
+        else
+            # Not fatal: the endpoint is already serving, and a request for the
+            # feature these belong to is what would notice. Left in the log so
+            # a missing controlnet is read as this and not as a broken node.
+            log "[WARN] deferred model download failed; feature requests may hit missing files"
+        fi
+    fi
 ) &
 R2_PID=$!
 
@@ -647,14 +695,30 @@ for e in "${URL_FILES[@]:-}"; do
     URL_RELS+=("$rel")
 done
 
-# wait for the R2/python downloader (forked way above) before the benchmark
-wait "$R2_PID" || { log "[ERROR] model download failed"; exit 1; }
-
-URL_FAIL=0
-for i in "${!URL_PIDS[@]}"; do
-    wait "${URL_PIDS[$i]}" || { log "[ERROR] url download failed: ${URL_RELS[$i]}"; URL_FAIL=1; }
+# Wait for the BLOCKING half of the R2 downloader (forked way above). Waiting
+# on the pid would wait for the deferred half too, which is the whole thing
+# this is avoiding; the marker is the boundary. If the job dies before writing
+# it, the exit status is the real error and provisioning fails as it always
+# did.
+while [ ! -f "$MODELS_CRITICAL_MARK" ]; do
+    if ! kill -0 "$R2_PID" 2>/dev/null; then
+        wait "$R2_PID" || { log "[ERROR] model download failed"; exit 1; }
+        break
+    fi
+    sleep 3
 done
-[ "$URL_FAIL" = 0 ] || exit 1
+
+# The URL files are all behind --pose/--hands, so they are deferred on the same
+# reasoning as the R2 feature models: nothing that answers a plain request is
+# in here. They are not waited on, only reported, because a failure here costs
+# a slow first pose request (the node fetches from HuggingFace mid-request),
+# not a broken endpoint.
+# They are left running: url_fetch already logs its own success and failure per
+# file, so nothing is lost by not collecting the exit codes here, and a `wait`
+# is what would put them back on the critical path.
+if [ "${#URL_PIDS[@]}" -gt 0 ]; then
+    log "[4/5] ${#URL_PIDS[@]} url file(s) still downloading behind the ready signal"
+fi
 
 hito "[4/5] models ready"
 
