@@ -62,6 +62,10 @@ POLL_SECONDS = 5
 # healthy origin; past this the file is not coming and the caller deserves the
 # name of it rather than another minute of billing.
 MODEL_WAIT = 300.0
+# Cap on the rendered gallery on disk, oldest job dirs deleted first. The VPS
+# has ~12 GB free and nothing else reclaims this, so it is set here rather than
+# left to whoever remembers. 0 disables.
+RETENTION_GB = float(os.environ.get("WEB_RETENTION_GB", "5"))
 
 
 async def _vast_state() -> dict:
@@ -203,7 +207,58 @@ def _save_blobs(job: Job, blobs: list[tuple[str, bytes]]) -> list[str]:
         path = dest / f"{i:02d}{suffix}"
         path.write_bytes(blob)
         saved.append(f"/results/{job.id}/{path.name}")
+    _prune_output(keep=job.id)
     return saved
+
+
+def _prune_output(keep: str | None = None) -> int:
+    """Drop the oldest renders until the gallery fits under its cap.
+
+    This exists because the directory only ever grew. On a laptop that is a
+    slow annoyance; on the VPS it is 12 GB of free disk and a server that stops
+    serving when it runs out, so the bill for forgetting is the whole page.
+
+    Deleting files is enough on its own: ``_history()`` already drops entries
+    whose images are gone from disk, so the gallery heals on the next read and
+    there is no second list to keep in step. ``keep`` is the job being written
+    right now - it is the newest and would never be picked anyway, but a cap
+    set absurdly low should degrade to "keeps one" rather than to deleting the
+    render the caller is still waiting for.
+    """
+    cap = RETENTION_GB * 1024 ** 3
+    if cap <= 0:
+        return 0
+    dirs = []
+    total = 0
+    for d in OUT_DIR.iterdir():
+        if not d.is_dir():
+            continue                         # index.jsonl lives alongside them
+        size = sum(f.stat().st_size for f in d.rglob("*") if f.is_file())
+        dirs.append((d.stat().st_mtime, d, size))
+        total += size
+    if total <= cap:
+        return 0
+    freed = 0
+    for _, d, size in sorted(dirs):          # oldest first
+        if total <= cap:
+            break
+        if keep is not None and d.name == keep:
+            continue
+        try:
+            for f in sorted(d.rglob("*"), reverse=True):
+                f.unlink() if f.is_file() else f.rmdir()
+            d.rmdir()
+        except OSError as exc:               # a locked file is not fatal
+            print(f"retention: {d.name}: {exc}", file=sys.stderr)
+            continue
+        total -= size
+        freed += size
+    if freed:
+        # :g not :.0f - a 0.5 GB cap printing as "0 GB cap" reads as the value
+        # that means disabled, which is the opposite of what just happened.
+        print(f"retention: freed {freed / 1024 ** 3:.2f} GB "
+              f"under a {RETENTION_GB:g} GB cap", file=sys.stderr)
+    return freed
 
 
 async def _watch_infra(job: Job) -> None:
