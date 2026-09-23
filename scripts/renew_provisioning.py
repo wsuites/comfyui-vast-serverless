@@ -241,7 +241,16 @@ def main() -> int:
             "get_object", Params={"Bucket": bucket, "Key": BUCKET_KEY}, ExpiresIn=EXPIRES)
         print("presigned URL regenerated (expires in 7 days)")
     else:
-        url = f"{R2_PUBLIC_BASE}/{BUCKET_KEY}"
+        # The version tag is what makes an edit reach a machine that is already
+        # provisioned. Vast keeps one hash per provisioning phase under
+        # /.provisioner_state, and the script's hash is taken over its URL, not
+        # its body: at a fixed key an instance runs the version it downloaded
+        # the first time, through every restart, and still writes
+        # /.provisioning_complete. R2 ignores the unknown parameter and serves
+        # the same object; only the hash moves.
+        import hashlib
+        version = hashlib.sha256(data).hexdigest()[:12]
+        url = f"{R2_PUBLIC_BASE}/{BUCKET_KEY}?v={version}"
         # check that public access is still on before breaking the template.
         # Cloudflare returns 403 to urllib's default User-Agent, so we
         # impersonate curl, which is what the worker provisioner uses.
