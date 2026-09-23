@@ -64,6 +64,7 @@ class Comfy(BaseHTTPRequestHandler):
     seen: dict[str, str] = {}   # prompt fingerprint -> prompt id
     done: dict[str, dict] = {}
     cache_hits = 0
+    interrupts = 0
     lock = threading.Lock()
 
     def log_message(self, *a):  # silence the access log
@@ -104,6 +105,12 @@ class Comfy(BaseHTTPRequestHandler):
         return self._json({}, 404)
 
     def do_POST(self):
+        # Counted, not just accepted: the point of owning the dispatch is that
+        # a cancel reaches the sampler, and only a count can show it did.
+        if self.path.startswith("/interrupt"):
+            with Comfy.lock:
+                Comfy.interrupts += 1
+            return self._json({})
         if not self.path.startswith("/prompt"):
             return self._json({}, 404)
         n = int(self.headers.get("Content-Length") or 0)

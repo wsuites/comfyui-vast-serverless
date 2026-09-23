@@ -1,22 +1,27 @@
 #!/usr/bin/env python3
-"""Local API for the "mizuki" serverless endpoint.
+"""Local API for the web page, dispatching to workers we rent ourselves.
 
 Runs on your machine, never on the worker. It holds the Vast API key
-server-side so the browser never sees it, submits jobs through the same
-``/generate/sync`` route the CLI scripts use, and streams progress to the page
-over Server-Sent Events.
+server-side so the browser never sees it, and streams progress to the page over
+Server-Sent Events.
 
 This process serves JSON and rendered files only. The page itself is the Astro
 app in ``apps/web``, which proxies ``/api/**`` and ``/results/**`` here.
 
     python webapp/server.py            # the API; open the Astro port instead
 
-About progress: the pyworker only exposes ``/generate/sync`` and ``/health``
-(checked on a live instance, 2026-09-20). There is no per-step callback and
-ComfyUI's own port is not published, so a percent-complete bar is impossible
-without changing the template. What this serves instead is *phase* progress,
-which is where the time actually goes: a cold start is ~7 min and the render
-is ~18 s. Phases come from polling the Vast API for the worker's real state.
+Jobs no longer go through the Vast serverless endpoint. That router made one
+call carry both the work and the reservation, so a request that died in flight
+left its slot held by a worker doing nothing and every later request queued
+behind it - measured on five distinct machines. ``scripts/fleet.py`` owns the
+renting instead, and this process talks to ComfyUI's own HTTP API on the
+instance, which is what makes a cancel a real ``/interrupt`` and a dead client
+cost nothing.
+
+About progress: ComfyUI reports per-node, not per-step, so what this serves is
+*phase* progress, which is where the time actually goes - a cold start is
+minutes and the render is seconds. Phases come from the dispatch path itself
+plus polling the Vast API for the instance's real state.
 """
 
 from __future__ import annotations
@@ -36,19 +41,17 @@ from typing import Any
 ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(ROOT / "scripts"))
 
-import aiohttp
 import uvicorn
 from fastapi import FastAPI, HTTPException
 from fastapi.responses import FileResponse, StreamingResponse
 from pydantic import BaseModel, Field
-from vastai import Serverless
+
+import fleet
 
 from ab_modelo import ANIMA_UNET, ARMS
 from ab_modelo import build as build_arm_workflow
-from call_endpoint import RMBG_MODELS, build_workflow, resolve_api_key
-from config import ENDPOINT_NAME
-from vast_state import (describe, extract_image_urls, goes_backwards, instances,
-                        unstick, workers)
+from call_endpoint import RMBG_MODELS, build_workflow
+from vast_state import describe, goes_backwards, instances, workers
 from vast_state import reboot as _vast_reboot
 
 OUT_DIR = ROOT / "output" / "web"
@@ -180,23 +183,21 @@ def _history(limit: int = 200) -> list[dict]:
     return alive[::-1][:limit]
 
 
-async def _save_locally(job: Job, urls: list[str]) -> list[str]:
-    """Mirror results to disk. The R2 links are presigned and expire in 7 days."""
-    saved: list[str] = []
+def _save_blobs(job: Job, blobs: list[tuple[str, bytes]]) -> list[str]:
+    """Write what came straight off the worker.
+
+    Nothing round-trips through R2 on this path: the bytes were fetched from
+    ComfyUI's /view while we held the instance, so there is no presigned URL to
+    expire and no upload to fail after a successful render.
+    """
     dest = OUT_DIR / job.id
     dest.mkdir(parents=True, exist_ok=True)
-    async with aiohttp.ClientSession() as session:
-        for i, url in enumerate(urls):
-            try:
-                async with session.get(url, timeout=aiohttp.ClientTimeout(total=120)) as resp:
-                    resp.raise_for_status()
-                    blob = await resp.read()
-            except Exception as exc:                      # keep the remote URL
-                job.emit("saving", f"Could not mirror image {i + 1}: {exc}")
-                continue
-            path = dest / f"{i:02d}.png"
-            path.write_bytes(blob)
-            saved.append(f"/results/{job.id}/{path.name}")
+    saved: list[str] = []
+    for i, (name, blob) in enumerate(blobs):
+        suffix = Path(name).suffix or ".png"
+        path = dest / f"{i:02d}{suffix}"
+        path.write_bytes(blob)
+        saved.append(f"/results/{job.id}/{path.name}")
     return saved
 
 
@@ -251,54 +252,75 @@ async def _run_job(job: Job) -> None:
         **{k: v for k, v in job.params.items()
            if k not in ("cost", "timeout", "arm")},
     )
-    # Before anything else: a worker stranded on a full machine cannot be
-    # rescued by waiting, and the page would show "queued" for the whole
-    # timeout. Replacing it here turns a dead job into a cold start.
-    fix = await asyncio.to_thread(unstick)
-    if fix.get("acted"):
-        job.emit("renting", f"Replaced a stranded worker ({fix['reason']}) - "
-                            "renting another machine")
-
     watcher = asyncio.create_task(_watch_infra(job))
-    client = Serverless(api_key=resolve_api_key())
     raw: Any = None
+    url: str | None = None
     try:
         if job.kind == "arm":
             workflow = await asyncio.to_thread(_build_arm, job)
         else:
             workflow = await asyncio.to_thread(build_workflow, args)
-        payload = {"input": {"request_id": str(uuid.uuid4()), "workflow_json": workflow}}
 
-        endpoint = await client.get_endpoint(name=ENDPOINT_NAME)
+        # Demand and supply used to travel on the same call: a request to the
+        # serverless endpoint was both the job and the reservation for a slot,
+        # so a request that died in flight left the slot wedged and every later
+        # one queued behind a worker that was doing nothing. Renting is ours
+        # now. ``fleet.up`` covers the whole decision table the page can hit -
+        # an instance already serving, one merely stopped, none at all, and a
+        # machine that refuses the booking - and only returns once we have
+        # personally fetched /object_info off it, so a wedged host is rejected
+        # at rent time instead of ten minutes into a timeout.
+        job.emit("renting", "Bringing up a worker")
+        # boot_cap is left at fleet's own (FLEET_BOOT_CAP, the ten-minute cold
+        # start goal). The job's ``timeout`` is a render budget and is orders
+        # of magnitude smaller; passing it here would abandon every cold start.
+        inst = await asyncio.to_thread(fleet.up)
+        if not inst:
+            raise RuntimeError("Could not bring a worker up: no offer under "
+                               f"{fleet.DPH_CEILING:.3f}/h passed the probe")
+        # ``up`` hands back fleet's own state record, not a Vast instance dict:
+        # it has already resolved and probed the URL, and re-deriving it here
+        # would be a second, less informed guess at the same thing.
+        url = inst.get("url")
+        if not url:
+            raise RuntimeError(f"Worker {inst.get('instance')} is up but its "
+                               "ComfyUI port is not published")
+
+        # "generating", not "submitting": the stepper only moves forward, so
+        # emitting an earlier phase here is silently dropped and the page sits
+        # on "renting GPU" for the whole render.
+        job.emit("generating", f"Rendering on {inst.get('gpu')} "
+                               f"(instance {inst.get('instance')})")
         started = time.time()
-        raw = await endpoint.request(
-            "/generate/sync", payload,
-            cost=job.params["cost"], timeout=job.params["timeout"],
+        prompt_id = await asyncio.to_thread(fleet.submit, url, workflow, "web")
+        raw = await asyncio.to_thread(
+            fleet.wait_job, url, prompt_id, float(job.params["timeout"]),
         )
         job.latency = time.time() - started
 
-        urls = extract_image_urls(raw)
-        if not urls:
+        blobs = await asyncio.to_thread(fleet.images, url, raw)
+        if not blobs:
             raise RuntimeError(
-                "The worker replied but no image URL was found. Raw reply saved "
-                f"to output/web/{job.id}/raw.json"
+                "The worker finished but produced no image. History entry "
+                f"saved to output/web/{job.id}/raw.json"
             )
 
-        job.emit("saving", f"Downloading {len(urls)} image(s) from R2")
-        job.images = await _save_locally(job, urls) or urls
+        job.emit("saving", f"Writing {len(blobs)} image(s)")
+        job.images = _save_blobs(job, blobs)
         job.state = "done"
         job.emit("done", f"Finished in {job.latency:.1f}s")
     except asyncio.CancelledError:
-        # Cancelling stops *this* side of the wire. The request is already at
-        # the endpoint and ComfyUI has no interrupt route through the api
-        # wrapper, so the worker finishes the render and throws the pixels
-        # away; what is reclaimed is the slot in front of the operator, not
-        # the GPU minute. Say so rather than implying the machine stopped.
+        # Dispatching straight at ComfyUI means a cancel is a real cancel: the
+        # sampler has an /interrupt route, and nothing is holding a reservation
+        # that has to be abandoned. The GPU minute is genuinely reclaimed, so
+        # do not repeat the old message about the worker finishing anyway.
         job.state = "cancelled"
+        if url:
+            with suppress(Exception):
+                await asyncio.shield(asyncio.to_thread(fleet.interrupt, url))
         # Log against the phase it died in rather than inventing a new one: the
         # stepper should keep showing how far this render got.
-        job.emit(job.phase, "Cancelled - the worker may still be finishing "
-                            "this render, its result is discarded")
+        job.emit(job.phase, "Cancelled - the worker was interrupted")
         raise
     except Exception as exc:
         job.state = "error"
@@ -313,10 +335,9 @@ async def _run_job(job: Job) -> None:
             )
         except Exception:
             pass
-        # shield + suppress: this runs while a CancelledError is propagating,
-        # and closing the session must not be what leaks the aiohttp connector.
-        with suppress(Exception, asyncio.CancelledError):
-            await asyncio.shield(client.close())
+        # The instance is deliberately left running. It is ours for the hour we
+        # already bought, and the next request finds it warm instead of paying
+        # a cold start again; ``scripts/fleet.py down`` releases it.
         _remember(job)
 
 
@@ -477,11 +498,12 @@ async def list_jobs() -> dict:
 async def cancel_job(job_id: str) -> dict:
     """Stop waiting for a running job.
 
-    What this does and does not do: it cancels the coroutine awaiting
-    ``/generate/sync``, which frees the console and releases the compare chain.
-    It does not interrupt ComfyUI - the api wrapper exposes no route for that,
-    and the worker will finish the render it already started. So this buys back
-    attention, not GPU time.
+    This buys back GPU time, which it did not use to. While jobs went through
+    the serverless wrapper there was no interrupt route, so cancelling only
+    stopped us waiting and the worker finished the render anyway. Dispatching
+    at ComfyUI directly means the cancel reaches ``/interrupt`` and the sampler
+    stops. The instance is deliberately left running - we already bought the
+    hour, and the next request finds it warm.
     """
     job = JOBS.get(job_id)
     if job is None:
