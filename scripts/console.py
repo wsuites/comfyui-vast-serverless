@@ -1,12 +1,12 @@
 #!/usr/bin/env python3
-"""Terminal console for the "mizuki" serverless endpoint.
+"""Terminal console for the pyworker-vast worker.
 
 The same thing ``webapp/`` does, without a browser: submit a render, watch the
 worker come up phase by phase, and pull the images down to disk.
 
-    python scripts/mizuki.py gen "1girl, standing" --no-upscale
-    python scripts/mizuki.py status
-    python scripts/mizuki.py watch
+    python scripts/console.py gen "1girl, standing" --no-upscale
+    python scripts/console.py status
+    python scripts/console.py watch
 
 Why this exists next to ``call_endpoint.py``: that one fires a request and
 dumps the raw JSON, which is right for scripting but leaves you staring at a
@@ -62,7 +62,7 @@ class Progress:
     """One self-updating status line, plus a permanent line per phase change.
 
     Falls back to plain appended lines when stdout is not a terminal, so
-    ``mizuki.py gen ... > log.txt`` stays readable instead of filling up with
+    ``console.py gen ... > log.txt`` stays readable instead of filling up with
     carriage returns.
     """
 
@@ -333,7 +333,7 @@ async def cmd_unstick(args: argparse.Namespace) -> int:
 
 def parser() -> argparse.ArgumentParser:
     p = argparse.ArgumentParser(
-        prog="mizuki", description=__doc__.split("\n\n")[0],
+        prog="console", description=__doc__.split("\n\n")[0],
         formatter_class=argparse.RawDescriptionHelpFormatter)
     sub = p.add_subparsers(dest="cmd", required=True)
 
@@ -383,7 +383,7 @@ def main() -> int:
     if args.cmd == "gen" and not args.prompt:
         # build_workflow leaves the workflow's own prompt in place when this is
         # None, which silently renders something other than what was asked for.
-        print("a prompt is required: mizuki.py gen \"1girl, standing\"",
+        print("a prompt is required: console.py gen \"1girl, standing\"",
               file=sys.stderr)
         return 2
     try:

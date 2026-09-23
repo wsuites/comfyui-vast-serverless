@@ -11,7 +11,7 @@ function ensure(): HTMLDialogElement {
   if (dialog !== null) return dialog
   const node = $<HTMLDialogElement>('zoom')
   const picture = node.querySelector('img')
-  if (picture === null) throw new Error('mizuki console: #zoom has no <img>')
+  if (picture === null) throw new Error('autoscaler-vast console: #zoom has no <img>')
   img = picture
   info = el('div', { class: 'zoominfo', hidden: true })
   node.append(info)

@@ -436,7 +436,7 @@ class CompareRequest(BaseModel):
     timeout: float = 900.0
 
 
-app = FastAPI(title="mizuki console")
+app = FastAPI(title="autoscaler-vast console")
 
 
 @app.post("/api/jobs")
@@ -655,5 +655,5 @@ if __name__ == "__main__":
     port = int(os.environ.get("API_PORT", "8800"))
     if host not in ("127.0.0.1", "::1", "localhost"):
         sys.exit(f"API_HOST={host} is not a loopback address; refusing to bind.")
-    print(f"mizuki api -> http://{host}:{port}", file=sys.stderr)
+    print(f"autoscaler-vast api -> http://{host}:{port}", file=sys.stderr)
     uvicorn.run(app, host=host, port=port, log_level="warning")

@@ -269,7 +269,7 @@ one node added, nothing rewired.
 `call_endpoint.py` now inserts it as node `903` with `take_count` 6 by default
 (`--face-cap N`, `0` to lift it), largest first: the face that carries the frame
 is the big one, and the 290 twelve-pixel hits are exactly what burns the budget.
-The default applies to every caller, including the web and `mizuki.py`, which
+The default applies to every caller, including the web and `console.py`, which
 build their args namespace by hand.
 
 Rule: any per-detection loop needs a cap before it needs tuning. A detector

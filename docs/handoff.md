@@ -268,7 +268,7 @@ vastai show instances --raw | python -c "import sys,json;[print(i['id'],i['ssh_h
 ssh -i ~/.ssh/xcl -p <port> root@<ssh_host>
 
 # shell through the named tunnel instead (any instance, whichever Cloudflare picks)
-cloudflared access tcp --hostname mizuki-ssh.whitesu.dev --url localhost:2223
+cloudflared access tcp --hostname ssh-vast.whitesu.dev --url localhost:2223
 ssh -i ~/.ssh/xcl -p 2223 root@localhost
 
 # are the tunnels actually up
@@ -284,6 +284,13 @@ python scripts/renew_provisioning.py
 injected into every rental. They are masked on read, so they cannot be recovered from
 Vast: the S3 ones live in `.env` (gitignored) and the Cloudflare ones are re-derivable
 with `cloudflared tunnel token mizuki-ssh` / `mizuki-worker`.
+
+The tunnels are still *named* `mizuki-ssh` and `mizuki-worker`; only the
+hostnames they serve were renamed (2026-09-23). A tunnel's name and its
+hostname are independent, so both moved with one `cloudflared tunnel route dns`
+against the existing tunnel - no new tunnel, no new token, nothing to re-inject
+into the Vast account env. Renaming the tunnels themselves would mean new
+tokens in `CF_SSH_TOKEN` / `CF_WORKER_TOKEN`, which is why it was not done.
 
 ## Files
 
@@ -342,7 +349,7 @@ on a public R2 URL.
 
 | | worker | admin ssh |
 |---|---|---|
-| hostname | `mizuki-py.whitesu.dev` | `mizuki-ssh.whitesu.dev` |
+| hostname | `pyworker-vast.whitesu.dev` | `ssh-vast.whitesu.dev` |
 | token env var | `CF_WORKER_TOKEN` | `CF_SSH_TOKEN` |
 | local origin | `https://localhost:3000` | `ssh://localhost:22` |
 | purpose | the pyworker's *reported* url | shell on a firewalled host |
@@ -359,7 +366,7 @@ lie to the autoscaler, which is why it is opt-in, and it must be ordered **befor
 To use the admin one:
 
 ```bash
-cloudflared access tcp --hostname mizuki-ssh.whitesu.dev --url localhost:2223
+cloudflared access tcp --hostname ssh-vast.whitesu.dev --url localhost:2223
 ssh -i ~/.ssh/xcl -p 2223 root@localhost
 ```
 

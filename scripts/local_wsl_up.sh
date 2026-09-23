@@ -2,7 +2,7 @@
 # =============================================================================
 # local_wsl_up.sh - rebuild the local ComfyUI test rig on WSL2 + RTX 5070
 # =============================================================================
-# Reproduces, on this machine, the same image the "mizuki" serverless worker
+# Reproduces, on this machine, the same image the pyworker-vast worker
 # runs on Vast, so a workflow can be tested without renting a GPU.
 #
 # Run from WSL as root:

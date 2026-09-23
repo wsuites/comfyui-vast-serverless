@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-Client for the "mizuki" serverless endpoint.
+Client for the pyworker-vast worker.
 
 Sends wf.json (ComfyUI API format) to the worker via /generate/sync and saves
 the presigned URLs returned by the api-wrapper.
@@ -246,7 +246,7 @@ def build_workflow(args) -> dict:
     # Dropping the face pass: whatever consumed the FaceDetailer output reads
     # the raw VAEDecode instead. Done after the upscale pruning above so the
     # SaveImage link it may have just moved is repointed too.
-    # The cap defaults on for every caller, including the web and mizuki.py,
+    # The cap defaults on for every caller, including the web and console.py,
     # which build their args namespace by hand and never heard of the flag.
     cap = getattr(args, "face_cap", FACE_CAP_DEFAULT)
     if cap is None:

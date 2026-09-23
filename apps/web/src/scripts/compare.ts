@@ -25,7 +25,7 @@ const views: Record<string, Side> = {}
 
 function sideOf(side: string): Side {
   const found = views[side]
-  if (found === undefined) throw new Error(`mizuki console: side ${side} not built`)
+  if (found === undefined) throw new Error(`autoscaler-vast console: side ${side} not built`)
   return found
 }
 

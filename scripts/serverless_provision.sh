@@ -1,6 +1,6 @@
 #!/bin/bash
 # =============================================================================
-# serverless_provision.sh - provisioning for the "mizuki" serverless endpoint
+# serverless_provision.sh - provisioning for the pyworker-vast worker
 #
 # Runs via PROVISIONING_SCRIPT (the vastai/comfy image provisioner downloads
 # it and runs it BEFORE marking the worker ready). If this script exits with
@@ -213,13 +213,13 @@ dc() {
     python3 - "$DISCORD_WEBHOOK" "$1" <<'PY' >/dev/null 2>&1 || true
 import json, sys, urllib.request
 url, content = sys.argv[1], sys.argv[2][:1900]
-body = json.dumps({"content": content, "username": "mizuki-provision",
+body = json.dumps({"content": content, "username": "pyworker-vast-provision",
                    "allowed_mentions": {"parse": []}}).encode()
 try:
     urllib.request.urlopen(urllib.request.Request(
         url, data=body, headers={"Content-Type": "application/json",
                                  # without a proper User-Agent Discord returns 403
-                                 "User-Agent": "mizuki-provision/1.0"}), timeout=10).read()
+                                 "User-Agent": "pyworker-vast-provision/1.0"}), timeout=10).read()
 except Exception:
     pass
 PY
@@ -836,8 +836,8 @@ fi
 # example payload for the api-wrapper (useful for testing over SSH)
 if [ -d /opt/comfyui-api-wrapper/payloads ]; then
     printf '{"input": {"request_id": "", "workflow_json": %s}}\n' "$BENCH_JSON" \
-        > /opt/comfyui-api-wrapper/payloads/mizuki_smoke.json
-    log "smoke test payload at /opt/comfyui-api-wrapper/payloads/mizuki_smoke.json"
+        > /opt/comfyui-api-wrapper/payloads/pyworker_smoke.json
+    log "smoke test payload at /opt/comfyui-api-wrapper/payloads/pyworker_smoke.json"
 fi
 
 hito "=== PROVISIONING_OK ==="
@@ -858,13 +858,13 @@ send() {
     python3 - "$W" "$1" <<'PY' >/dev/null 2>&1 || true
 import json, sys, urllib.request
 url, content = sys.argv[1], sys.argv[2][:1900]
-body = json.dumps({"content": content, "username": "mizuki-worker",
+body = json.dumps({"content": content, "username": "pyworker-vast-worker",
                    "allowed_mentions": {"parse": []}}).encode()
 try:
     urllib.request.urlopen(urllib.request.Request(
         url, data=body, headers={"Content-Type": "application/json",
                                  # without a proper User-Agent Discord returns 403
-                                 "User-Agent": "mizuki-provision/1.0"}), timeout=10).read()
+                                 "User-Agent": "pyworker-vast-provision/1.0"}), timeout=10).read()
 except Exception:
     pass
 PY

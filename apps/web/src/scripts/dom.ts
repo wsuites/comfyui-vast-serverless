@@ -9,7 +9,7 @@
  */
 export function $<T extends HTMLElement = HTMLElement>(id: string): T {
   const node = document.getElementById(id)
-  if (node === null) throw new Error(`mizuki console: missing element #${id}`)
+  if (node === null) throw new Error(`autoscaler-vast console: missing element #${id}`)
   return node as T
 }
 

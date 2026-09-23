@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Live state of the serverless endpoint, as the Vast API really reports it.
 
-Shared by ``webapp/server.py`` and ``scripts/mizuki.py`` so the phase rules
+Shared by ``webapp/server.py`` and ``scripts/console.py`` so the phase rules
 live in exactly one place.
 
 Two views have to be merged, because neither is enough on its own:

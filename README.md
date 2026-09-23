@@ -270,13 +270,13 @@ One-time setup:
 
 ```powershell
 cloudflared tunnel login
-cloudflared tunnel create mizuki-worker
-cloudflared tunnel route dns mizuki-worker mizuki-py.<your-domain>
-cloudflared tunnel token mizuki-worker          # -> Vast account env var
+cloudflared tunnel create pyworker-vast
+cloudflared tunnel route dns pyworker-vast pyworker-vast.<your-domain>
+cloudflared tunnel token pyworker-vast          # -> Vast account env var
 vastai create env-var CF_WORKER_TOKEN <token>   # secret: NOT in the template
 ```
 
-Then `CF_WORKER_HOSTNAME=mizuki-py.<your-domain>` in `.env` (the hostname is not
+Then `CF_WORKER_HOSTNAME=pyworker-vast.<your-domain>` in `.env` (the hostname is not
 secret and travels in the template env; the token stays a masked account env
 var). With it empty the boot is byte-identical to before.
 
@@ -606,8 +606,8 @@ from its side the slot is occupied. The symptom is a request that sits queued
 until it times out, with no error anywhere.
 
 ```powershell
-python scripts/mizuki.py unstick --dry-run   # diagnose, spends nothing
-python scripts/mizuki.py unstick             # destroy it so a new one is rented
+python scripts/console.py unstick --dry-run   # diagnose, spends nothing
+python scripts/console.py unstick             # destroy it so a new one is rented
 ```
 
 `gen` and the web console run this check automatically before submitting
@@ -1410,8 +1410,8 @@ address rather than trusting the status fields). The fix is to destroy the
 worker so the autoscaler rents another machine:
 
 ```powershell
-python scripts/mizuki.py unstick --dry-run
-python scripts/mizuki.py unstick
+python scripts/console.py unstick --dry-run
+python scripts/console.py unstick
 ```
 
 Order of checks when it looks alive but serves nothing:
@@ -1512,7 +1512,7 @@ Two details that cost blood:
 
 - **Discord returns `403 Forbidden` to urllib's default User-Agent**
   (`Python-urllib/3.x`). You must send your own header:
-  `headers={"User-Agent": "mizuki-provision/1.0"}` -> `204`. Same pattern as
+  `headers={"User-Agent": "pyworker-vast-provision/1.0"}` -> `204`. Same pattern as
   Cloudflare/R2, where `curl/8.0` is used.
 - **The webhook must never be able to take down the provisioning.** The
   script runs with `set -euo pipefail`; all emitters end in `|| true` and

@@ -80,13 +80,13 @@ rm -f /tmp/.acc_probe
 # proxy (ssh -p <port> root@sshN.vast.ai) is the way to address a specific one.
 #
 # Client side (needs cloudflared locally):
-#   cloudflared access tcp --hostname mizuki-ssh.whitesu.dev --url localhost:2222
+#   cloudflared access tcp --hostname ssh-vast.whitesu.dev --url localhost:2222
 #   ssh -i ~/.ssh/xcl -p 2222 root@localhost
 (
 _dc() {
   [ -n "$DISCORD_WEBHOOK" ] || return 0
-  curl -fsSL -m 10 -H 'Content-Type: application/json' -A 'mizuki-tunnel/1.0' \
-    -d "{\"content\":\"$1\",\"username\":\"mizuki-tunnel\"}" \
+  curl -fsSL -m 10 -H 'Content-Type: application/json' -A 'pyworker-vast-tunnel/1.0' \
+    -d "{\"content\":\"$1\",\"username\":\"pyworker-vast-tunnel\"}" \
     "$DISCORD_WEBHOOK" >/dev/null 2>&1 || true
 }
 CF=/usr/local/bin/cloudflared
