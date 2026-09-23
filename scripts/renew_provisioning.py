@@ -60,14 +60,27 @@ export MODEL_LOG=/var/log/portal/comfyui.log;
     /opt/instance-tools/bin/boot_default.sh /etc/vast_boot.d/25-first-boot.sh
 rm -f /tmp/.acc_probe
 # --- admin SSH tunnel (hosts with filtered inbound ports) --------------------
-# Outbound cloudflared quick tunnel: needs no credentials (nothing secret may
-# live here: the template is readable) and bypasses host firewalls entirely,
-# since the connection goes OUT to Cloudflare. The URL is random per boot and
-# is reported to Discord; without DISCORD_WEBHOOK the tunnel still runs, just
-# unannounced. Best effort only: backgrounded with its own retry loop, it must
-# never block or break the boot.
+# Outbound cloudflared tunnel to sshd: bypasses host firewalls entirely, since
+# the connection goes OUT to Cloudflare. Best effort only - backgrounded with
+# its own retry loop, it must never block or break the boot.
+#
+# Two modes, same loop:
+#
+#   named  CF_SSH_TOKEN set. Stable hostname ($CF_SSH_HOSTNAME), no rate limit,
+#          nothing to announce - you know where it is before the box boots.
+#          The token is an account env var (masked in `vastai show env-vars`),
+#          never in this string: the template is readable.
+#   quick  no token. Cloudflare hands out a random *.trycloudflare.com url per
+#          boot, reported to Discord. Kept only so a machine rented without the
+#          env var is still reachable.
+#
+# Every instance runs the SAME named tunnel token, exactly as the worker one
+# does, so the hostname resolves to whichever connection Cloudflare picks. With
+# one box up that is the box; with several it is a coin toss, and the Vast ssh
+# proxy (ssh -p <port> root@sshN.vast.ai) is the way to address a specific one.
+#
 # Client side (needs cloudflared locally):
-#   cloudflared access tcp --hostname <host> --url localhost:2222
+#   cloudflared access tcp --hostname mizuki-ssh.whitesu.dev --url localhost:2222
 #   ssh -i ~/.ssh/xcl -p 2222 root@localhost
 (
 _dc() {
@@ -81,6 +94,13 @@ CF=/usr/local/bin/cloudflared
   https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-linux-amd64 \
   && chmod +x "$CF" || exit 0
 WHO="${VAST_CONTAINERLABEL:-$(hostname)}"
+if [ -n "${CF_SSH_TOKEN:-}" ]; then
+  MODE=named
+  READY='Registered tunnel connection'
+else
+  MODE=quick
+  READY='trycloudflare\.com'
+fi
 # Quick tunnels are handed out per source IP and rate limited. Retrying every
 # 15s asks for ~240 of them an hour from one address, and Cloudflare answers
 # "quick tunnel provisioning failed with status 429: error code: 1015" - so the
@@ -88,20 +108,32 @@ WHO="${VAST_CONTAINERLABEL:-$(hostname)}"
 # on instance 52224586, 2026-09-23: six hours of 15s retries, zero tunnels, and
 # a Discord channel with one DOWN line per attempt burying everything else.
 # Back off to 15 minutes, and say DOWN once per outage rather than per attempt.
+# A named tunnel has no such quota, but a dead origin still deserves the brake.
 BACKOFF=15
 DOWN_REPORTED=0
 while true; do
-  "$CF" tunnel --no-autoupdate --url ssh://localhost:22 > /tmp/cf-ssh.log 2>&1 &
+  if [ "$MODE" = named ]; then
+    "$CF" tunnel --no-autoupdate run --token "$CF_SSH_TOKEN" \
+      --url ssh://localhost:22 > /tmp/cf-ssh.log 2>&1 &
+  else
+    "$CF" tunnel --no-autoupdate --url ssh://localhost:22 > /tmp/cf-ssh.log 2>&1 &
+  fi
   CFPID=$!
-  URL=""
+  UP=""
   for _ in $(seq 1 60); do
     sleep 2
-    URL=$(grep -o 'https://[^ ]*\.trycloudflare\.com' /tmp/cf-ssh.log | head -1)
-    [ -n "$URL" ] && break
+    UP=$(grep -om1 "$READY" /tmp/cf-ssh.log)
+    [ -n "$UP" ] && break
     kill -0 $CFPID 2>/dev/null || break
   done
-  if [ -n "$URL" ]; then
-    _dc ":lock: **SSH tunnel UP** \`$WHO\` $URL || local: cloudflared access tcp --hostname ${URL#https://} --url localhost:2222 + ssh -p 2222 root@localhost"
+  if [ -n "$UP" ]; then
+    if [ "$MODE" = named ]; then
+      HOST="${CF_SSH_HOSTNAME:-(named tunnel)}"
+    else
+      HOST=$(grep -o 'https://[^ ]*\.trycloudflare\.com' /tmp/cf-ssh.log | head -1)
+      HOST="${HOST#https://}"
+    fi
+    _dc ":lock: **SSH tunnel UP** \`$WHO\` $HOST || local: cloudflared access tcp --hostname $HOST --url localhost:2222 + ssh -i ~/.ssh/xcl -p 2222 root@localhost"
     BACKOFF=15
     DOWN_REPORTED=0
   fi
@@ -110,7 +142,7 @@ while true; do
     # The reason lives in the tunnel's own log; without it a 1015 reads exactly
     # like a network blip and gets retried forever instead of waited out.
     WHY=$(grep -om1 'failed with status [0-9]*[^"]*' /tmp/cf-ssh.log | head -c 120)
-    _dc ":warning: SSH tunnel DOWN on \`$WHO\` ${WHY:-(no url)} - backing off, next report only when it changes"
+    _dc ":warning: SSH tunnel DOWN on \`$WHO\` ($MODE) ${WHY:-(no url)} - backing off, next report only when it changes"
     DOWN_REPORTED=1
   fi
   sleep "$BACKOFF"
@@ -289,6 +321,13 @@ def main() -> int:
     cf_env = f' -e CF_WORKER_HOSTNAME="{cf_host}"' if cf_host else ""
     print("worker tunnel:", f"hostname {cf_host}" if cf_host else "disabled",
           "(token must be a Vast account env var)")
+    # Same split for the admin SSH tunnel: hostname here, CF_SSH_TOKEN as an
+    # account env var. With the token unset the onstart falls back to a quick
+    # tunnel, so this is additive - no machine loses its door by upgrading.
+    ssh_host = config.ENV.get("CF_SSH_HOSTNAME", "").strip()
+    ssh_env = f' -e CF_SSH_HOSTNAME="{ssh_host}"' if ssh_host else ""
+    print("admin ssh tunnel:",
+          f"named, hostname {ssh_host}" if ssh_host else "quick tunnel")
     onstart = ONSTART
 
     template_env = (
@@ -300,6 +339,7 @@ def main() -> int:
         f'-e R2_PUBLIC_BASE="{R2_PUBLIC_BASE}" '
         f'-e PROVISIONING_SCRIPT="{url}"'
         f'{cf_env}'
+        f'{ssh_env}'
         f'{env_webhook}'
     )
 
