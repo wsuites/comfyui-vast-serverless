@@ -143,7 +143,12 @@ export class ApiClient {
    * than treated as an error.
    */
   async *stream(id: string, signal?: AbortSignal): AsyncGenerator<JobSnapshot> {
-    const init: RequestInit = { headers: { Accept: 'text/event-stream' } }
+    // The stream is a plain fetch rather than a `call`, so it has to ask for
+    // the credential itself; a remote API answers 401 and the watch dies one
+    // line after a submit that worked.
+    const init: RequestInit = {
+      headers: this.headers({ headers: { Accept: 'text/event-stream' } }),
+    }
     if (signal) init.signal = signal
 
     let res: Response
