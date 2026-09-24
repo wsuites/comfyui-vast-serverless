@@ -44,13 +44,27 @@ class Harness:
         fleet.LEASE_PATH = tmp / "fleet.lease"
         fleet.LEASE_TTL = 120.0
         fleet.IDLE_AFTER = 600.0
+        fleet.DESTROY_AFTER = 3600.0
         fleet.destroy = self._destroy
+        fleet.pause = self._pause
         fleet.over_ceiling = lambda inst: False
+        # Both accessors, and the binary under them. Production reads the
+        # fleet through ``instances_strict``; a stub that only covers the
+        # lenient alias does not fake the account, it falls through to the
+        # real one - which is how this suite spent a run listing live
+        # hardware and deciding a rented instance was not in its state file.
         vs.instances = lambda: self.insts
+        vs.instances_strict = lambda: self.insts
+        vs.vastai_bin = lambda: ""
         self.insts: list[dict] = []
+        self.stopped: list[str] = []
 
     def _destroy(self, iid, why: str = "") -> bool:
         self.destroyed.append(str(iid))
+        return True
+
+    def _pause(self, iid, why: str = "") -> bool:
+        self.stopped.append(str(iid))
         return True
 
     def account(self, *ids: str) -> None:
@@ -64,6 +78,7 @@ class Harness:
 
     def clear(self) -> None:
         self.destroyed = []
+        self.stopped = []
         fleet.lease_clear()
         fleet.save_state({})
 
@@ -74,15 +89,17 @@ def main() -> int:
     fails: list[str] = []
 
     def check(name: str, want_destroyed: list[str], want_released: bool = False,
-              result: dict | None = None) -> None:
+              result: dict | None = None, want_stopped: list[str] = []) -> None:
         got = sorted(h.destroyed)
-        ok = got == sorted(want_destroyed)
+        stopped = sorted(h.stopped)
+        ok = got == sorted(want_destroyed) and stopped == sorted(want_stopped)
         released = bool((result or {}).get("released"))
         ok = ok and released == want_released
         print(f"{'ok  ' if ok else 'FAIL'} {name}")
         if not ok:
             fails.append(name)
             print(f"       destroyed={got} want={sorted(want_destroyed)} "
+                  f"stopped={stopped} want={sorted(want_stopped)} "
                   f"released={released} want={want_released}")
 
     # --- the orphan path, which must keep working -----------------------------
@@ -131,8 +148,29 @@ def main() -> int:
     h.state(instance="52300001", url="http://x", ready_at=time.time() - 5000,
             last_job=time.time() - 5000)
     r = fleet.tick()
-    check("idle past IDLE_AFTER, no lease -> released", ["52300001"],
+    check("idle past IDLE_AFTER, no lease -> stopped, not destroyed", [],
+          want_stopped=["52300001"], result=r)
+    stopped_state = fleet.load_state()
+    ok = (stopped_state.get("stopped_at") and not stopped_state.get("url")
+          and stopped_state.get("instance") == "52300001")
+    print(f"{'ok  ' if ok else 'FAIL'} the stop leaves a record `up` can start "
+          f"again")
+    if not ok:
+        fails.append("stop leaves a startable record")
+
+    # The second stage. The GPU is already off; this is the disk bill ending.
+    h.clear()
+    h.account("52300001")
+    h.state(instance="52300001", stopped_at=time.time() - 5000)
+    r = fleet.tick()
+    check("stopped past DESTROY_AFTER -> destroyed", ["52300001"],
           want_released=True, result=r)
+
+    h.clear()
+    h.account("52300001")
+    h.state(instance="52300001", stopped_at=time.time() - 60)
+    r = fleet.tick()
+    check("stopped inside the window -> kept, disk and all", [], result=r)
 
     h.clear()
     h.account("52300001")
@@ -149,8 +187,8 @@ def main() -> int:
             last_job=time.time() - 5000)
     fleet.lease("52300001", ttl=-1)
     r = fleet.tick()
-    check("render lease expired with the process -> released", ["52300001"],
-          want_released=True, result=r)
+    check("render lease expired with the process -> stopped", [],
+          want_stopped=["52300001"], result=r)
 
     # --- releasing on purpose outranks any claim ------------------------------
     h.clear()
@@ -163,7 +201,7 @@ def main() -> int:
         fails.append("down() drops the lease")
 
     print()
-    total = 9
+    total = 12
     if fails:
         print(f"{total - len(fails)}/{total} lease cases passed")
         return 1

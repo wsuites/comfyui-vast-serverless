@@ -60,10 +60,19 @@ DPH_CEILING = float(ENV.get("FLEET_DPH_CEILING", "0.220"))
 # The goal is under ten minutes; this is the hard stop, not the target.
 BOOT_CAP = float(ENV.get("FLEET_BOOT_CAP", "600"))
 
-# A rented instance that has served nothing for this long is released. Vast
-# bills by the second while running, so the only thing standing between an
-# abandoned session and an overnight bill is this number.
+# Releasing is two-stage, because stopping and destroying cost different
+# things. A rented instance that has served nothing for this long is *stopped*:
+# the GPU bill ends on the second, the disk keeps the models, and ``up`` starts
+# it again in seconds instead of paying ten minutes to download them onto a
+# fresh host.
 IDLE_AFTER = float(ENV.get("FLEET_IDLE_AFTER", "600"))
+
+# A stopped instance is not free - Vast keeps billing the disk it is holding,
+# and the template asks for 26 GB. This is the point where the models on that
+# disk stop being worth the storage and the rental is given back for real. It
+# counts from the stop, so the full walk from the last render is
+# IDLE_AFTER + DESTROY_AFTER.
+DESTROY_AFTER = float(ENV.get("FLEET_DESTROY_AFTER", "3600"))
 
 POLL = 5.0
 PROBE_TIMEOUT = 6.0
@@ -376,6 +385,21 @@ def destroy(iid: Any, why: str = "") -> bool:
         log(f"  instance {iid} destroyed{(' - ' + why) if why else ''}")
     else:
         log(f"  could not destroy {iid}: {out.strip()[:200]}")
+    return ok
+
+
+def pause(iid: Any, why: str = "") -> bool:
+    """Stop an instance without giving up its disk.
+
+    The reversible half of releasing. A stopped instance stops billing the GPU
+    but keeps the volume, so ``up`` can start it again with the checkpoint
+    already on it - which is the whole reason the idle walk has two stages.
+    """
+    ok, out = cli("stop", "instance", str(iid), timeout=120)
+    if ok:
+        log(f"  instance {iid} stopped{(' - ' + why) if why else ''}")
+    else:
+        log(f"  could not stop {iid}: {out.strip()[:200]}")
     return ok
 
 
@@ -960,9 +984,34 @@ def tick() -> dict:
                     "leased": True}
         idle = time.time() - float(state.get("last_job") or state["ready_at"])
         if idle > IDLE_AFTER:
-            log(f"  idle for {idle:.0f}s; releasing the worker")
-            down("idle")
+            log(f"  idle for {idle:.0f}s; stopping the worker")
+            iid = state.get("instance")
+            if pause(iid, "idle"):
+                rec = {k: v for k, v in state.items()
+                       if k not in ("url", "ready_at")}
+                rec["stopped_at"] = time.time()
+                save_state(rec)
+                return {"worker": iid, "stopped": True}
+            # A refused stop leaves the GPU running and billing, which is the
+            # one outcome the idle walk exists to prevent. Fall through to the
+            # release that always works.
+            down("idle - stop refused")
             return {"worker": None, "released": True}
+        return {"worker": state.get("instance"), "url": state.get("url")}
+
+    if state.get("stopped_at"):
+        # Paused, not gone. The GPU is off; the disk is still billing, so this
+        # is the only clock left running and it ends in a real release.
+        if hold is not None:
+            return {"worker": state.get("instance"), "stopped": True,
+                    "leased": True}
+        held = time.time() - float(state["stopped_at"])
+        if held > DESTROY_AFTER:
+            log(f"  stopped for {held:.0f}s; destroying the worker")
+            down("idle past the destroy window")
+            return {"worker": None, "released": True}
+        return {"worker": state.get("instance"), "stopped": True}
+
     return {"worker": state.get("instance"), "url": state.get("url")}
 
 
@@ -986,7 +1035,8 @@ def daemon(interval: float = 30.0) -> int:
             "in .env, on THIS machine")
         return 1
     log(f"fleet daemon up: ceiling {DPH_CEILING:.3f}/h, boot cap {BOOT_CAP:.0f}s, "
-        f"idle release {IDLE_AFTER:.0f}s, cli {vs.vastai_bin()}")
+        f"idle stop {IDLE_AFTER:.0f}s, destroy {DESTROY_AFTER:.0f}s after "
+        f"that, cli {vs.vastai_bin()}")
     while True:
         try:
             tick()
@@ -1014,7 +1064,12 @@ def cmd_status() -> int:
               f"{'serving' if ready else 'not serving'}")
         print(f"  comfy: {url or 'port not published'}")
     if state.get("ready_at"):
-        print(f"  idle: {time.time() - float(state.get('last_job') or 0):.0f}s")
+        idle = time.time() - float(state.get("last_job") or 0)
+        print(f"  idle: {idle:.0f}s of {IDLE_AFTER:.0f}s before it stops")
+    elif state.get("stopped_at"):
+        held = time.time() - float(state["stopped_at"])
+        print(f"  stopped: {held:.0f}s of {DESTROY_AFTER:.0f}s before it is "
+              f"destroyed")
     pool = offers()
     print(f"{len(pool)} offers under {DPH_CEILING:.3f}/h")
     for o in pool[:5]:

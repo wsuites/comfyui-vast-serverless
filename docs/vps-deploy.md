@@ -1,7 +1,10 @@
 # Running the autoscaler on a VPS
 
 The reaper is the reason for this document. `scripts/fleet.py daemon` is what
-releases a rented GPU once it has been idle for `FLEET_IDLE_AFTER`, and on the
+stops a rented GPU once it has been idle for `FLEET_IDLE_AFTER` and destroys it
+`FLEET_DESTROY_AFTER` later — a stop ends the GPU bill and keeps the disk, so
+the next render starts in seconds instead of re-downloading the checkpoint; the
+destroy is the disk bill ending too. On the
 workstation it only ever ran while a terminal was open. A closed laptop, a
 Windows update, a crashed shell — each of those is a rental that keeps billing
 until somebody notices. Moving the four processes to a machine that does not
