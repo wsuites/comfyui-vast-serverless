@@ -1,0 +1,30 @@
+# The FastAPI process: job dispatch, progress, the gallery. It holds the Vast
+# API key, and webapp/server.py refuses to bind anything but a loopback
+# address for that reason - so nothing here exposes a port. Reaching it from
+# outside is cv-web's job, and only after Basic Auth.
+[Unit]
+Description=comfy-vast API (FastAPI, loopback only)
+Documentation=file://__ROOT__/docs/vps-deploy.md
+After=network-online.target
+Wants=network-online.target
+
+StartLimitIntervalSec=0
+
+[Service]
+Type=simple
+User=__USER__
+WorkingDirectory=__ROOT__
+# scripts/ is a library this imports, not a package it installs.
+Environment=PYTHONPATH=__ROOT__/scripts
+Environment=PYTHONUNBUFFERED=1
+Environment=PYTHONIOENCODING=utf-8
+# Everything else - the key, the bucket, the ports, the retention cap - comes
+# from .env, which webapp/server.py reads through scripts/config.py. No
+# EnvironmentFile: one source of configuration, and systemd is not it.
+ExecStart=__ROOT__/.venv/bin/python webapp/server.py
+Restart=always
+RestartSec=5
+# A crash loop here is a bug, not a reason to give up on the box.
+
+[Install]
+WantedBy=multi-user.target

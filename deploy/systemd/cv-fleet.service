@@ -1,0 +1,31 @@
+# The reaper. tick() every 30s: it destroys instances the state file does not
+# know about, and releases the worker once FLEET_IDLE_AFTER passes with no job.
+#
+# This is the process the whole VPS migration exists for. On the workstation it
+# only ran while a terminal was open, which is the same as saying that closing
+# the laptop lid rented a GPU until someone noticed. Here it starts at boot and
+# restarts on crash, and it is the only thing standing between an interrupted
+# render and a 24/7 bill.
+[Unit]
+Description=comfy-vast fleet reaper (releases idle GPU workers)
+Documentation=file://__ROOT__/docs/vps-deploy.md
+After=network-online.target
+Wants=network-online.target
+
+StartLimitIntervalSec=0
+
+[Service]
+Type=simple
+User=__USER__
+WorkingDirectory=__ROOT__
+Environment=PYTHONPATH=__ROOT__/scripts
+Environment=PYTHONUNBUFFERED=1
+ExecStart=__ROOT__/.venv/bin/python scripts/fleet.py daemon --interval 30
+Restart=always
+RestartSec=10
+# Deliberately no ExecStop that releases the worker: a restart of this unit
+# would then destroy a rental that is mid-render. Money is released by the
+# idle rule and by the lease expiring, both of which survive a restart.
+
+[Install]
+WantedBy=multi-user.target

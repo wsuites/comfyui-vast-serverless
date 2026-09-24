@@ -1,0 +1,22 @@
+# The Astro site: the only process on this box that a browser talks to, and
+# the only one that asks for a password. Started through cv-web.sh because the
+# built server reads its configuration from the process environment and must
+# be handed a deliberate subset of .env - see that script.
+[Unit]
+Description=comfy-vast web UI (Astro standalone, loopback only)
+Documentation=file://__ROOT__/docs/vps-deploy.md
+After=network-online.target cv-api.service
+Wants=network-online.target cv-api.service
+
+StartLimitIntervalSec=0
+
+[Service]
+Type=simple
+User=__USER__
+WorkingDirectory=__ROOT__
+ExecStart=__ROOT__/deploy/systemd/cv-web.sh
+Restart=always
+RestartSec=5
+
+[Install]
+WantedBy=multi-user.target

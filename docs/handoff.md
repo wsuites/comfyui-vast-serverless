@@ -300,12 +300,14 @@ tokens in `CF_SSH_TOKEN` / `CF_WORKER_TOKEN`, which is why it was not done.
 | `scripts/fleet_loop.py` | the 5-cycle harness and the run summary table |
 | `scripts/vast_state.py` | merges Vast's instance and worker views for the page |
 | `scripts/paused_probe.py` | isolates the stopped -> running case |
-| `scripts/test_*.py` | the three offline suites |
+| `scripts/test_*.py` | the five offline suites |
 | `webapp/server.py` | local API for the page; dispatches through `fleet.py` |
 | `apps/web/src/scripts/progress.ts` | `PHASES` — the stepper's forward-only order |
 | `logs/fleet_loop.jsonl` | per-cycle rows; also the input to `measured_seconds()` |
 | `scripts/serverless_provision.sh` | what a rented box runs; uploaded to R2, not read from here |
 | `scripts/renew_provisioning.py` | uploads that script and rewrites template 549464 + the onstart |
+| `deploy/systemd/` | the four units that run all of this on a VPS, as templates |
+| `docs/vps-deploy.md` | installing them, and what breaks if two hosts run the reaper |
 | `docs/levers-and-dead-ends.md` | what is already ruled out, with evidence |
 
 ## If you change the ranking

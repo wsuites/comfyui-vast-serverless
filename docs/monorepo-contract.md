@@ -12,6 +12,7 @@ comfy-vast/
 ├─ packages/cli/         @comfy-vast/cli  — `cv`, the unified toolchain
 ├─ webapp/server.py      FastAPI, API only, loopback only
 ├─ scripts/              Python engine (workflows, Vast state, rendering)
+├─ deploy/systemd/       unit templates; the VPS deployment, see docs/vps-deploy.md
 └─ workflows/ docs/ output/
 ```
 

@@ -1,0 +1,24 @@
+# cloudflared, the only thing here that listens to the internet - outbound,
+# so no port is open on this host. Named tunnel: the hostname is stable and
+# survives a restart, unlike the quick tunnels the CLI uses on the
+# workstation. Requires the tunnel and its credentials to exist already; see
+# the Cloudflare section of docs/vps-deploy.md.
+[Unit]
+Description=comfy-vast cloudflared tunnel
+Documentation=file://__ROOT__/docs/vps-deploy.md
+After=network-online.target cv-web.service
+Wants=network-online.target cv-web.service
+
+StartLimitIntervalSec=0
+
+[Service]
+Type=notify
+User=__USER__
+ExecStart=/usr/local/bin/cloudflared --no-autoupdate --config __HOME__/.cloudflared/config.yml tunnel run
+Restart=always
+RestartSec=5
+# cloudflared reconnects on its own; this is for the case where it exits.
+TimeoutStartSec=0
+
+[Install]
+WantedBy=multi-user.target

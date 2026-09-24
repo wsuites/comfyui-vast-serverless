@@ -1,0 +1,4 @@
+# These run on Linux and are edited on Windows. A CRLF shebang fails there
+# with "no such file or directory", naming the interpreter that does exist.
+*.sh            text eol=lf
+*.service       text eol=lf
