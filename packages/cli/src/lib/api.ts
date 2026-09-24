@@ -4,8 +4,11 @@ import { CliError, EXIT } from './errors.ts'
 /**
  * Client for the FastAPI process in `webapp/server.py`.
  *
- * Per the monorepo contract that server binds loopback only, so this always
- * talks to API_HOST:API_PORT directly rather than through Astro.
+ * Per the monorepo contract that server binds loopback only, so on the machine
+ * that runs it this talks to API_HOST:API_PORT directly rather than through
+ * Astro. When `API_ORIGIN` is set the server is on another machine and its
+ * loopback is not ours: the address is then the public one, which fronts *that*
+ * machine's Astro, and the request carries that deployment's Basic credential.
  */
 export interface JobSnapshot {
   id: string
@@ -26,22 +29,48 @@ export interface JobSnapshot {
   created: number
 }
 
+/** The address this CLI reaches the API on: remote origin first, else loopback. */
+export function apiBase(cfg: Config): string {
+  if (cfg.apiOrigin) return cfg.apiOrigin
+  const host = cfg.apiHost.includes(':') ? `[${cfg.apiHost}]` : cfg.apiHost
+  return `http://${host}:${cfg.apiPort}`
+}
+
+/** The Basic header for a remote origin, or null when talking to loopback. */
+export function apiAuthHeader(cfg: Config): string | null {
+  if (!cfg.apiOrigin || !cfg.apiOriginUser || !cfg.apiOriginPass) return null
+  const raw = `${cfg.apiOriginUser}:${cfg.apiOriginPass}`
+  return `Basic ${Buffer.from(raw).toString('base64')}`
+}
+
 export class ApiClient {
   readonly base: string
+  private readonly remote: boolean
+  private readonly auth: string | null
 
   constructor(cfg: Config) {
-    const host = cfg.apiHost.includes(':') ? `[${cfg.apiHost}]` : cfg.apiHost
-    this.base = `http://${host}:${cfg.apiPort}`
+    this.base = apiBase(cfg)
+    this.remote = Boolean(cfg.apiOrigin)
+    this.auth = apiAuthHeader(cfg)
+  }
+
+  /** `init.headers` with the upstream credential added, when there is one. */
+  private headers(init?: RequestInit): Headers {
+    const h = new Headers(init?.headers)
+    if (this.auth) h.set('authorization', this.auth)
+    return h
   }
 
   private async call<T>(path: string, init?: RequestInit): Promise<T> {
     let res: Response
     try {
-      res = await fetch(this.base + path, init)
+      res = await fetch(this.base + path, { ...init, headers: this.headers(init) })
     } catch (e) {
       throw new CliError(`The API at ${this.base} is not answering.`, {
         code: EXIT.UPSTREAM,
-        hint: 'Start it with `cv web up`, or `python webapp/server.py` on its own.',
+        hint: this.remote
+          ? 'That host serves it; check its cv-api and cv-tunnel units, not this machine.'
+          : 'Start it with `cv web up`, or `python webapp/server.py` on its own.',
         details: e instanceof Error ? e.message : e,
       })
     }
@@ -66,7 +95,10 @@ export class ApiClient {
     const ac = new AbortController()
     const timer = setTimeout(() => ac.abort(), timeoutMs)
     try {
-      const res = await fetch(this.base + '/api/jobs', { signal: ac.signal })
+      const res = await fetch(this.base + '/api/jobs', {
+        signal: ac.signal,
+        headers: this.headers(),
+      })
       return res.ok
     } catch {
       return false

@@ -11,6 +11,7 @@ export const SECRET_KEYS = new Set([
   'S3_SECRET_ACCESS_KEY',
   'DISCORD_WEBHOOK',
   'WEBAPP_PASS',
+  'API_ORIGIN_PASS',
 ])
 
 export interface Config {
@@ -36,6 +37,10 @@ export interface Config {
 
   apiHost: string
   apiPort: number
+  /** Absolute origin of a remote API, replacing the loopback pair. */
+  apiOrigin: string
+  apiOriginUser: string
+  apiOriginPass: string
   webHost: string
   webPort: number
   webappAuth: boolean
@@ -101,6 +106,9 @@ export function loadConfig(): Config {
 
     apiHost: str(raw, 'API_HOST', '127.0.0.1'),
     apiPort: int(raw, 'API_PORT', 8800),
+    apiOrigin: str(raw, 'API_ORIGIN').trim().replace(/\/+$/, ''),
+    apiOriginUser: str(raw, 'API_ORIGIN_USER').trim(),
+    apiOriginPass: str(raw, 'API_ORIGIN_PASS'),
     webHost: str(raw, 'WEB_HOST', '127.0.0.1'),
     webPort: int(raw, 'WEB_PORT', 4321),
     webappAuth: authOn(raw),
@@ -154,6 +162,19 @@ export function validateConfig(cfg: Config): Finding[] {
   }
   if (cfg.apiHost !== '127.0.0.1' && cfg.apiHost !== 'localhost' && cfg.apiHost !== '::1') {
     add('error', 'API_HOST', `${cfg.apiHost} is not loopback; the contract binds FastAPI to loopback only`)
+  }
+
+  if (cfg.apiOrigin) {
+    if (!/^https?:\/\/[^/]+$/.test(cfg.apiOrigin)) {
+      add('error', 'API_ORIGIN', `${cfg.apiOrigin} is not a bare origin; it must be scheme://host[:port] with no path`)
+    } else if (cfg.apiOrigin.startsWith('http://') && !/^http:\/\/(127\.0\.0\.1|localhost|\[::1\])(:|$)/.test(cfg.apiOrigin)) {
+      add('warn', 'API_ORIGIN', 'plain http to a non-loopback host sends the Basic credential in the clear')
+    } else {
+      add('ok', 'API_ORIGIN', `the API lives on ${cfg.apiOrigin}, not on this machine`)
+    }
+    if (!cfg.apiOriginUser || !cfg.apiOriginPass) {
+      add('warn', 'API_ORIGIN_USER', 'no credential for the remote origin; it will answer 401 to every request')
+    }
   }
 
   if (cfg.webappAuth && !cfg.webappPass) {

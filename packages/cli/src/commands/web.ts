@@ -8,6 +8,7 @@ import { askYesNo } from '../lib/confirm.ts'
 import { CliError, EXIT } from '../lib/errors.ts'
 import { c, err, isTTY, json, out } from '../lib/output.ts'
 import { ROOT } from '../lib/paths.ts'
+import { apiBase } from '../lib/api.ts'
 import { common, ctx, int, type CommonOptions } from '../lib/program.ts'
 import { startApi, stopChild, type ApiProcess } from '../web/apiserver.ts'
 import { astroBuildExists, requireBuild, serverEnv, startAstro, type EmbeddedSite } from '../web/astro.ts'
@@ -151,10 +152,21 @@ export function webCommand(): Command {
       }
 
       try {
+        if (cfg.apiOrigin && o.api !== false) {
+          // Two machines, one Vast account. The API holds VAST_API_KEY and can
+          // rent, so starting a local one next to a remote origin puts a second
+          // spender on the account while the page talks to neither reliably.
+          throw new CliError(`API_ORIGIN points at ${cfg.apiOrigin}, so this machine must not run its own API.`, {
+            code: EXIT.CONFIG,
+            hint: 'Run `cv web up --no-api`, or clear API_ORIGIN in .env to go back to the local stack.',
+          })
+        }
         if (o.api !== false) {
           api = await startApi(cfg)
+        } else if (cfg.apiOrigin) {
+          err(c.dim(`api   remote; ${cfg.apiOrigin}`))
         } else {
-          err(c.dim(`api   skipped; expecting one on http://${cfg.apiHost}:${cfg.apiPort}`))
+          err(c.dim(`api   skipped; expecting one on ${apiBase(cfg)}`))
         }
 
         let url: string
@@ -176,7 +188,7 @@ export function webCommand(): Command {
         if (asJson) {
           json({
             local: url,
-            api: api?.base ?? `http://${cfg.apiHost}:${cfg.apiPort}`,
+            api: api?.base ?? apiBase(cfg),
             tunnel: tunnel?.url ?? null,
             auth: cfg.webappAuth ? { user: cfg.webappUser, pass: password } : null,
             mode: o.dev ? 'dev' : 'standalone',
@@ -184,7 +196,7 @@ export function webCommand(): Command {
         } else {
           out('')
           out(`  ${c.dim('local ')} ${c.bold(url)}`)
-          out(`  ${c.dim('api   ')} ${api?.base ?? `http://${cfg.apiHost}:${cfg.apiPort}`}`)
+          out(`  ${c.dim('api   ')} ${api?.base ?? apiBase(cfg)}${cfg.apiOrigin ? c.dim(' (remote)') : ''}`)
           if (tunnel?.url) {
             out(`  ${c.dim('public')} ${c.bold(c.green(tunnel.url))}`)
             if (cfg.webappAuth) {
@@ -220,14 +232,14 @@ export function webCommand(): Command {
       const built = astroBuildExists()
 
       const state = {
-        api: { url: `http://${cfg.apiHost}:${cfg.apiPort}`, running: apiUp },
+        api: { url: apiBase(cfg), running: apiUp, remote: Boolean(cfg.apiOrigin) },
         web: { url: `http://${cfg.webHost}:${cfg.webPort}`, built },
         auth: { enabled: cfg.webappAuth, user: cfg.webappUser, password_set: Boolean(cfg.webappPass) },
         tunnel: { bin: cfg.cloudflaredBin, named: cfg.cfTunnelName || null, hostname: cfg.cfTunnelHostname || null },
       }
       if (asJson) return json(state)
 
-      out(`${apiUp ? c.green('up  ') : c.dim('down')}  api  ${state.api.url}`)
+      out(`${apiUp ? c.green('up  ') : c.dim('down')}  api  ${state.api.url}${cfg.apiOrigin ? c.dim(' (remote)') : ''}`)
       out(`${built ? c.green('built') : c.red('missing')}  web  ${state.web.url}`)
       if (!built) out(c.dim('       build it with: pnpm web:build'))
       out(

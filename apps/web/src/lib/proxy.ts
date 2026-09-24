@@ -42,9 +42,32 @@ const DROPPED_FROM_RESPONSE = new Set([
 ])
 
 export function upstreamBase(): string {
+  // An absolute origin wins over the loopback pair, and is the only way a page
+  // running on one machine drives the API on another: the workstation serves
+  // the UI, the VPS owns the fleet. It points at the *public* hostname, which
+  // fronts that machine's own Astro, not its FastAPI — the API is loopback-only
+  // there by contract and nothing about that changes here.
+  const origin = (process.env.API_ORIGIN || '').trim()
+  if (origin) return origin.replace(/\/+$/, '')
   const host = process.env.API_HOST || '127.0.0.1'
   const port = process.env.API_PORT || '8800'
   return `http://${host}:${port}`
+}
+
+/**
+ * The credential for a remote upstream, or null for the loopback one.
+ *
+ * A remote origin answers 401 before it answers anything else, so the page
+ * would prompt for a password it cannot forward: the browser is authenticated
+ * against *this* server, and that header is dropped one hop earlier on purpose.
+ * These are the far machine's credentials, read from `.env` here and never
+ * shown to the browser.
+ */
+export function upstreamAuth(): string | null {
+  const user = (process.env.API_ORIGIN_USER || '').trim()
+  const pass = process.env.API_ORIGIN_PASS || ''
+  if (!user || !pass) return null
+  return `Basic ${Buffer.from(`${user}:${pass}`).toString('base64')}`
 }
 
 /** Prefixes owned by FastAPI. Everything else is an Astro route. */
@@ -66,6 +89,10 @@ export async function proxy(request: Request, url: URL): Promise<Response> {
   for (const [name, value] of request.headers) {
     if (!DROPPED_FROM_REQUEST.has(name.toLowerCase())) headers.append(name, value)
   }
+  // Set after the copy, so it replaces this hop's credential rather than
+  // arriving alongside it.
+  const credential = upstreamAuth()
+  if (credential) headers.set('authorization', credential)
 
   // `duplex: 'half'` is required by the fetch spec to send a streaming body and
   // is what keeps an upload from being buffered into memory first.
@@ -90,10 +117,13 @@ export async function proxy(request: Request, url: URL): Promise<Response> {
     // The client hung up mid-flight: nothing left to answer.
     if (request.signal.aborted) return new Response(null, { status: 499 })
     const reason = error instanceof Error ? error.message : String(error)
+    const hint = process.env.API_ORIGIN
+      ? 'Check that host is up and that its tunnel is running; this page only '
+        + 'displays what it serves.'
+      : 'Start it with: python webapp/server.py'
     return new Response(
       JSON.stringify({
-        detail: `Cannot reach the API at ${upstreamBase()}: ${reason}. `
-          + 'Start it with: python webapp/server.py',
+        detail: `Cannot reach the API at ${upstreamBase()}: ${reason}. ${hint}`,
       }),
       { status: 502, headers: { 'content-type': 'application/json' } },
     )

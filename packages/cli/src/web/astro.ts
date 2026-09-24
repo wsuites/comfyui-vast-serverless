@@ -49,6 +49,12 @@ export function serverEnv(cfg: Config): Record<string, string> {
     PORT: String(cfg.webPort),
     API_HOST: cfg.apiHost,
     API_PORT: String(cfg.apiPort),
+    // Empty is the loopback case, and an empty string is how the proxy spells
+    // "not set": these are always written, so a stale value from the parent
+    // shell cannot outlive a `.env` that no longer has one.
+    API_ORIGIN: cfg.apiOrigin,
+    API_ORIGIN_USER: cfg.apiOriginUser,
+    API_ORIGIN_PASS: cfg.apiOriginPass,
     WEBAPP_AUTH: cfg.webappAuth ? 'on' : 'off',
     WEBAPP_USER: cfg.webappUser,
     WEBAPP_PASS: cfg.webappPass,

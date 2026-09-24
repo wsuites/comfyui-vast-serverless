@@ -1,5 +1,7 @@
 import { Command } from 'commander'
 
+import { apiBase } from '../lib/api.ts'
+
 import { SECRET_KEYS, galleryRoot, loadConfig, validateConfig } from '../lib/config.ts'
 import { EXIT } from '../lib/errors.ts'
 import { c, json, mask, out, printTable } from '../lib/output.ts'
@@ -45,7 +47,7 @@ export function configCommand(): Command {
         image: cfg.imageTag ? `${cfg.image}:${cfg.imageTag}` : cfg.image,
         disk_space: String(cfg.diskSpace),
         search_params: cfg.searchParams,
-        api: `http://${cfg.apiHost}:${cfg.apiPort}`,
+        api: apiBase(cfg),
         web: `http://${cfg.webHost}:${cfg.webPort}`,
         web_auth: cfg.webappAuth ? `on, user ${cfg.webappUser}` : 'off',
         web_password: cfg.webappPass ? reveal('WEBAPP_PASS', cfg.webappPass) : '(empty)',

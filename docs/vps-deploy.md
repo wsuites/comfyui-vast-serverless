@@ -163,6 +163,12 @@ take effect.
 | `cv-fleet` | `scripts/config.py`, at import | restart |
 | `cv-web` | `deploy/systemd/cv-web.sh`, at every start | restart |
 | the build | `astro.config.mjs`, at build time | rebuild, for `WEB_HOST`/`WEB_PORT` |
+| a workstation `cv web up` | `packages/cli/src/lib/config.ts`, then `serverEnv()` | restart the command |
+
+The last row is the one that catches people: the embedded Astro server never
+reads `.env` at all. The CLI resolves the configuration and hands over an
+explicit set of variables, so a key that is not listed in `serverEnv()` is a
+key the page cannot see no matter how correct `.env` is.
 
 No `EnvironmentFile=` anywhere. systemd is not a second place to configure
 this, and a copy of the values under `/etc` would drift from `.env` silently —
@@ -376,3 +382,43 @@ Cloudflare Access goes in front of that hostname and the Basic Auth stays
 behind it. Two prompts is the intent, not an oversight: Access is the one that
 can be revoked per device and per email, and Basic Auth is the one that still
 holds if the hostname is ever reached another way.
+
+## Phase 3.5 — driving it from the workstation
+
+The VPS owns the fleet. The workstation can still serve the page, as a client
+of that API rather than a second copy of the stack:
+
+```sh
+# workstation .env
+API_ORIGIN=https://autoscaler-vast.<your-domain>
+API_ORIGIN_USER=admin
+API_ORIGIN_PASS=<the VPS WEBAPP_PASS>
+```
+
+```sh
+pnpm build && pnpm web:build
+cv web up --no-api
+```
+
+`API_ORIGIN` is a bare origin — scheme, host, optional port, no path — and it
+points at the *public* hostname, which fronts the VPS's Astro, not its
+FastAPI. That is not a detour: the API is loopback-only there by contract and
+nothing about this mode changes that. The request goes browser → local Astro →
+tunnel → VPS Astro → VPS FastAPI, and every hop but the last is the one that
+was already there.
+
+Three consequences worth knowing before the first surprise:
+
+* The browser authenticates against the *local* page (`WEBAPP_*`, and with
+  `WEBAPP_AUTH=off` on loopback, not at all). `API_ORIGIN_USER`/`_PASS` are
+  the VPS's credentials, attached by the local server after it drops the
+  browser's own `Authorization` header. The two never mix, and the remote
+  credential is never sent to the browser.
+* `cv web up` refuses to start without `--no-api` while `API_ORIGIN` is set.
+  A local `webapp/server.py` holds `VAST_API_KEY` and can rent, so running one
+  next to the remote API puts a second spender on the same account — the same
+  failure as trap 1, arriving by a different door.
+* `cv job`, `cv doctor` and `cv web status` follow `API_ORIGIN` too, so they
+  report on the VPS's fleet rather than on a local API that is not running.
+
+Clearing `API_ORIGIN` puts everything back to the all-in-one local stack.
