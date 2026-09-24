@@ -51,6 +51,9 @@ class Layout:
         self.cli = self.bindir / EXE
         if cli_beside:
             self.cli.write_text("#!/bin/sh\n")
+            # `shutil.which` skips a file it cannot execute, so the PATH case
+            # only means anything with the bit set. Windows ignores it.
+            self.cli.chmod(0o755)
 
     @property
     def interpreter(self) -> str:
