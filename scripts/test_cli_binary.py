@@ -97,6 +97,97 @@ def check(name: str, got, want) -> bool:
     return ok
 
 
+# --- the second door: a CLI that is found, runs, and is not logged in -------
+
+AUTH_CASES = 15
+NL = chr(10)
+Q = chr(34)
+
+
+def fake_cli(tmp: Path, body: str) -> str:
+    """A `vastai` that is present, runs, and answers `body` on stdout."""
+    d = tmp / "fakebin"
+    d.mkdir(parents=True, exist_ok=True)
+    py = d / "vastai_fake.py"
+    py.write_text("import sys" + NL + "sys.stdout.write(%r)" % body + NL)
+    exe = d / ("vastai.cmd" if WIN else "vastai")
+    if WIN:
+        exe.write_text("@echo off" + NL
+                       + Q + sys.executable + Q + " " + Q + str(py) + Q + " %*" + NL)
+    else:
+        exe.write_text("#!/bin/sh" + NL
+                       + "exec " + sys.executable + " " + str(py) + NL)
+        exe.chmod(0o755)
+    return str(exe)
+
+
+def auth_cases() -> list[str]:
+    """An unauthenticated CLI must never read back as an empty account.
+
+    This is the bug that `vastai_bin` already documents, arriving the other
+    way round. There the binary was missing; here it is present and perfect
+    and has no API key, so Vast answers every account-level call with a 403
+    wrapped in a 200-shaped body. Both end as `[]`, and `[]` is what a reaper
+    reads as "nothing to release".
+    """
+    fails: list[str] = []
+    denied = '{"error": true, "status_code": 403, "msg": "This action requires login."}'
+    with tempfile.TemporaryDirectory() as td:
+        tmp = Path(td)
+        saved = vs.ENV.get("VASTAI_BIN")
+        for name, body, want_ok in (
+            ("a 403 is not an empty fleet", denied, False),
+            ("an empty account still reads empty", "[]", True),
+            ("a real listing reads through", '[{"id": 1, "label": "x"}]', True),
+        ):
+            vs.ENV["VASTAI_BIN"] = fake_cli(tmp / name.replace(" ", "_"), body)
+            vs.vastai_bin.cache_clear()
+            ok, why = vs.authenticated()
+            if ok is not want_ok:
+                fails.append(f"{name}: authenticated() said {ok!r} ({why})")
+            try:
+                got = vs.instances_strict()
+                blind = False
+            except vs.VastBlind:
+                blind = True
+                got = []
+            if blind is want_ok:
+                fails.append(f"{name}: instances_strict() blind={blind!r}")
+            # The lenient accessor keeps its old shape for the status displays.
+            if not isinstance(vs.instances(), list):
+                fails.append(f"{name}: instances() stopped returning a list")
+            # And the reaper's eye must refuse rather than report an empty deck.
+            try:
+                fleet.ours()
+                reaped_blind = False
+            except vs.VastBlind:
+                reaped_blind = True
+            except Exception:
+                reaped_blind = True
+            if reaped_blind is want_ok:
+                fails.append(f"{name}: fleet.ours() blind={reaped_blind!r}")
+        # A daemon that cannot read the account exits instead of idling.
+        vs.ENV["VASTAI_BIN"] = fake_cli(tmp / "daemon", denied)
+        vs.vastai_bin.cache_clear()
+        if fleet.daemon(interval=0.01) != 1:
+            fails.append("the daemon runs blind when the CLI is not logged in")
+        # And a template lookup says so instead of killing its host process.
+        try:
+            fleet.template()
+            fails.append("template() returned on an unreadable account")
+        except SystemExit:
+            fails.append("template() still raises SystemExit - it runs in the API")
+        except Exception as exc:
+            if "authenticated" not in str(exc):
+                fails.append(f"template() blamed the wrong thing: {exc}")
+        if saved is None:
+            vs.ENV.pop("VASTAI_BIN", None)
+        else:
+            vs.ENV["VASTAI_BIN"] = saved
+        vs.vastai_bin.cache_clear()
+    return fails
+
+
 def main() -> int:
     fails: list[str] = []
 
@@ -150,7 +241,9 @@ def main() -> int:
         finally:
             vs.vastai_bin = saved  # type: ignore[assignment]
 
-    total = 10
+    fails.extend(auth_cases())
+
+    total = 10 + AUTH_CASES
     if fails:
         print(f"\n{total - len(fails)}/{total} CLI binary cases passed")
         return 1

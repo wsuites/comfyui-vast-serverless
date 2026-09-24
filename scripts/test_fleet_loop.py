@@ -285,6 +285,11 @@ def install(v):
     fleet.load_state = lambda: ({} if not v.insts
                                 else {"instance": list(v.insts)[-1]})
     vs.instances = v.instances
+    # Production reads the fleet through the strict accessor - a failed listing
+    # must not arrive anywhere as an empty one - so that is the seam the fake
+    # has to stand in, not just the lenient alias beside it.
+    vs.instances_strict = v.instances
+    vs.authenticated = lambda: (True, "")
     # Real-time constants scaled to the fake hardware.
     fleet.POLL = 0.05
     fleet.STATUS_GRACE = 0.6

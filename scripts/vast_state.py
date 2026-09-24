@@ -96,29 +96,104 @@ def vastai_bin() -> str:
     return shutil.which("vastai") or ""
 
 
-def _vastai(*args: str, timeout: int = 30) -> Any:
-    """Run a --raw Vast CLI call and parse it. None on any failure.
+class VastBlind(RuntimeError):
+    """A Vast call failed, as opposed to a Vast call that found nothing.
 
-    Never raises: every caller here is a status display, and a status display
-    that crashes is worse than one that says "unknown".
+    That difference is the whole ballgame for anything that spends money. An
+    empty list means "no GPU is rented"; a failure means "I cannot see". They
+    are indistinguishable to a caller that only gets a list back, and reading
+    the second as the first is how a reaper sits idle beside a billing
+    instance - the failure this module already documents for a missing binary,
+    arriving through a second door.
+    """
+
+
+def _vastai_call(*args: str, timeout: int = 30) -> tuple[Any, str]:
+    """Run a ``--raw`` call. ``(parsed, "")`` on success, ``(None, why)`` on
+    failure. ``why`` is non-empty on every failure and never on a success.
+
+    Three ways to fail, and only the first two look like failures. The binary
+    can be missing; the call can blow up or time out; or Vast can answer, with
+    exit status 0 and a body that parses perfectly, saying it did not do it:
+
+        {"error": true, "status_code": 403, "msg": "This action requires login."}
+
+    A CLI with no API key returns that for every account-level call. It is not
+    an empty fleet, and the only thing separating the two is this check.
     """
     binary = vastai_bin()
     if not binary:
-        return None
+        return None, ("vastai not found beside the interpreter, on PATH, or "
+                      "in VASTAI_BIN")
     try:
         proc = subprocess.run(
             [binary, *args, "--raw"],
             capture_output=True, text=True, timeout=timeout,
+            stdin=subprocess.DEVNULL,
         )
-        return json.loads(proc.stdout)
-    except Exception:
-        return None
+    except Exception as exc:  # noqa: BLE001
+        return None, f"{type(exc).__name__}: {exc}"
+    try:
+        data = json.loads(proc.stdout)
+    except ValueError:
+        detail = (proc.stderr or proc.stdout or "no output").strip()
+        return None, f"unreadable answer: {detail[:200]}"
+    if isinstance(data, dict) and data.get("error"):
+        return None, f"{data.get('status_code', '?')} {data.get('msg') or data['error']}"
+    return data, ""
+
+
+def _vastai(*args: str, timeout: int = 30) -> Any:
+    """Run a --raw Vast CLI call and parse it. None on any failure.
+
+    Never raises: every caller of *this* helper is a status display, and a
+    status display that crashes is worse than one that says "unknown".
+    Anything deciding whether to spend or release money wants the strict
+    accessors below instead.
+    """
+    data, _ = _vastai_call(*args, timeout=timeout)
+    return data
 
 
 def instances() -> list[dict]:
-    """Current instances. [] on any failure."""
-    data = _vastai("show", "instances")
-    return data if isinstance(data, list) else []
+    """Current instances. [] on any failure - display use only.
+
+    Derived from the strict accessor rather than fetching separately, so the
+    two cannot drift and there is exactly one place to intercept - which is
+    also the one place a test harness has to stand in.
+    """
+    try:
+        return instances_strict()
+    except VastBlind:
+        return []
+
+
+def instances_strict() -> list[dict]:
+    """Current instances, or ``VastBlind`` when we could not find out.
+
+    For the reaper and anything else whose wrong answer costs money by the
+    hour: an exception stops a tick and lands in the journal, where an empty
+    list stops nothing and says nothing.
+    """
+    data, why = _vastai_call("show", "instances")
+    if why:
+        raise VastBlind(f"cannot list instances - {why}")
+    if not isinstance(data, list):
+        raise VastBlind("cannot list instances - unexpected answer: "
+                        f"{type(data).__name__}")
+    return data
+
+
+def authenticated() -> tuple[bool, str]:
+    """Whether the CLI can act on the account: ``(ok, why-not)``.
+
+    Searching offers needs no credentials, so a CLI that cheerfully lists five
+    machines under the ceiling can still be unable to see, rent, or destroy a
+    single instance. `fleet.py status` printing offers therefore proves
+    nothing about the account. Probe the call that needs the key.
+    """
+    _, why = _vastai_call("show", "instances")
+    return (not why), why
 
 
 def workers() -> list[dict]:

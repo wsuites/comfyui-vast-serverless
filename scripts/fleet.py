@@ -102,6 +102,15 @@ LEASE_PATH = ROOT / "logs" / "fleet.lease"
 LEASE_TTL = float(ENV.get("FLEET_LEASE_TTL", "120"))
 
 
+class FleetError(RuntimeError):
+    """A fleet operation could not be carried out.
+
+    An ordinary exception on purpose. This module is imported by the API
+    process as well as run as a script, so anything it raises has to be
+    catchable by a request handler; a ``SystemExit`` here ends the server.
+    """
+
+
 def log(msg: str) -> None:
     print(f"[{time.strftime('%H:%M:%S')}] {msg}", flush=True)
 
@@ -158,10 +167,30 @@ def template() -> dict:
     configures - one source of truth for the image, onstart and environment."""
     data = cli_json("search", "templates", f"creator_id={CREATOR_ID}")
     items = data.get("templates", data) if isinstance(data, dict) else data
-    for t in items or []:
-        if t.get("id") == TEMPLATE_ID:
+    # An error body is a dict, and iterating a dict yields its keys - strings,
+    # which have no .get - so a refused call used to die here as an
+    # AttributeError about the wrong subject entirely.
+    if not isinstance(items, list):
+        items = []
+    for t in items:
+        if isinstance(t, dict) and t.get("id") == TEMPLATE_ID:
             return t
-    raise SystemExit(f"template {TEMPLATE_ID} not found for creator {CREATOR_ID}")
+    # Not SystemExit. This runs inside a request on the API process as well as
+    # in the CLI, and SystemExit is a BaseException: it walks straight past the
+    # job's error handling and out through uvicorn, taking the server with it.
+    # systemd restarts it, the in-memory job table dies, every open SSE stream
+    # closes, and the page freezes on the last frame it was sent - which looks
+    # like a worker that is taking a long time rather than a crash.
+    #
+    # Reaching this line usually means the CLI cannot read the account rather
+    # than that the template is gone: an unauthenticated `search templates`
+    # returns no templates at all, and every id is then "not found".
+    ok, why = vs.authenticated()
+    if not ok:
+        raise FleetError(f"cannot read templates - the Vast CLI is not "
+                         f"authenticated on this machine ({why})")
+    raise FleetError(
+        f"template {TEMPLATE_ID} not found for creator {CREATOR_ID}")
 
 
 def rent_env(tmpl: dict) -> str:
@@ -319,13 +348,23 @@ def ours() -> list[dict]:
     Matched by label rather than by the state file, so an instance orphaned by
     a crash between ``create`` and the first state write is still found and
     released instead of billing quietly forever.
+
+    Strict on purpose: a listing we could not obtain must not arrive here
+    looking like an account with nothing in it. Raising stops the tick and
+    writes the reason to the journal; returning [] would tell the reaper its
+    work is done.
     """
-    return [i for i in vs.instances() if (i.get("label") or "") == LABEL]
+    return [i for i in vs.instances_strict() if (i.get("label") or "") == LABEL]
 
 
 def find(iid: Any) -> dict | None:
+    """The instance with this id, or None when it is genuinely not there.
+
+    Strict for the same reason as ``ours``: callers read None as "gone", and
+    an instance that is merely invisible is still spending.
+    """
     iid = str(iid)
-    for i in vs.instances():
+    for i in vs.instances_strict():
         if str(i.get("id")) == iid:
             return i
     return None
@@ -935,6 +974,16 @@ def daemon(interval: float = 30.0) -> int:
     if not vs.vastai_bin():
         log("vastai CLI not found - refusing to run blind. Install it in the "
             "venv this process runs from, or set VASTAI_BIN in .env")
+        return 1
+    # Finding the binary was only half the question. An unauthenticated CLI is
+    # blind in exactly the same way and costs exactly the same money: it lists
+    # offers all day, because searching needs no key, while every call that
+    # names the account answers 403 and reads back as an empty fleet.
+    authed, why = vs.authenticated()
+    if not authed:
+        log(f"vastai CLI cannot read the account - refusing to run blind ({why}). "
+            "Put the key in ~/.config/vastai/vast_api_key, or set VAST_API_KEY "
+            "in .env, on THIS machine")
         return 1
     log(f"fleet daemon up: ceiling {DPH_CEILING:.3f}/h, boot cap {BOOT_CAP:.0f}s, "
         f"idle release {IDLE_AFTER:.0f}s, cli {vs.vastai_bin()}")

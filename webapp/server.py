@@ -447,6 +447,19 @@ async def _run_job(job: Job) -> None:
         job.state = "error"
         job.error = f"{type(exc).__name__}: {exc}"
         job.emit("error", job.error)
+    except BaseException as exc:                    # noqa: BLE001
+        # A job must not be able to end the process. `SystemExit` was the one
+        # that got through: raised deep in a config lookup, carried out of the
+        # worker thread by ``to_thread``, past the handler above because it is
+        # not an ``Exception``, and out through uvicorn. The server died, the
+        # job table died with it, and the page - whose stream had just closed -
+        # sat on "Bringing up a worker" with a stopped clock. A crash that
+        # renders as patience is the expensive kind.
+        job.state = "error"
+        job.error = f"{type(exc).__name__}: {exc}"
+        job.emit("error", job.error)
+        if isinstance(exc, (KeyboardInterrupt, asyncio.CancelledError)):
+            raise
     finally:
         watcher.cancel()
         try:
