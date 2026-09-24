@@ -142,6 +142,10 @@ systemctl is-active  cv-api cv-web cv-fleet      # active x3
 journalctl -u cv-fleet -b | head
 ```
 
+`cv-tunnel` reads `disabled` here until phase 3; that is the install script
+doing what it was told, not a failed unit. Give the box a hundred seconds
+before the first reconnect and do not loop on it — see trap 7.
+
 An honest version of this test rents something first: `fleet.py up`, reboot,
 then watch `journalctl -u cv-fleet -b` reap it once the idle window passes.
 That costs one boot of GPU time and is worth it, because a reaper that does
@@ -235,6 +239,39 @@ arrived over scp is.
 `output/web`, oldest job directories first, and `_prune_output()` runs after
 every save. If the box gets tighter, lower that number; `cv-api` reads it from
 `.env` at start.
+
+### 7. The SSH lockout renews itself while you poll it
+
+The provider's image ships an iptables firewall, not `fail2ban` — there is no
+`fail2ban-client` on this box, so nothing answers `unbanip` and there is no jail
+to inspect. Port 22 goes through the `SSHBRUTE` chain:
+
+```
+-A INPUT -p tcp --dport 22 --tcp-flags FIN,SYN,RST,ACK SYN -m conntrack --ctstate NEW -j SSHBRUTE
+-A SSHBRUTE -m recent --set    --name SSH --rsource
+-A SSHBRUTE -m recent --update --seconds 300 --hitcount 10 --name SSH --rsource -j DROP
+-A SSHBRUTE -j ACCEPT
+```
+
+Ten new connections in five minutes and the source is dropped. The trap is
+`--update`: it refreshes the timestamp on every matching packet, so a script
+that polls port 22 waiting for the block to lift is the thing keeping it up.
+Fourteen polls, ninety seconds apart, held it open for over an hour here.
+
+Two rules follow from that. Connect with `-o IdentitiesOnly=yes -i <key>`, or
+the agent offers every key it holds and one login burns several attempts. And
+when you are locked out, wait a full five minutes without sending anything —
+polling is not free, it is the ban.
+
+The state is a kernel list, not a config file, and root can edit it directly:
+
+```sh
+grep 201.245.250.253 /proc/net/xt_recent/SSH    # is this address held
+echo -201.245.250.253 > /proc/net/xt_recent/SSH # release it
+```
+
+A reboot clears both lists. The same mechanism guards ICMP under
+`/proc/net/xt_recent/ICMP`, which is why a ping flood stops answering.
 
 ## Operating it
 
