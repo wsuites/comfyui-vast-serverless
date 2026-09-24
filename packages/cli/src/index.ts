@@ -37,7 +37,7 @@ Examples:
   cv instance search --limit 5           offers matching VAST_SEARCH_PARAMS
   cv endpoint scale --max 1 --cold 0     stop paying between renders
   cv gen "1girl, standing" --discord     render and post each image as it lands
-  cv job submit "1girl" --no-upscale     the same pipeline through the local API
+  cv job submit "1girl" --upscale        the same pipeline through the local API
   cv web up --tunnel                     the browser UI, published
 
 Every command takes --json. Configuration comes from .env at the repository root.

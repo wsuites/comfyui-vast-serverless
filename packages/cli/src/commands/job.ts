@@ -122,7 +122,7 @@ export function jobCommand(): Command {
       if (!params['prompt']) {
         throw new CliError('A prompt is required.', {
           code: EXIT.USAGE,
-          hint: 'cv job submit "1girl, standing" --no-upscale',
+          hint: 'cv job submit "1girl, standing" --upscale',
         })
       }
 

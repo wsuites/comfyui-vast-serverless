@@ -27,7 +27,7 @@ export interface GenCliOptions {
   family?: string
   animaModel?: string
   lora?: number
-  noFace?: boolean
+  face?: boolean
   faceCap?: number
   detailPrompt?: string
   detailNegative?: string
@@ -54,11 +54,13 @@ export function genOptions(cmd: Command): Command {
     .option('--family <name>', `model family: ${['wai', 'anima'].join(' | ')}`)
     .option('--anima-model <file>', 'UNET file, with --family anima')
     .option('--lora <strength>', 'style LoRA strength, wai only; 0 removes the node', (v) => float(v, '--lora'))
-    .option('--no-face', 'skip the FaceDetailer pass')
+    .option('--face', 'run the FaceDetailer pass; off unless asked for')
+    .option('--no-face', 'skip the face pass - the default, kept so the old spelling still parses')
     .option('--face-cap <n>', 'repaint at most n faces, largest first; 0 lifts the cap', (v) => int(v, '--face-cap'))
     .option('--detail-prompt <text>', 'prompt the face pass repaints with (wf.json ships "red eyes")')
     .option('--detail-negative <text>', 'negative for the face pass')
-    .option('--no-upscale', 'skip the upscale pass')
+    .option('--upscale', 'run the upscale pass; off unless asked for')
+    .option('--no-upscale', 'skip the upscale pass - the default, kept so the old spelling still parses')
     .option('--remove-bg <model>', `background removal: ${RMBG_MODELS.join(' | ')}`)
     .option('--bg-refine', 'refine the matte edge; better on hair, slower')
     .option('--bg-sensitivity <x>', 'background matte sensitivity', (v) => float(v, '--bg-sensitivity'))
@@ -81,8 +83,11 @@ export function validateGenOptions(o: GenCliOptions): string[] {
 /**
  * Turn CLI options into the argv `scripts/call_endpoint.py` expects.
  *
- * Commander turns `--no-face` into `face: false`, so the negated flags are
- * translated back rather than passed through.
+ * The two expensive passes are opt-in: absent means off, so the negation is
+ * emitted unless `--upscale`/`--face` asked for it. Sent on every call rather
+ * than left out, because the wire format is still `no_upscale`/`no_face` and
+ * the workflow's own default is the opposite of this one. Saying it every time
+ * is what keeps the answer from depending on which end is asked.
  */
 export function callEndpointArgs(o: GenCliOptions, prompt: string | undefined): string[] {
   const args: string[] = []
@@ -113,8 +118,8 @@ export function callEndpointArgs(o: GenCliOptions, prompt: string | undefined): 
   push('--timeout', o.timeout)
   push('--workflow', o.workflow)
 
-  if (o.upscale === false) args.push('--no-upscale')
-  if (o.noFace === true || (o as { face?: boolean }).face === false) args.push('--no-face')
+  if (o.upscale !== true) args.push('--no-upscale')
+  if (o.face !== true) args.push('--no-face')
   if (o.bgRefine) args.push('--bg-refine')
 
   return args
@@ -148,8 +153,8 @@ export function jobParamsFromOptions(o: GenCliOptions, prompt: string | undefine
   set('cost', o.cost)
   set('timeout', o.timeout)
 
-  if (o.upscale === false) p['no_upscale'] = true
-  if (o.noFace === true || (o as { face?: boolean }).face === false) p['no_face'] = true
+  p['no_upscale'] = o.upscale !== true
+  p['no_face'] = o.face !== true
   if (o.bgRefine) p['bg_refine'] = true
 
   return p

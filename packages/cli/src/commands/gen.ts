@@ -218,8 +218,8 @@ export function genCommand(): Command {
         family: o.family ?? 'wai',
         lora: o.lora ?? null,
         remove_bg: o.removeBg ?? null,
-        no_upscale: o.upscale === false,
-        no_face: o.noFace === true || (o as { face?: boolean }).face === false,
+        no_upscale: o.upscale !== true,
+        no_face: o.face !== true,
         face_cap: o.faceCap ?? null,
       }
 
