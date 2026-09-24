@@ -27,6 +27,7 @@ from pathlib import Path
 HERE = Path(__file__).parent
 SCRIPT = HERE / "serverless_provision.sh"
 import config
+import vast_state
 # Bucket Public Development URL (R2 -> Settings -> Public Development URL).
 # Permanent and without query string, unlike a presigned one.
 BUCKET_KEY = config.var("R2_PROVISION_KEY")
@@ -233,7 +234,10 @@ SEARCH_PARAMS = config.var("VAST_SEARCH_PARAMS")
 
 
 def vastai(*args: str) -> str:
-    proc = subprocess.run(["vastai", *args], capture_output=True, text=True,
+    # Resolved, not looked up on PATH: see vast_state.vastai_bin.
+    binary = vast_state.vastai_bin() or sys.exit(
+        "vastai not found beside the interpreter, on PATH, or in VASTAI_BIN")
+    proc = subprocess.run([binary, *args], capture_output=True, text=True,
                           env={**os.environ, "PYTHONIOENCODING": "utf-8"})
     if proc.returncode != 0:
         sys.exit(f"`vastai {' '.join(args)}` failed:\n{proc.stdout}\n{proc.stderr}")

@@ -64,7 +64,8 @@ def container_log(iid: str, tail: int = 300) -> str:
     """
     try:
         proc = subprocess.run(
-            ["vastai", "logs", str(iid), "--tail", str(tail)],
+            [fleet.vs.vastai_bin() or "vastai",
+             "logs", str(iid), "--tail", str(tail)],
             capture_output=True,
             timeout=120,
             env={**os.environ, "PYTHONIOENCODING": "utf-8"},

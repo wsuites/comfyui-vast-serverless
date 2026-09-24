@@ -110,9 +110,13 @@ def log(msg: str) -> None:
 
 def cli(*args: str, timeout: int = 90) -> tuple[bool, str]:
     """A mutating Vast CLI call. Never inherits stdin - see vast_state."""
+    binary = vs.vastai_bin()
+    if not binary:
+        return False, ("vastai not found beside the interpreter, on PATH, or "
+                       "in VASTAI_BIN")
     try:
         proc = subprocess.run(
-            ["vastai", *args],
+            [binary, *args],
             capture_output=True, text=True, timeout=timeout,
             stdin=subprocess.DEVNULL,
             env={**os.environ, "PYTHONIOENCODING": "utf-8"},
@@ -924,8 +928,16 @@ def tick() -> dict:
 
 
 def daemon(interval: float = 30.0) -> int:
+    # Refuse to supervise an account we cannot see. Without the CLI every call
+    # reads as an empty fleet, so the reaper runs forever, logs nothing, and
+    # reaps nothing while the GPU bills. Exiting turns that into a restart
+    # loop in `journalctl -u cv-fleet`, which is the one place someone looks.
+    if not vs.vastai_bin():
+        log("vastai CLI not found - refusing to run blind. Install it in the "
+            "venv this process runs from, or set VASTAI_BIN in .env")
+        return 1
     log(f"fleet daemon up: ceiling {DPH_CEILING:.3f}/h, boot cap {BOOT_CAP:.0f}s, "
-        f"idle release {IDLE_AFTER:.0f}s")
+        f"idle release {IDLE_AFTER:.0f}s, cli {vs.vastai_bin()}")
     while True:
         try:
             tick()

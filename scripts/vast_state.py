@@ -17,9 +17,14 @@ Everything here is blocking on purpose; async callers push it to a thread.
 from __future__ import annotations
 
 import json
+import os
+import shutil
 import socket
 import subprocess
+import sys
 import time
+from functools import lru_cache
+from pathlib import Path
 from typing import Any, Iterator
 
 from config import ENV
@@ -58,15 +63,51 @@ def goes_backwards(current: str, new: str) -> bool:
     return PHASES.index(new) < PHASES.index(current)
 
 
+@lru_cache(maxsize=1)
+def vastai_bin() -> str:
+    """Absolute path to the Vast CLI, or "" when it is nowhere.
+
+    Looked for beside the running interpreter before the PATH, because that is
+    where pip put it and the PATH is not ours to rely on: systemd starts these
+    processes with `/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/snap/bin`
+    and the venv is not in it. A bare ``vastai`` therefore resolves in a login
+    shell and fails under the units.
+
+    That failure was silent and it is the expensive direction to fail in.
+    ``subprocess`` raises ``FileNotFoundError``, ``_vastai`` catches everything
+    and returns ``None``, and every caller reads it as an empty account: the
+    page reports no worker, the CLI reports no offers, and the reaper decides
+    there is nothing to reap - while a rented GPU bills on. Nothing logs,
+    because from the inside an empty account and an unreachable CLI look the
+    same.
+
+    ``VASTAI_BIN`` in ``.env`` overrides all of it for a CLI installed
+    somewhere else entirely.
+    """
+    override = (ENV.get("VASTAI_BIN") or os.environ.get("VASTAI_BIN") or "").strip()
+    if override:
+        return override if Path(override).is_file() else ""
+
+    here = Path(sys.executable).parent
+    for name in ("vastai", "vastai.exe"):
+        candidate = here / name
+        if candidate.is_file():
+            return str(candidate)
+    return shutil.which("vastai") or ""
+
+
 def _vastai(*args: str, timeout: int = 30) -> Any:
     """Run a --raw Vast CLI call and parse it. None on any failure.
 
     Never raises: every caller here is a status display, and a status display
     that crashes is worse than one that says "unknown".
     """
+    binary = vastai_bin()
+    if not binary:
+        return None
     try:
         proc = subprocess.run(
-            ["vastai", *args, "--raw"],
+            [binary, *args, "--raw"],
             capture_output=True, text=True, timeout=timeout,
         )
         return json.loads(proc.stdout)
@@ -427,9 +468,13 @@ def _vastai_raw(*args: str, timeout: int = 60) -> tuple[bool, str]:
     calls destroy and create rented hardware, and a silent failure there is
     how you end up paying for two workers or none.
     """
+    binary = vastai_bin()
+    if not binary:
+        return False, ("vastai not found beside the interpreter, on PATH, or "
+                       "in VASTAI_BIN")
     try:
         proc = subprocess.run(
-            ["vastai", *args],
+            [binary, *args],
             capture_output=True, text=True, timeout=timeout,
             # Never inherit a terminal. ``destroy instance`` prompts for
             # confirmation, and a prompt reading an inherited stdin hangs the
