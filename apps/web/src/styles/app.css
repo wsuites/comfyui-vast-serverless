@@ -107,6 +107,25 @@ button.secondary {
   border:1px solid var(--line);
 }
 button.secondary:hover { color:var(--bad); border-color:var(--bad); }
+/* img2img init image: drop target, preview and denoise */
+.init-drop {
+  position:relative; display:flex; align-items:center; justify-content:center;
+  min-height:92px; padding:10px; border:1px dashed var(--line); border-radius:8px;
+  background:#0f1218; font-size:12px; color:var(--muted); text-align:center;
+}
+.init-drop.over { border-color:var(--accent); color:var(--accent); }
+.init-drop img { max-height:180px; max-width:100%; border-radius:6px; display:block; }
+.init-drop .secondary { position:absolute; top:8px; right:8px; margin:0; padding:5px 10px; font-size:11.5px; }
+/* A button that has to read as a link: the global rule makes every button a
+   full-width accent block, which is wrong inside a sentence. */
+.linkish {
+  width:auto; margin:0; padding:0; background:none; border:0; font:inherit;
+  font-weight:600; color:var(--accent); cursor:pointer; text-decoration:underline;
+}
+#denoise-cell .row { grid-template-columns:1fr auto; align-items:center; }
+#denoise-cell output { font-variant-numeric:tabular-nums; font-size:13px; color:var(--ink); min-width:34px; text-align:right; }
+input[type=range] { padding:0; background:none; border:0; }
+
 .note { margin-top:10px; font-size:11.5px; color:var(--muted); line-height:1.45; }
 .hint { font-size:11px; color:var(--muted); opacity:.75; }
 

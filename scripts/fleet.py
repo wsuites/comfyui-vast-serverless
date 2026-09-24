@@ -33,6 +33,7 @@ import time
 import urllib.error
 import urllib.parse
 import urllib.request
+import uuid
 from contextlib import suppress
 from pathlib import Path
 from typing import Any, Iterable
@@ -457,6 +458,55 @@ def http(url: str, payload: Any = None, timeout: float = PROBE_TIMEOUT,
     return json.loads(body) if body else None
 
 
+def upload_image(url: str, data: bytes, name: str,
+                 timeout: float = 120.0) -> str:
+    """Put bytes in the worker's input/ dir. Returns the name it stored them as.
+
+    ComfyUI has no node that loads an image from a URL and none that takes
+    base64, so an operator-supplied image reaches a render exactly one way:
+    multipart POST to /upload/image, then LoadImage by name. The multipart body
+    is built by hand because the alternative is a `requests` dependency on the
+    VPS venv for thirty lines of string concatenation.
+
+    ``overwrite`` is on: without it ComfyUI appends a counter to a name it has
+    seen before, and an input dir that lives as long as the rental would grow a
+    copy per submit. The stored name is still read back from the response
+    rather than assumed - it also sanitises what it is given.
+    """
+    boundary = f"----cv{uuid.uuid4().hex}"
+    # The filename is what ComfyUI derives the stored name from; the content
+    # type is what it uses to decide the file is an image at all.
+    parts = [
+        f"--{boundary}\r\n"
+        f'Content-Disposition: form-data; name="image"; filename="{name}"\r\n'
+        "Content-Type: application/octet-stream\r\n\r\n".encode(),
+        data,
+        f"\r\n--{boundary}\r\n"
+        'Content-Disposition: form-data; name="overwrite"\r\n\r\n'
+        f"true\r\n--{boundary}--\r\n".encode(),
+    ]
+    req = urllib.request.Request(
+        f"{url}/upload/image", data=b"".join(parts),
+        headers={"Content-Type": f"multipart/form-data; boundary={boundary}"},
+    )
+    try:
+        with urllib.request.urlopen(req, timeout=timeout) as resp:
+            body = json.loads(resp.read() or b"{}")
+    except urllib.error.HTTPError as exc:
+        try:
+            detail = exc.read().decode("utf-8", "replace").strip()
+        except Exception:                                  # noqa: BLE001
+            detail = ""
+        raise FleetError(f"worker refused the init image: {exc.msg}"
+                         + (f": {detail[:400]}" if detail else "")) from exc
+    stored = body.get("name")
+    if not stored:
+        raise FleetError(f"worker accepted the init image but named nothing: {body}")
+    # A subfolder comes back as a path prefix LoadImage expects verbatim.
+    sub = body.get("subfolder") or ""
+    return f"{sub}/{stored}" if sub else str(stored)
+
+
 def comfy_ready(url: str) -> bool:
     """True once the server answers *and* our checkpoint is on disk.
 
@@ -827,6 +877,14 @@ def missing_inputs(url: str, workflow: dict, timeout: float = 20.0) -> list[str]
                 specs[cls] = {}
         for field, value in (node.get("inputs") or {}).items():
             if isinstance(value, (list, dict)):
+                continue
+            # An init image is a combo input like any other, but it is one we
+            # put there ourselves seconds ago, and /object_info may be serving
+            # a listing of input/ from before the upload. A stale cache here
+            # would report the image as a missing model and hold the job for
+            # MODEL_WAIT against a worker that has the file. ComfyUI validates
+            # it again at submit anyway, with the same answer and no cache.
+            if cls == "LoadImage" and field == "image":
                 continue
             spec = specs[cls].get(field)
             # A combo input is declared as [[option, ...], {...}].

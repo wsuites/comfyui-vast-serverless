@@ -25,6 +25,24 @@ export interface Options {
   anima_model: string
   remove_bg: string[]
   detail?: DetailDefaults
+  init?: InitLimits
+}
+
+/** img2img limits, served so the page enforces the API's numbers, not a copy. */
+export interface InitLimits {
+  max_upload_mb: number
+  formats: string[]
+  denoise_default: number
+}
+
+/** What POST /api/inputs hands back for an uploaded image. */
+export interface UploadedInput {
+  id: string
+  width: number
+  height: number
+  bytes: number
+  /** The SDXL-native box this renders at when the size fields are blank. */
+  fit: { width: number; height: number }
 }
 
 /** Parameters echoed back with a job; every one may be missing on old rows. */
@@ -131,6 +149,9 @@ export interface SceneRequest {
   steps: number | null
   cfg: number | null
   family: string
+  /** Id from POST /api/inputs; null renders from noise. */
+  init_image: string | null
+  denoise: number
   lora: number | null
   no_face: boolean
   detail_prompt: string | null

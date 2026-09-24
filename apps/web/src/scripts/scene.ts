@@ -1,8 +1,8 @@
 // Scene tab: the full pipeline from workflows/wf.json.
 
-import type { Job, Options, SceneRequest } from '../lib/types'
+import type { Job, Options, SceneRequest, UploadedInput } from '../lib/types'
 import { $, area, el, input, num, select } from './dom'
-import { cancelJob, follow, submitScene } from './api'
+import { cancelJob, follow, submitScene, uploadInput } from './api'
 import { JobView } from './progress'
 import { markActive, refreshJobs } from './jobs'
 import { zoomable } from './zoom'
@@ -20,6 +20,105 @@ function fillRemoveBg(models: string[]): void {
   )
 }
 
+/**
+ * The init image currently attached to the form, or null.
+ *
+ * The id, not the File: the bytes go up when the file is picked, so submitting
+ * is a small JSON POST however large the image was, and re-rendering the same
+ * start at another denoise does not upload it again.
+ */
+let init: UploadedInput | null = null
+
+function fmtBytes(n: number): string {
+  return n < 1024 ** 2 ? `${Math.round(n / 1024)} kB` : `${(n / 1024 ** 2).toFixed(1)} MB`
+}
+
+/** Reflect `init` into the preview, the status line and the denoise block. */
+function showInit(): void {
+  const preview = $<HTMLImageElement>('init-preview')
+  $('init-placeholder').hidden = init !== null
+  $<HTMLButtonElement>('init-clear').hidden = init === null
+  preview.hidden = init === null
+  $('denoise-cell').hidden = init === null
+  $('init-status').hidden = init === null
+  if (!init) {
+    preview.removeAttribute('src')
+    return
+  }
+  preview.src = `/api/inputs/${init.id}`
+  const fitted = init.fit.width !== init.width || init.fit.height !== init.height
+  $('init-status').textContent =
+    `${init.width}×${init.height} · ${fmtBytes(init.bytes)}`
+    + (fitted ? ` · resampled to ${init.fit.width}×${init.fit.height}, the SDXL-native box nearest this aspect` : '')
+}
+
+/**
+ * Upload a picked file and adopt it as the start image.
+ *
+ * The size fields follow the image rather than staying at 1024×1024: a 16:9
+ * photo sampled in a square latent comes back squashed, and that reads as a
+ * model failure rather than a framing one. They stay editable - this sets
+ * them, it does not lock them.
+ */
+async function takeFile(file: File): Promise<void> {
+  const status = $('init-status')
+  status.hidden = false
+  status.textContent = `Uploading ${file.name}…`
+  try {
+    init = await uploadInput(file)
+  } catch (e) {
+    init = null
+    showInit()
+    status.hidden = false
+    status.textContent = e instanceof Error ? e.message : String(e)
+    return
+  }
+  input('width').value = String(init.fit.width)
+  input('height').value = String(init.fit.height)
+  showInit()
+}
+
+function clearInit(): void {
+  init = null
+  input('init_file').value = ''   // so the same file re-fires change
+  showInit()
+}
+
+function initImageControls(options: Options): void {
+  const drop = $('init-drop')
+  const file = input('init_file')
+  const denoise = input('denoise')
+
+  if (options.init?.denoise_default !== undefined) {
+    denoise.value = String(options.init.denoise_default)
+  }
+  const showDenoise = () => { $('denoise-out').textContent = Number(denoise.value).toFixed(2) }
+  showDenoise()
+  denoise.addEventListener('input', showDenoise)
+
+  $<HTMLButtonElement>('init-pick').addEventListener('click', () => file.click())
+  $<HTMLButtonElement>('init-clear').addEventListener('click', clearInit)
+  file.addEventListener('change', () => {
+    const picked = file.files?.[0]
+    if (picked) void takeFile(picked)
+  })
+
+  // Drag and drop over the same target. dragover must be cancelled or the
+  // browser navigates to the file instead of handing it over.
+  for (const ev of ['dragenter', 'dragover'] as const) {
+    drop.addEventListener(ev, (e) => { e.preventDefault(); drop.classList.add('over') })
+  }
+  for (const ev of ['dragleave', 'drop'] as const) {
+    drop.addEventListener(ev, () => drop.classList.remove('over'))
+  }
+  drop.addEventListener('drop', (e) => {
+    e.preventDefault()
+    const dropped = (e as DragEvent).dataTransfer?.files?.[0]
+    if (dropped) void takeFile(dropped)
+  })
+  showInit()
+}
+
 function body(): SceneRequest {
   const family = select('family').value
   return {
@@ -32,6 +131,8 @@ function body(): SceneRequest {
     steps: num(input('steps')),
     cfg: num(input('cfg')),
     family,
+    init_image: init?.id ?? null,
+    denoise: Number(input('denoise').value),
     lora: family === 'wai' ? num(input('lora')) : null,
     no_face: input('no_face').checked,
     detail_prompt: area('detail_prompt').value.trim() || null,
@@ -123,6 +224,7 @@ export function initScene(options: Options, onFinished?: () => void): void {
   $('detail-default').textContent = options.detail?.prompt ?? ''
   area('detail_prompt').placeholder = options.detail?.prompt ?? ''
   area('detail_negative').placeholder = options.detail?.negative ?? ''
+  initImageControls(options)
   showFamily()
   showFace()
   select('family').addEventListener('change', showFamily)

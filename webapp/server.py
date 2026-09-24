@@ -29,6 +29,7 @@ from __future__ import annotations
 import asyncio
 import json
 import os
+import re
 import sys
 import time
 import uuid
@@ -42,7 +43,7 @@ ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(ROOT / "scripts"))
 
 import uvicorn
-from fastapi import FastAPI, HTTPException
+from fastapi import FastAPI, HTTPException, Request
 from fastapi.responses import FileResponse, StreamingResponse
 from pydantic import BaseModel, Field
 
@@ -51,7 +52,7 @@ import fleet
 
 from ab_modelo import ANIMA_UNET, ARMS
 from ab_modelo import build as build_arm_workflow
-from call_endpoint import RMBG_MODELS, build_workflow
+from call_endpoint import RMBG_MODELS, build_workflow, fit_dims, set_init_image
 from vast_state import describe, goes_backwards, instances, workers
 from vast_state import reboot as _vast_reboot
 
@@ -82,6 +83,17 @@ def setting(name: str, default: str) -> str:
 # has ~12 GB free and nothing else reclaims this, so it is set here rather than
 # left to whoever remembers. 0 disables.
 RETENTION_GB = float(setting("WEB_RETENTION_GB", "5"))
+
+# Init images for img2img. They live under OUT_DIR but are not job dirs and are
+# skipped by the gallery reaper: an input is uploaded before the job that uses
+# it exists, so a reaper that could not tell them apart would be free to delete
+# one mid-render. Their own cap is small - these are single frames, not
+# galleries - and old ones go first.
+INPUTS_DIR = OUT_DIR / "inputs"
+INPUTS_MB = float(setting("WEB_INPUTS_MB", "512"))
+# Per-file ceiling on an upload. Generous for a photo, far under the point
+# where holding the body in memory on a 2 GB VPS matters.
+MAX_UPLOAD_MB = float(setting("WEB_MAX_UPLOAD_MB", "24"))
 
 
 async def _vast_state() -> dict:
@@ -257,6 +269,8 @@ def _prune_output(keep: str | None = None) -> int:
     for d in OUT_DIR.iterdir():
         if not d.is_dir():
             continue                         # index.jsonl lives alongside them
+        if d.name == INPUTS_DIR.name:
+            continue                         # not a job; _reap_inputs owns it
         size = sum(f.stat().st_size for f in d.rglob("*") if f.is_file())
         dirs.append((d.stat().st_mtime, d, size))
         total += size
@@ -284,6 +298,84 @@ def _prune_output(keep: str | None = None) -> int:
         print(f"retention: freed {_human(freed)} "
               f"under a {_human(cap)} cap", file=sys.stderr)
     return freed
+
+
+# Magic bytes -> (extension, header parser). Pillow is not in the VPS venv and
+# an init image is not worth putting it there: all three formats ComfyUI's
+# LoadImage will accept from us carry their dimensions in a fixed-offset header,
+# and refusing anything we cannot parse is the validation we wanted anyway.
+def _sniff_image(data: bytes) -> tuple[str, int, int]:
+    """``(extension, width, height)``, or raise ValueError.
+
+    Doubles as the check that an upload is an image at all: the bytes reach a
+    rented GPU, so "it had a .png name" is not the standard.
+    """
+    if data[:8] == b"\x89PNG\r\n\x1a\n" and data[12:16] == b"IHDR":
+        w = int.from_bytes(data[16:20], "big")
+        h = int.from_bytes(data[20:24], "big")
+        return "png", w, h
+    if data[:2] == b"\xff\xd8":
+        # JPEG: walk the segment chain to the frame header. The dimensions are
+        # not at a fixed offset - EXIF and colour profiles sit in front of them.
+        i = 2
+        while i + 9 < len(data):
+            if data[i] != 0xFF:
+                break
+            marker = data[i + 1]
+            if 0xC0 <= marker <= 0xCF and marker not in (0xC4, 0xC8, 0xCC):
+                h = int.from_bytes(data[i + 5:i + 7], "big")
+                w = int.from_bytes(data[i + 7:i + 9], "big")
+                return "jpg", w, h
+            i += 2 + int.from_bytes(data[i + 2:i + 4], "big")
+        raise ValueError("JPEG with no frame header")
+    if data[:4] == b"RIFF" and data[8:12] == b"WEBP":
+        chunk = data[12:16]
+        if chunk == b"VP8X":
+            w = int.from_bytes(data[24:27], "little") + 1
+            h = int.from_bytes(data[27:30], "little") + 1
+            return "webp", w, h
+        if chunk == b"VP8 ":
+            w = int.from_bytes(data[26:28], "little") & 0x3FFF
+            h = int.from_bytes(data[28:30], "little") & 0x3FFF
+            return "webp", w, h
+        if chunk == b"VP8L":
+            bits = int.from_bytes(data[21:25], "little")
+            return "webp", (bits & 0x3FFF) + 1, ((bits >> 14) & 0x3FFF) + 1
+        raise ValueError("WebP of an unknown flavour")
+    raise ValueError("not a PNG, JPEG or WebP")
+
+
+def _reap_inputs() -> int:
+    """Hold the init-image dir under its cap, oldest first."""
+    cap = INPUTS_MB * 1024 ** 2
+    if cap <= 0 or not INPUTS_DIR.is_dir():
+        return 0
+    files = [(f.stat().st_mtime, f, f.stat().st_size)
+             for f in INPUTS_DIR.iterdir() if f.is_file()]
+    total = sum(s for _, _, s in files)
+    freed = 0
+    for _, f, size in sorted(files):
+        if total <= cap:
+            break
+        with suppress(OSError):
+            f.unlink()
+            total -= size
+            freed += size
+    return freed
+
+
+def _input_path(input_id: str) -> Path:
+    """Resolve an input id to a file, refusing anything that escapes the dir.
+
+    The id reaches here from a JSON body, so it is a path traversal until
+    proven otherwise.
+    """
+    if not re.fullmatch(r"[0-9a-f]{12}\.(png|jpg|webp)", input_id or ""):
+        raise HTTPException(400, f"malformed init image id {input_id!r}")
+    path = (INPUTS_DIR / input_id).resolve()
+    if INPUTS_DIR.resolve() not in path.parents or not path.is_file():
+        raise HTTPException(404, f"no init image {input_id}")
+    return path
 
 
 async def _watch_infra(job: Job) -> None:
@@ -370,6 +462,19 @@ async def _run_job(job: Job) -> None:
         if not url:
             raise RuntimeError(f"Worker {inst.get('instance')} is up but its "
                                "ComfyUI port is not published")
+
+        # The init image can only be uploaded now: it goes to the worker's own
+        # input/ dir over its own HTTP API, so it needs a worker that exists.
+        # The graph was built with the input id as a placeholder; LoadImage is
+        # repointed at whatever name ComfyUI says it stored, which is not
+        # necessarily the one we sent.
+        if job.params.get("init_image"):
+            job.emit("renting", "Uploading the init image")
+            blob = await asyncio.to_thread(
+                _input_path(job.params["init_image"]).read_bytes)
+            stored = await asyncio.to_thread(
+                fleet.upload_image, url, blob, job.params["init_image"])
+            set_init_image(workflow, stored)
 
         # A worker can come ready with the deferred half of its models still
         # landing: provisioning signals ready on the blocking set and keeps
@@ -482,11 +587,17 @@ class JobRequest(BaseModel):
     prompt: str = Field(min_length=1)
     negative: str | None = None
     seed: int | None = None
-    width: int = 1024
-    height: int = 1024
+    width: int | None = None
+    height: int | None = None
     batch: int = 1
     steps: int | None = None
     cfg: float | None = None
+    # img2img. ``init_image`` is an id from POST /api/inputs, not a path and not
+    # pixels: the bytes are uploaded once, before a worker exists, and the job
+    # that uses them names them. ``denoise`` is how much of the schedule runs -
+    # 1.0 ignores the input entirely, below ~0.3 returns it nearly untouched.
+    init_image: str | None = None
+    denoise: float = 0.6
     # The scene graph is SDXL-wired; "anima" swaps its loading subgraph for
     # the three-loader set. The LoRA and the face pass are levers of the SDXL
     # side: the LoRA file does not apply to a DiT, and the face pass is the
@@ -538,11 +649,82 @@ async def create_job(req: JobRequest) -> dict:
         raise HTTPException(400, f"family must be wai or anima, not {req.family!r}")
     if req.remove_bg and req.remove_bg not in RMBG_MODELS:
         raise HTTPException(400, f"remove_bg must be one of {sorted(RMBG_MODELS)}")
-    job = Job(id=uuid.uuid4().hex[:12], params=req.model_dump())
+
+    params = req.model_dump()
+    # Size is resolved here, not in the job, so that what got rendered is a
+    # concrete number in run_info.json and the gallery rather than a null that
+    # meant something at the time. An init image with no explicit size takes
+    # the SDXL-native box nearest its own aspect: sampling a 16:9 photo in a
+    # 1024x1024 latent squashes it, and that arrives looking like a model
+    # problem rather than a framing one.
+    width, height = req.width, req.height
+    if req.init_image:
+        if not (0.0 < req.denoise <= 1.0):
+            raise HTTPException(400, f"denoise must be in (0, 1], not {req.denoise}")
+        path = _input_path(req.init_image)
+        if width is None or height is None:
+            try:
+                _, iw, ih = _sniff_image(path.read_bytes()[:65536])
+            except (OSError, ValueError) as exc:
+                raise HTTPException(400, f"unreadable init image: {exc}") from exc
+            fit = fit_dims(iw, ih)
+            width = width or fit[0]
+            height = height or fit[1]
+    params["width"] = width or 1024
+    params["height"] = height or 1024
+
+    job = Job(id=uuid.uuid4().hex[:12], params=params)
     JOBS[job.id] = job
     job.emit("submitting", "Request queued for the endpoint")
     job.task = asyncio.create_task(_run_job(job))
     return {"job_id": job.id}
+
+
+@app.post("/api/inputs")
+async def create_input(request: Request) -> dict:
+    """Take the raw bytes of an init image. Returns the id a job refers to.
+
+    The body is the file itself, not multipart and not base64. Multipart would
+    put ``python-multipart`` in a venv that is deliberately six packages, and
+    base64 would spend a third of the transfer on nothing; a raw body needs
+    neither and both the page (``fetch(body: File)``) and the CLI can send one.
+
+    Uploading is its own step rather than a field on the job because the page
+    wants the preview and the dimensions back before the operator has decided
+    anything, and because one image is usually rendered at several denoise
+    values - it should cross the wire once.
+    """
+    data = await request.body()
+    if not data:
+        raise HTTPException(400, "empty body; POST the image bytes themselves")
+    if len(data) > MAX_UPLOAD_MB * 1024 ** 2:
+        raise HTTPException(
+            413, f"{_human(len(data))} is over the {MAX_UPLOAD_MB:.0f} MB limit")
+    try:
+        ext, width, height = _sniff_image(data)
+    except ValueError as exc:
+        raise HTTPException(400, f"unsupported image: {exc}") from exc
+
+    INPUTS_DIR.mkdir(parents=True, exist_ok=True)
+    input_id = f"{uuid.uuid4().hex[:12]}.{ext}"
+    (INPUTS_DIR / input_id).write_bytes(data)
+    _reap_inputs()
+    fit_w, fit_h = fit_dims(width, height)
+    return {
+        "id": input_id,
+        "width": width,
+        "height": height,
+        "bytes": len(data),
+        # What the render will actually use if the form leaves size blank, so
+        # the page can show it instead of guessing the same arithmetic again.
+        "fit": {"width": fit_w, "height": fit_h},
+    }
+
+
+@app.get("/api/inputs/{input_id}")
+async def read_input(input_id: str) -> FileResponse:
+    """Serve an uploaded image back, for the page's preview."""
+    return FileResponse(_input_path(input_id))
 
 
 def _detail_defaults() -> dict:
@@ -574,6 +756,13 @@ async def list_options() -> dict:
         "anima_model": ANIMA_UNET,
         "remove_bg": sorted(RMBG_MODELS),
         "detail": _detail_defaults(),
+        # img2img limits, so the page enforces the same numbers the API does
+        # rather than its own copy of them.
+        "init": {
+            "max_upload_mb": MAX_UPLOAD_MB,
+            "formats": ["png", "jpg", "webp"],
+            "denoise_default": 0.6,
+        },
     }
 
 

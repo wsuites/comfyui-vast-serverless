@@ -51,6 +51,8 @@ NODE_WIDTH = "39"
 NODE_HEIGHT = "40"
 NODE_BATCH = "41"
 NODE_SAVE = "7"
+NODE_LATENT = "8"         # EmptyLatentImage: the txt2img latent source
+NODE_VAEDECODE = "6"      # read for its `vae` link, which to_anima repoints
 NODE_FACEDETAILER = "17"
 NODE_DETAIL_POS = "42"    # prompt the FaceDetailer repaints the face with
 NODE_DETAIL_NEG = "55"
@@ -62,6 +64,10 @@ NODE_CLIPSKIP = "60"
 NODE_ANIMA_CLIP = "901"   # ids outside the range the exported graph uses
 NODE_ANIMA_VAE = "902"
 NODE_FACE_CAP = "903"     # SEGS ordered-filter hook, inserted when needed
+NODE_INIT_IMAGE = "904"   # img2img: LoadImage -> scale -> encode -> repeat
+NODE_INIT_SCALE = "905"
+NODE_INIT_ENCODE = "906"
+NODE_INIT_BATCH = "907"
 
 # How many faces the detailer is allowed to repaint per image.
 #
@@ -174,6 +180,99 @@ def set_lora(wf: dict, strength: float) -> dict:
     return wf
 
 
+def to_img2img(wf: dict, name: str, denoise: float) -> dict:
+    """Feed the sampler an uploaded image instead of an empty latent.
+
+    The only thing that changes is where the latent comes from: LoadImage ->
+    ImageScale -> VAEEncode replaces EmptyLatentImage, and everything after the
+    sampler - face pass, upscale, background removal - is untouched.
+
+    Three details that are not obvious:
+
+    * The VAE link is read off VAEDecode rather than hardcoded to the
+      checkpoint, because ``to_anima`` has already repointed it at the Qwen
+      VAE by the time we run. Hardcoding ``[NODE_CHECKPOINT, 2]`` here is how
+      you get an img2img that works on wai and 400s on anima.
+    * Width, height and batch stay wired to the same PrimitiveInt nodes the
+      txt2img path uses, so ``--width``/``--batch`` keep meaning one thing.
+      Only EmptyLatentImage is dropped.
+    * The sampler is a KSamplerAdvanced, which has no ``denoise``. Denoise on
+      that node *is* ``start_at_step``: the fraction of the schedule skipped.
+      0.0 would start at the last step and return the input untouched, so the
+      start is clamped to leave at least one step to actually sample.
+    """
+    steps = int(wf[NODE_SAMPLER]["inputs"]["steps"])
+    start = int(round(steps * (1.0 - denoise)))
+    wf[NODE_SAMPLER]["inputs"]["start_at_step"] = max(0, min(start, steps - 1))
+
+    vae = wf[NODE_VAEDECODE]["inputs"]["vae"]
+    wf[NODE_INIT_IMAGE] = {
+        "class_type": "LoadImage",
+        "inputs": {"image": name},
+        "_meta": {"title": "Init image"},
+    }
+    # Scaled, not cropped: the caller picks width/height to match the image's
+    # own aspect (see ``fit_dims``), so "disabled" never distorts in practice
+    # and an explicit --width that does not match is obeyed rather than
+    # silently centre-cropped.
+    wf[NODE_INIT_SCALE] = {
+        "class_type": "ImageScale",
+        "inputs": {
+            "image": [NODE_INIT_IMAGE, 0],
+            "upscale_method": "lanczos",
+            "width": [NODE_WIDTH, 0],
+            "height": [NODE_HEIGHT, 0],
+            "crop": "disabled",
+        },
+        "_meta": {"title": "Init image to latent size"},
+    }
+    wf[NODE_INIT_ENCODE] = {
+        "class_type": "VAEEncode",
+        "inputs": {"pixels": [NODE_INIT_SCALE, 0], "vae": vae},
+        "_meta": {"title": "Encode init image"},
+    }
+    # One image encodes to a batch of one; --batch > 1 means the same start
+    # with different noise, which is the useful reading for img2img.
+    wf[NODE_INIT_BATCH] = {
+        "class_type": "RepeatLatentBatch",
+        "inputs": {"samples": [NODE_INIT_ENCODE, 0], "amount": [NODE_BATCH, 0]},
+        "_meta": {"title": "Init latent batch"},
+    }
+    wf[NODE_SAMPLER]["inputs"]["latent_image"] = [NODE_INIT_BATCH, 0]
+    wf.pop(NODE_LATENT, None)
+    return wf
+
+
+def set_init_image(wf: dict, name: str) -> dict:
+    """Point the init LoadImage at the name the worker actually stored.
+
+    ComfyUI's /upload/image is free to rename what it is given - it sanitises
+    the filename and, without overwrite, appends a counter. The graph is built
+    before a worker exists and the upload only happens once one does, so the
+    name is patched in afterwards rather than assumed to have survived.
+    """
+    if NODE_INIT_IMAGE in wf:
+        wf[NODE_INIT_IMAGE]["inputs"]["image"] = name
+    return wf
+
+
+def fit_dims(width: int, height: int, area: int = 1024 * 1024,
+             multiple: int = 64) -> tuple[int, int]:
+    """The SDXL-native box closest to this image's aspect ratio.
+
+    SDXL is trained at ~1 megapixel and degrades off it, so an init image is
+    not sampled at its own resolution; it is fitted to the same pixel budget
+    the txt2img path uses, keeping its aspect, snapped to a multiple of 64 so
+    the latent divides cleanly.
+    """
+    if width <= 0 or height <= 0:
+        return 1024, 1024
+    scale = (area / (width * height)) ** 0.5
+    w = max(multiple, round(width * scale / multiple) * multiple)
+    h = max(multiple, round(height * scale / multiple) * multiple)
+    return w, h
+
+
 def cap_faces(wf: dict, count: int) -> dict:
     """Keep only the `count` largest detections in the face pass.
 
@@ -231,6 +330,14 @@ def build_workflow(args) -> dict:
         wf[NODE_SAMPLER]["inputs"]["end_at_step"] = args.steps
     if args.cfg is not None:
         wf[NODE_SAMPLER]["inputs"]["cfg"] = args.cfg
+
+    # img2img, after the steps above are settled: denoise is expressed as a
+    # fraction of the final step count, so it has to read the last word on it.
+    # The name here is a placeholder until the image is on a worker; whoever
+    # uploads it calls set_init_image with what came back.
+    init = getattr(args, "init_image", None)
+    if init:
+        to_img2img(wf, str(init), float(getattr(args, "denoise", None) or 0.6))
 
     # without upscale: SaveImage hangs directly off the FaceDetailer and the
     # upscaler nodes are pruned so ComfyUI does not execute them
@@ -290,8 +397,13 @@ def build_workflow(args) -> dict:
 
     face = ("off" if getattr(args, "no_face", False)
             else "uncapped" if cap <= 0 else f"<={cap}")
+    mode = "txt2img"
+    if init:
+        start = wf[NODE_SAMPLER]["inputs"]["start_at_step"]
+        steps_now = wf[NODE_SAMPLER]["inputs"]["steps"]
+        mode = f"img2img(start={start}/{steps_now})"
     print(f"seed={seed} size={args.width}x{args.height} batch={args.batch} "
-          f"upscale={'no' if args.no_upscale else 'yes'} faces={face} "
+          f"{mode} upscale={'no' if args.no_upscale else 'yes'} faces={face} "
           f"nodes={len(wf)}", file=sys.stderr)
     return wf
 

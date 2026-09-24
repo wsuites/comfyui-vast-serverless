@@ -115,6 +115,21 @@ export class ApiClient {
     })
   }
 
+  /**
+   * Upload the bytes of an init image; the id comes back for `init_image`.
+   *
+   * The body is the file itself. The API takes a raw body rather than
+   * multipart so its venv can stay free of `python-multipart`, which means
+   * there is no form to assemble on this side either.
+   */
+  uploadInput(bytes: Uint8Array): Promise<{ id: string; width: number; height: number; bytes: number; fit: { width: number; height: number } }> {
+    return this.call('/api/inputs', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/octet-stream' },
+      body: bytes,
+    })
+  }
+
   list(): Promise<{ jobs: JobSnapshot[] }> {
     return this.call('/api/jobs')
   }

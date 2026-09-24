@@ -165,6 +165,18 @@ export function genCommand(): Command {
 
       const problems = validateGenOptions(o)
       if (problems.length) throw new CliError(problems.join('\n'), { code: EXIT.USAGE })
+
+      // img2img needs the pixels in the worker's own input/ directory, and the
+      // only way in is a multipart POST to ComfyUI itself. This path does not
+      // talk to ComfyUI - it hands a workflow to the Vast serverless router,
+      // which forwards JSON and nothing else, and no installed node loads an
+      // image from a URL. The fleet path owns the instance and can upload.
+      if (o.init) {
+        throw new CliError('`cv gen` cannot do img2img: it renders through the serverless endpoint, which has no way to put an image on the worker.', {
+          code: EXIT.USAGE,
+          hint: 'Use `cv job submit --init <path>`, which goes through the API that owns the instance.',
+        })
+      }
       if (!prompt && !o.workflow) {
         err(c.dim('no prompt given; rendering the workflow as it stands'))
       }

@@ -1,11 +1,14 @@
+import { readFile } from 'node:fs/promises'
+
 import { Command } from 'commander'
 
 import { ApiClient, PHASES, PHASE_LABELS, type JobSnapshot } from '../lib/api.ts'
 import type { Config } from '../lib/config.ts'
 import { CliError, EXIT } from '../lib/errors.ts'
-import { c, err, fmtDuration, fmtMoney, isTTY, json, out, printTable } from '../lib/output.ts'
+import { c, err, fmtBytes, fmtDuration, fmtMoney, isTTY, json, out, printTable } from '../lib/output.ts'
+import { fromRoot } from '../lib/paths.ts'
 import { common, ctx, float, int, type CommonOptions } from '../lib/program.ts'
-import { genOptions, jobParamsFromOptions, type GenCliOptions } from '../python/gen.ts'
+import { genOptions, jobParamsFromOptions, validateGenOptions, type GenCliOptions } from '../python/gen.ts'
 
 function phaseIndex(phase: string): number {
   const i = (PHASES as readonly string[]).indexOf(phase)
@@ -118,12 +121,39 @@ export function jobCommand(): Command {
       const { cfg, json: asJson } = ctx(o)
       const api = apiFor(cfg)
 
+      const problems = validateGenOptions(o)
+      if (problems.length) throw new CliError(problems.join('\n'), { code: EXIT.USAGE })
+
       const params = jobParamsFromOptions(o, prompt)
       if (!params['prompt']) {
         throw new CliError('A prompt is required.', {
           code: EXIT.USAGE,
           hint: 'cv job submit "1girl, standing" --upscale',
         })
+      }
+
+      // The image crosses the wire before the job does: the API stores it and
+      // hands back an id, and only a worker that exists can be given the
+      // bytes. Failing here costs nothing, which is the point of doing it
+      // before anything rents a GPU.
+      if (o.init) {
+        const path = fromRoot(o.init)
+        let bytes: Buffer
+        try {
+          bytes = await readFile(path)
+        } catch (e) {
+          throw new CliError(`Cannot read the init image ${o.init}.`, {
+            code: EXIT.USAGE,
+            details: e instanceof Error ? e.message : e,
+          })
+        }
+        const up = await api.uploadInput(bytes)
+        params['init_image'] = up.id
+        if (!asJson) {
+          const fitted = params['width'] === undefined && params['height'] === undefined
+          err(c.dim(`init ${up.width}x${up.height}, ${fmtBytes(up.bytes)}`
+            + (fitted ? ` -> rendering at ${up.fit.width}x${up.fit.height}` : '')))
+        }
       }
 
       const { job_id } = await api.submit(params)

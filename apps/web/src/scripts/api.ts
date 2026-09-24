@@ -13,6 +13,7 @@ import type {
   Options,
   SceneRequest,
   StatusResponse,
+  UploadedInput,
 } from '../lib/types'
 
 async function post<T>(path: string, body: unknown): Promise<T> {
@@ -37,6 +38,29 @@ async function get<T>(path: string): Promise<T> {
 }
 
 export const submitScene = (body: SceneRequest): Promise<JobCreated> => post('/api/jobs', body)
+
+/**
+ * Send an init image and get the id a job refers to it by.
+ *
+ * The File goes on the wire as its own body - the API reads raw bytes, so
+ * there is no FormData and no base64 hop. Done when the file is picked rather
+ * than at submit: the operator gets the dimensions and the preview back
+ * immediately, and one image usually feeds several attempts.
+ */
+export async function uploadInput(file: File): Promise<UploadedInput> {
+  let res: Response
+  try {
+    res = await fetch('/api/inputs', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/octet-stream' },
+      body: file,
+    })
+  } catch (e) {
+    throw new Error(`Cannot reach the local server: ${String(e)}`)
+  }
+  if (!res.ok) throw new Error(`Rejected: ${await res.text()}`)
+  return res.json() as Promise<UploadedInput>
+}
 export const submitCompare = (body: CompareRequest): Promise<CompareResponse> =>
   post('/api/compare', body)
 export const getOptions = (): Promise<Options> => get('/api/options')

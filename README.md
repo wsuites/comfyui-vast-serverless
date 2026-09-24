@@ -142,6 +142,48 @@ upstream.
 nodes `46` and `47` must be **deleted**, or ComfyUI executes them anyway
 because they are still in the graph. The script already does this.
 
+### Start from an image (img2img)
+
+Renders that begin from a picture instead of from noise are **fleet-only**:
+
+```bash
+cv job submit --init ./ref.png --denoise 0.55 --prompt "..."
+```
+
+`cv gen` rejects `--init` on purpose. The serverless route posts JSON to
+`/generate/sync` and no node in the image loads a URL or base64, so the pixels
+have nowhere to enter; the fleet route owns a rented instance and can
+`POST /upload/image` to it. The web Scene tab has the same control — drop a
+file on the box above the Model row.
+
+What the graph does with it: `LoadImage` -> `ImageScale` (lanczos, to the
+width/height already on the form) -> `VAEEncode` -> `RepeatLatentBatch` (to the
+batch count) -> the sampler's `latent_image`, and `EmptyLatentImage` (node `8`)
+is deleted. The VAE is read off the `VAEDecode` node rather than named, so
+`--family anima` still gets its own.
+
+**Denoise is not an input.** `KSamplerAdvanced` has no `denoise` field; the
+equivalent is where sampling starts:
+
+    start_at_step = round(steps x (1 - denoise))
+
+so the input survives in inverse proportion. ~0.3 is a retouch, ~0.6 a
+reinterpretation, 1.0 skips nothing and is text2img again. The face pass and
+the upscale run afterwards, unchanged.
+
+The upload is its own step (`POST /api/inputs`, raw body, no multipart and no
+base64) and returns an id. A job carries the id, not the bytes, so re-rendering
+the same start at another denoise does not send the image again. Uploads live
+in `output/web/inputs/`, are capped by `WEB_INPUTS_MB` (512 by default) and are
+reaped oldest-first; a single upload is capped by `WEB_MAX_UPLOAD_MB` (24).
+PNG, JPEG and WebP only — the header is parsed in-process, so the VPS venv
+still has no Pillow.
+
+When the size fields are left as they are, the page snaps them to the
+SDXL-native box nearest the image's aspect ratio (~1 MP, multiples of 64):
+sampling a 16:9 photo in a square latent comes back squashed and reads as a
+model failure rather than a framing one.
+
 ---
 
 ## From your own code

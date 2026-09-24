@@ -40,6 +40,8 @@ export interface GenCliOptions {
   cost?: number
   timeout?: number
   workflow?: string
+  init?: string
+  denoise?: number
 }
 
 export function genOptions(cmd: Command): Command {
@@ -49,6 +51,8 @@ export function genOptions(cmd: Command): Command {
     .option('-W, --width <px>', 'width', (v) => int(v, '--width'))
     .option('-H, --height <px>', 'height', (v) => int(v, '--height'))
     .option('-b, --batch <n>', 'images per request', (v) => int(v, '--batch'))
+    .option('--init <path>', 'img2img: start from this image instead of noise')
+    .option('--denoise <x>', 'with --init: how much to repaint, 0-1 (default 0.6)', (v) => float(v, '--denoise'))
     .option('--steps <n>', 'sampler steps', (v) => int(v, '--steps'))
     .option('--cfg <x>', 'classifier-free guidance scale', (v) => float(v, '--cfg'))
     .option('--family <name>', `model family: ${['wai', 'anima'].join(' | ')}`)
@@ -76,6 +80,12 @@ export function validateGenOptions(o: GenCliOptions): string[] {
   }
   if (o.removeBg !== undefined && !(RMBG_MODELS as readonly string[]).includes(o.removeBg)) {
     problems.push(`--remove-bg must be one of ${RMBG_MODELS.join(', ')}`)
+  }
+  if (o.denoise !== undefined && !(o.denoise > 0 && o.denoise <= 1)) {
+    problems.push(`--denoise must be in (0, 1], not ${o.denoise}`)
+  }
+  if (o.denoise !== undefined && o.init === undefined) {
+    problems.push('--denoise only means something with --init; there is nothing to denoise from')
   }
   return problems
 }
@@ -140,6 +150,10 @@ export function jobParamsFromOptions(o: GenCliOptions, prompt: string | undefine
   set('batch', o.batch)
   set('steps', o.steps)
   set('cfg', o.cfg)
+  // `init_image` is not here: it is an id the API hands back for uploaded
+  // bytes, so it can only be filled in after the upload. `cv job submit` does
+  // that and adds it to what this returns.
+  set('denoise', o.denoise)
   set('family', o.family)
   set('anima_model', o.animaModel)
   set('lora', o.lora)
