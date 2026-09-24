@@ -38,7 +38,7 @@ Done in phase 1, on the VPS, as the user that owns the checkout:
 | pnpm | 10.13.1 at `/usr/bin/pnpm`, matching the `packageManager` pin |
 | cloudflared | 2026.7.3 at `/usr/local/bin/cloudflared`, `~/.cloudflared/cert.pem` present |
 | `.env` | copied out of band, mode 600, never through git |
-| suites | all five offline suites pass there |
+| suites | all six offline suites pass there |
 
 Three values in the VPS `.env` deliberately differ from the workstation's:
 `PYTHON_BIN` points at the venv, `WEBAPP_AUTH` is `on` rather than `off`, and
@@ -266,12 +266,39 @@ polling is not free, it is the ban.
 The state is a kernel list, not a config file, and root can edit it directly:
 
 ```sh
-grep 201.245.250.253 /proc/net/xt_recent/SSH    # is this address held
-echo -201.245.250.253 > /proc/net/xt_recent/SSH # release it
+grep <your-ip> /proc/net/xt_recent/SSH    # is this address held
+echo -<your-ip> > /proc/net/xt_recent/SSH # release it
 ```
 
 A reboot clears both lists. The same mechanism guards ICMP under
 `/proc/net/xt_recent/ICMP`, which is why a ping flood stops answering.
+
+### 8. A reaper that cannot run `vastai` looks exactly like an idle one
+
+`vastai` is a console script pip installs into `.venv/bin`. systemd starts a
+unit with `/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/snap/bin` and
+nothing else, so a bare `vastai` resolves in your login shell and fails under
+the units. `_vastai` catches every exception and returns `None`, `instances()`
+turns that into `[]`, and an empty list is what an empty account looks like.
+For seven hours after the reboot test the reaper here supervised nothing,
+`fleet.py status` said `0 offers`, and the page said no worker. All three were
+printing a swallowed `FileNotFoundError`.
+
+Fixed in the code, not in the unit: the CLI is looked for beside the running
+interpreter first (`VASTAI_BIN` overrides), the calls that spend money report
+it missing, and `daemon()` exits instead of supervising an account it cannot
+see. A restart loop in the journal is findable; a healthy-looking blind reaper
+is not.
+
+It does not announce itself, so check it directly:
+
+```sh
+journalctl -u cv-fleet -b | head -1   # ends with `cli /home/<user>/comfy-vast/.venv/bin/vastai`
+.venv/bin/python scripts/fleet.py status   # offers under the ceiling; a flat 0 is the symptom
+pgrep -P $(systemctl show cv-fleet -p MainPID --value)   # a tick spawns the CLI; silence for a minute means it never does
+```
+
+`python scripts/test_cli_binary.py` pins the lookup order and the refusals.
 
 ## Operating it
 
