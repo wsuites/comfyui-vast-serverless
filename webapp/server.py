@@ -744,6 +744,17 @@ if __name__ == "__main__":
     # it holds the Vast API key: binding it to anything but a loopback address
     # would hand that key to whoever can reach the port, tunnel included. Hence
     # API_HOST is read but a non-loopback value is refused.
+    # `API_ORIGIN` names the deployment that owns the fleet. When it is set,
+    # this machine is a client of that API, and a second process holding the
+    # same Vast key would rent against the same account from a second door.
+    origin = setting("API_ORIGIN", "")
+    if origin:
+        sys.exit(
+            f"API_ORIGIN={origin} - the fleet lives there, so this API would be a "
+            "second spender on the same Vast account. Clear API_ORIGIN in .env to "
+            "run the all-in-one local stack."
+        )
+
     host = setting("API_HOST", "127.0.0.1")
     port = int(setting("API_PORT", "8800"))
     if host not in ("127.0.0.1", "::1", "localhost"):

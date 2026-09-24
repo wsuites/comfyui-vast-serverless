@@ -6,7 +6,8 @@ import { Command } from 'commander'
 import { confirmDestructive } from '../lib/confirm.ts'
 import { CliError, EXIT } from '../lib/errors.ts'
 import { c, err, fmtDuration, fmtMoney, json, out, printTable } from '../lib/output.ts'
-import { common, ctx, destructive, float, int, type CommonOptions } from '../lib/program.ts'
+import type { Config } from '../lib/config.ts'
+import { assertOwnsFleet, common, ctx, destructive, float, int, type CommonOptions } from '../lib/program.ts'
 import { VastClient } from '../vast/client.ts'
 import {
   createInstance,
@@ -31,6 +32,16 @@ function client(cfg: { apiKey: string | null }): VastClient {
     })
   }
   return new VastClient(cfg.apiKey)
+}
+
+/**
+ * A client for the calls that start the meter. Only these are gated: stopping
+ * and destroying stay open from anywhere, because a brake that answers from
+ * one machine only is not a brake.
+ */
+function spender(cfg: Config, what: string): VastClient {
+  assertOwnsFleet(cfg, what)
+  return client(cfg)
 }
 
 function statusColour(status: string): string {
@@ -173,24 +184,25 @@ export function instanceCommand(): Command {
         const tid = o.templateId ?? (cfg.templateId || undefined)
         if (tid !== undefined) opts.templateId = tid
 
-        const res = await createInstance(client(cfg), id, opts)
+        const res = await createInstance(spender(cfg, 'cv instance rent'), id, opts)
         if (asJson) return json(res)
         out(c.green(`rented offer ${id}`))
         out(JSON.stringify(res, null, 2))
       },
     )
 
-  for (const [name, verb, fn] of [
-    ['start', 'start', startInstance],
-    ['stop', 'stop', stopInstance],
-    ['restart', 'reboot', rebootInstance],
+  for (const [name, verb, fn, costs] of [
+    ['start', 'start', startInstance, true],
+    ['stop', 'stop', stopInstance, false],
+    ['restart', 'reboot', rebootInstance, true],
   ] as const) {
     common(cmd.command(`${name} <id>`))
       .description(`${verb} an instance`)
       .action(async (idRaw: string, o: CommonOptions) => {
         const { cfg, json: asJson } = ctx(o)
         const id = int(idRaw, 'id')
-        const res = await fn(client(cfg), id)
+        const api = costs ? spender(cfg, `cv instance ${name}`) : client(cfg)
+        const res = await fn(api, id)
         if (asJson) return json(res)
         out(c.green(`${verb} requested for instance ${id}`))
       })

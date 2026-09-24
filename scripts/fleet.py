@@ -1041,6 +1041,18 @@ def main() -> int:
     p_d.add_argument("--interval", type=float, default=30.0)
     args = ap.parse_args()
 
+    # Reads are fine from anywhere; anything that rents, releases or supervises
+    # has to run where the fleet is, or it doubles up on one Vast account.
+    origin = ENV.get("API_ORIGIN", "").strip()
+    if origin and args.cmd != "status":
+        print(
+            f"API_ORIGIN={origin} - the fleet lives there. `{args.cmd}` would spend "
+            "on the same Vast account from a second machine. Run it on the VPS, or "
+            "clear API_ORIGIN in .env.",
+            file=sys.stderr,
+        )
+        return 2
+
     if args.cmd == "status":
         return cmd_status()
     if args.cmd == "up":

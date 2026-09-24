@@ -9,7 +9,7 @@ import { galleryRoot } from '../lib/config.ts'
 import { DiscordNotifier, describeRender } from '../lib/discord.ts'
 import { CliError, EXIT } from '../lib/errors.ts'
 import { c, err, fmtBytes, json, out } from '../lib/output.ts'
-import { common, ctx, float, int, type CommonOptions } from '../lib/program.ts'
+import { assertOwnsFleet, common, ctx, float, int, type CommonOptions } from '../lib/program.ts'
 import { ROOT, fromRoot } from '../lib/paths.ts'
 import { runPython } from '../python/bridge.ts'
 import { ARMS, callEndpointArgs, genOptions, validateGenOptions, type GenCliOptions } from '../python/gen.ts'
@@ -158,6 +158,10 @@ export function genCommand(): Command {
       o: CommonOptions & GenCliOptions & DiscordOptions & { out?: string; keepRaw?: boolean },
     ) => {
       const { cfg, json: asJson } = ctx(o)
+      // The Python engine calls the Vast endpoint itself, on this machine's
+      // key. With a fleet elsewhere that is a second spender: render through
+      // `cv job submit`, which goes to the API that owns the workers.
+      assertOwnsFleet(cfg, 'cv gen')
 
       const problems = validateGenOptions(o)
       if (problems.length) throw new CliError(problems.join('\n'), { code: EXIT.USAGE })
@@ -341,6 +345,7 @@ async function delegate(
   flags: string[],
 ): Promise<void> {
   const { cfg, json: asJson } = ctx(o)
+  assertOwnsFleet(cfg, `cv gen (${script})`)
 
   const args: string[] = []
   for (const flag of flags) {

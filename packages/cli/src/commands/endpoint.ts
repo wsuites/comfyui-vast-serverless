@@ -3,7 +3,7 @@ import { Command } from 'commander'
 import { confirmDestructive } from '../lib/confirm.ts'
 import { CliError, EXIT } from '../lib/errors.ts'
 import { c, err, fmtDuration, json, out, printTable } from '../lib/output.ts'
-import { common, ctx, destructive, float, int, type CommonOptions } from '../lib/program.ts'
+import { assertOwnsFleet, common, ctx, destructive, float, int, type CommonOptions } from '../lib/program.ts'
 import { VastClient } from '../vast/client.ts'
 import {
   createEndpoint,
@@ -31,6 +31,15 @@ function client(cfg: Config): VastClient {
     })
   }
   return new VastClient(cfg.apiKey)
+}
+
+/**
+ * A client for the calls that put hardware up. Scaling down, deleting and
+ * every read stay open from anywhere: those end spending, they never start it.
+ */
+function spender(cfg: Config, what: string): VastClient {
+  assertOwnsFleet(cfg, what)
+  return client(cfg)
 }
 
 /** The endpoint the command is about: --id, --name, or .env. */
@@ -290,7 +299,7 @@ export function endpointCommand(): Command {
         },
       ) => {
         const { cfg, json: asJson } = ctx(o)
-        const api = client(cfg)
+        const api = spender(cfg, 'cv endpoint create')
         const knobs = collectKnobs(o as unknown as Record<string, unknown>)
 
         const created = (await createEndpoint(api, { ...knobs, endpoint_name: o.name })) as {
@@ -348,7 +357,7 @@ export function endpointCommand(): Command {
         },
       ) => {
         const { cfg, json: asJson } = ctx(o)
-        const api = client(cfg)
+        const api = spender(cfg, 'cv endpoint update')
         const ep = await resolve(api, cfg, o)
         const knobs = collectKnobs(o as unknown as Record<string, unknown>)
 
@@ -408,7 +417,7 @@ export function endpointCommand(): Command {
         },
       ) => {
         const { cfg, json: asJson } = ctx(o)
-        const api = client(cfg)
+        const api = o.down === true ? client(cfg) : spender(cfg, 'cv endpoint scale')
         const ep = await resolve(api, cfg, o)
 
         const knobs: AutoscalerKnobs = {}
@@ -488,7 +497,7 @@ export function endpointCommand(): Command {
     .option('--cancel', 'cancel a rolling update in progress')
     .action(async (o: CommonOptions & { id?: number; name?: string; cancel?: boolean }) => {
       const { cfg, json: asJson } = ctx(o)
-      const api = client(cfg)
+      const api = spender(cfg, 'cv endpoint roll')
       const ep = await resolve(api, cfg, o)
       const group = await resolveGroup(api, cfg, Number(ep.id))
       const res = await updateWorkers(api, Number(group.id), o.cancel === true)
