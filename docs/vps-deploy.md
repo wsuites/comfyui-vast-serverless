@@ -304,14 +304,14 @@ exists. Named, not the quick tunnel the CLI uses on the workstation: the
 hostname has to survive a restart, and a quick tunnel's does not.
 
 ```sh
-cloudflared tunnel create autoscaler-vast
+cloudflared tunnel create autoscaler-vast          # on the VPS; needs ~/.cloudflared/cert.pem
 cloudflared tunnel route dns autoscaler-vast autoscaler-vast.<your-domain>
 ```
 
-`~/.cloudflared/config.yml`:
+`~/.cloudflared/config.yml`, mode 600:
 
 ```yaml
-tunnel: autoscaler-vast
+tunnel: <tunnel-uuid>
 credentials-file: /home/<user>/.cloudflared/<tunnel-uuid>.json
 ingress:
   - hostname: autoscaler-vast.<your-domain>
@@ -319,7 +319,28 @@ ingress:
   - service: http_status:404
 ```
 
-Then `sudo systemctl enable --now cv-tunnel`. The hostname is a placeholder
+`cloudflared tunnel ingress validate` reads that file and answers `OK`
+before anything is started; use it, the unit restarts on a bad one.
+
+The two commands do not need the same credential, and on this account they
+did not have it. Creating a tunnel is an account-level operation; routing a
+hostname edits a zone. The `cert.pem` sitting on the VPS was old enough to
+predate the zone and `route dns` failed with `code: 10000, reason:
+Authentication error` while `create` had just succeeded with the same file.
+The fix is not to re-login on the server: run `route dns` from whichever
+machine holds the cert that already wrote the zone's other records — the
+tunnel is visible account-wide, so a workstation can route a hostname to a
+tunnel that only exists on the VPS. The CNAME is the whole handoff.
+
+Then `sudo systemctl enable --now cv-tunnel`. Look for four `Registered
+tunnel connection` lines in `journalctl -u cv-tunnel -b`; fewer than four
+means it is reaching the edge but not redundantly. Smoke test from outside
+the box, not from it: `401` without credentials on `/`, `200` with them, and
+`/api/status` returning the same JSON the loopback port serves. A `404`
+instead of a `401` is the catch-all answering, which means the hostname in
+`config.yml` and the hostname you asked for are not the same string.
+
+The hostname is a placeholder
 here for the same reason as in `docs/handoff.md`: this repository is public,
 and a hostname that fronts a private service is the one thing in it worth not
 publishing. The live value belongs in `.env`.
