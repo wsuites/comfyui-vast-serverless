@@ -46,6 +46,7 @@ from fastapi import FastAPI, HTTPException
 from fastapi.responses import FileResponse, StreamingResponse
 from pydantic import BaseModel, Field
 
+import config
 import fleet
 
 from ab_modelo import ANIMA_UNET, ARMS
@@ -62,10 +63,25 @@ POLL_SECONDS = 5
 # healthy origin; past this the file is not coming and the caller deserves the
 # name of it rather than another minute of billing.
 MODEL_WAIT = 300.0
+
+
+def setting(name: str, default: str) -> str:
+    """The environment first, then ``.env``, then the default.
+
+    Launched by the CLI, this process inherits everything it needs because the
+    CLI exports it. Launched by systemd it inherits almost nothing, and the
+    only file that knows the deployment is ``.env`` - the same one
+    ``scripts/config.py`` reads. Reading ``os.environ`` alone made
+    ``WEB_RETENTION_GB`` a decoration in that case: documented, set, ignored.
+    """
+    v = os.environ.get(name) or config.ENV.get(name)
+    return default if v is None or v == "" else v
+
+
 # Cap on the rendered gallery on disk, oldest job dirs deleted first. The VPS
 # has ~12 GB free and nothing else reclaims this, so it is set here rather than
 # left to whoever remembers. 0 disables.
-RETENTION_GB = float(os.environ.get("WEB_RETENTION_GB", "5"))
+RETENTION_GB = float(setting("WEB_RETENTION_GB", "5"))
 
 
 async def _vast_state() -> dict:
@@ -715,8 +731,8 @@ if __name__ == "__main__":
     # it holds the Vast API key: binding it to anything but a loopback address
     # would hand that key to whoever can reach the port, tunnel included. Hence
     # API_HOST is read but a non-loopback value is refused.
-    host = os.environ.get("API_HOST", "127.0.0.1")
-    port = int(os.environ.get("API_PORT", "8800"))
+    host = setting("API_HOST", "127.0.0.1")
+    port = int(setting("API_PORT", "8800"))
     if host not in ("127.0.0.1", "::1", "localhost"):
         sys.exit(f"API_HOST={host} is not a loopback address; refusing to bind.")
     print(f"autoscaler-vast api -> http://{host}:{port}", file=sys.stderr)
