@@ -1,4 +1,5 @@
 // @ts-check
+import { execSync } from 'node:child_process'
 import { readFileSync } from 'node:fs'
 import { fileURLToPath } from 'node:url'
 import { defineConfig } from 'astro/config'
@@ -41,13 +42,31 @@ function seedProcessEnv() {
 
 seedProcessEnv()
 
+/**
+ * The commit this bundle is built from, baked into the client code so the
+ * page can compare it with the one the API reports at /api/options. Build
+ * time is the right moment: `git pull` without `pnpm web:build` leaves the
+ * old bundle serving, and that is exactly the drift the banner is for.
+ */
+function gitVersion() {
+  try {
+    return execSync('git rev-parse --short=7 HEAD', { cwd: repoRoot, stdio: ['ignore', 'pipe', 'ignore'] })
+      .toString().trim() || null
+  } catch {
+    return null
+  }
+}
+
 export default defineConfig({
   output: 'server',
   // Single source of configuration: the same .env scripts/config.py reads.
   // Astro has no top-level `envDir`; it is a Vite option, and this is where
   // Astro exposes it. Pointing it at the repository root is what keeps a
   // second .env from ever appearing under apps/web.
-  vite: { envDir: repoRoot },
+  vite: {
+    envDir: repoRoot,
+    define: { __WEB_VERSION__: JSON.stringify(gitVersion()) },
+  },
   // Standalone so the adapter serves dist/client itself; the CLI imports
   // dist/server/entry.mjs and calls startServer() rather than re-implementing
   // static file handling. See docs/monorepo-contract.md.

@@ -25,6 +25,25 @@ function show(name: View): void {
   if (name === 'gallery') void refreshGallery()
 }
 
+/**
+ * Banner when the page and the API were not deployed from the same commit.
+ * A server too old to report a version counts as different: that is the
+ * case this exists for (a `git pull` that never got its restart). Unknown on
+ * the web side (built outside git) stays silent rather than crying wolf.
+ */
+function warnOnVersionDrift(api: string | null | undefined): void {
+  const web = __WEB_VERSION__
+  if (web === null || api === web) return
+  const apiText = api ?? 'an older build that does not report one'
+  document.body.prepend(Object.assign(document.createElement('div'), {
+    className: 'err version-drift',
+    style: 'padding:10px 20px; border-bottom:1px solid var(--bad)',
+    textContent: `Version mismatch: this page is ${web}, the autoscaler API is ${apiText}. `
+      + 'Features may fail until both are deployed from the same commit '
+      + '(git pull, pnpm web:build, restart cv-api and cv-web).',
+  }))
+}
+
 async function boot(): Promise<void> {
   initWorker()
   initGallery()
@@ -42,6 +61,8 @@ async function boot(): Promise<void> {
     }))
     return
   }
+
+  warnOnVersionDrift(options.version)
 
   // A finished job is a new history entry; refresh so the tab is never stale.
   initScene(options, () => void refreshGallery())

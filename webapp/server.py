@@ -59,6 +59,25 @@ from vast_state import reboot as _vast_reboot
 
 OUT_DIR = ROOT / "output" / "web"
 
+
+def _git_version() -> str | None:
+    """The commit this process was started from, read once at import.
+
+    Once, on purpose: ``git pull`` without a restart changes HEAD under a
+    process that is still running the old code, and the page compares against
+    the code that is running, not the code on disk. Same reasoning as the web
+    side, which bakes its commit in at build time.
+    """
+    import subprocess
+    try:
+        out = subprocess.run(["git", "rev-parse", "--short=7", "HEAD"], cwd=ROOT,
+                             capture_output=True, text=True, timeout=5)
+    except (OSError, subprocess.SubprocessError):
+        return None
+    return (out.stdout.strip() or None) if out.returncode == 0 else None
+
+
+VERSION = _git_version()
 HISTORY = OUT_DIR / "index.jsonl"
 POLL_SECONDS = 5
 # How long a request waits for a model that is still downloading behind the
@@ -825,6 +844,9 @@ async def list_options() -> dict:
         "anima_model": ANIMA_UNET,
         "remove_bg": sorted(RMBG_MODELS),
         "detail": _detail_defaults(),
+        # The page compares this with its own build commit and warns when
+        # the two halves were deployed from different checkouts.
+        "version": VERSION,
         # img2img limits, so the page enforces the same numbers the API does
         # rather than its own copy of them.
         "init": {

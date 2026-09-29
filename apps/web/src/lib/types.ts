@@ -26,6 +26,8 @@ export interface Options {
   remove_bg: string[]
   detail?: DetailDefaults
   init?: InitLimits
+  /** Commit the API process started from; null or absent on older servers. */
+  version?: string | null
 }
 
 /** img2img limits, served so the page enforces the API's numbers, not a copy. */
