@@ -168,8 +168,12 @@ function showFamily(): void {
   $('family-note').textContent = FAMILY_NOTE[fam] ?? ''
 }
 
+/** The job whose images the result panel is showing, for Retouch. */
+let shown: Job | null = null
+
 function showImages(job: Job): void {
   if (!job.images?.length) return
+  shown = job
   $('scene-empty').hidden = true
   const p = job.params || {}
   $('scene-gallery').replaceChildren(...job.images.map((u, i) => el(
@@ -246,7 +250,8 @@ export function initScene(options: Options, onFinished?: () => void): void {
     }
     refreshJobs()
   })
-  zoomable($('scene-gallery'), (img) => img.closest('figure')?.textContent?.trim() ?? null)
+  zoomable($('scene-gallery'), (img) => img.closest('figure')?.textContent?.trim() ?? null,
+    () => shown)
 
   $<HTMLFormElement>('scene-form').addEventListener('submit', async (ev) => {
     ev.preventDefault()

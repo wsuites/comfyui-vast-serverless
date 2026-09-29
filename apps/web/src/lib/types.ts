@@ -166,6 +166,21 @@ export interface SceneRequest {
   bg_offset: number
   cost: number
   timeout: number
+  /** Inpaint: another /api/inputs id, white = repaint, same size as init_image. */
+  mask_image?: string | null
+  /** Bounding box of the painted pixels, in the init image's coordinates. */
+  mask_box?: MaskBox | null
+  /** Context kept around the box, in source px. */
+  mask_pad?: number
+  /** Feather of the paste seam, 0-31 px. */
+  mask_blur?: number
+}
+
+export interface MaskBox {
+  x: number
+  y: number
+  width: number
+  height: number
 }
 
 export interface CompareRequest {

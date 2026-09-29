@@ -1,0 +1,76 @@
+---
+// Retouch editor: paint a mask over a finished image and resample only that
+// region. Opened from the zoom modal; wired by src/scripts/retouch.ts.
+---
+
+<dialog id="retouch" class="retouch">
+  <div class="rt-body">
+    <div class="rt-left">
+      <div class="rt-tools" role="toolbar" aria-label="Mask tools">
+        <button type="button" class="rt-tool" data-tool="brush" title="Brush (B)">Brush</button>
+        <button type="button" class="rt-tool" data-tool="eraser" title="Eraser (E) - erases brush strokes, not rectangles">Eraser</button>
+        <button type="button" class="rt-tool" data-tool="rect" title="Rectangle (R) - drag to draw, drag a corner to resize, drag inside to move">Rectangle</button>
+        <span class="rt-sep"></span>
+        <label class="rt-inline" for="rt-size">Size</label>
+        <input id="rt-size" type="range" min="4" max="200" step="1" value="40" />
+        <output id="rt-size-out">40</output>
+        <span class="rt-sep"></span>
+        <button type="button" class="secondary" id="rt-undo" title="Undo (Ctrl+Z)">Undo</button>
+        <button type="button" class="secondary" id="rt-delete" title="Delete the selected rectangle (Del)" disabled>Delete rect</button>
+        <button type="button" class="secondary" id="rt-clear">Clear</button>
+      </div>
+      <div class="rt-stage" id="rt-stage">
+        <img id="rt-image" alt="image to retouch" draggable="false" />
+        <canvas id="rt-overlay"></canvas>
+      </div>
+      <p class="note" id="rt-dims"></p>
+    </div>
+
+    <form class="rt-form" id="rt-form">
+      <label for="rt-prompt">Prompt <span class="hint">(what the masked area should become)</span></label>
+      <textarea id="rt-prompt" required></textarea>
+      <label for="rt-negative">Negative <span class="hint">(blank = workflow default)</span></label>
+      <textarea id="rt-negative" style="min-height:52px"></textarea>
+
+      <label for="rt-denoise">Denoise <output id="rt-denoise-out">0.60</output></label>
+      <input id="rt-denoise" type="range" min="0.05" max="1" step="0.05" value="0.6" />
+
+      <div class="row">
+        <div>
+          <label for="rt-pad">Context <span class="hint">(px around)</span></label>
+          <input id="rt-pad" type="number" min="0" max="512" step="8" value="64" />
+        </div>
+        <div>
+          <label for="rt-blur">Seam blur <span class="hint">(0-31 px)</span></label>
+          <input id="rt-blur" type="number" min="0" max="31" step="1" value="8" />
+        </div>
+      </div>
+
+      <div class="row">
+        <div>
+          <label for="rt-family">Model</label>
+          <select id="rt-family">
+            <option value="wai">WAI Illustrious (SDXL)</option>
+            <option value="anima">Anima Aesthetic (2B DiT)</option>
+          </select>
+        </div>
+        <div>
+          <label for="rt-batch">Variants</label>
+          <input id="rt-batch" type="number" min="1" max="8" value="1" />
+        </div>
+      </div>
+      <div class="check"><input id="rt-no-face" type="checkbox" checked /><label for="rt-no-face">Skip face pass</label></div>
+
+      <p class="note">
+        Only the painted area is regenerated, at full resolution: it is cropped with
+        the context around it, sampled at ~1 MP and pasted back with a soft edge.
+        Everything outside the mask stays byte-for-byte the original.
+      </p>
+      <p class="err" id="rt-status" hidden></p>
+      <div class="rt-actions">
+        <button type="button" class="secondary" id="rt-cancel">Cancel</button>
+        <button type="submit" id="rt-go">Inpaint</button>
+      </div>
+    </form>
+  </div>
+</dialog>

@@ -6,8 +6,10 @@ import { getOptions } from './api'
 import { attachScene, initScene } from './scene'
 import { initCompare } from './compare'
 import { initGallery, refreshGallery } from './gallery'
-import { initJobs } from './jobs'
+import { initJobs, refreshJobs } from './jobs'
 import { initWorker } from './worker'
+import { initRetouch, openRetouch } from './retouch'
+import { setRetouch } from './zoom'
 
 const VIEWS = ['scene', 'compare', 'gallery'] as const
 type View = (typeof VIEWS)[number]
@@ -71,6 +73,15 @@ async function boot(): Promise<void> {
   // Picking a job off the strip re-attaches the scene view to it, whichever
   // tab and whichever session started it. Arms render there too: the view
   // paints any snapshot it is handed.
+  // Retouch opens from the zoom modal on any tab; the job it queues is
+  // followed in the scene view, like any other render.
+  initRetouch(options, (jobId) => {
+    show('scene')
+    attachScene(jobId)
+    refreshJobs()
+  })
+  setRetouch(openRetouch)
+
   initJobs((jobId) => {
     show('scene')
     attachScene(jobId)

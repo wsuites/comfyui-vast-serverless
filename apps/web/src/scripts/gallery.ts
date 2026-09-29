@@ -170,5 +170,5 @@ export function initGallery(): void {
     const index = Number(fig?.dataset['index'])
     const it = items[index]
     return it !== undefined ? asText(it) : null
-  })
+  }, (img) => items[Number(img.closest('figure')?.dataset['index'])] ?? null)
 }

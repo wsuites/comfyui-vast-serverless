@@ -19,6 +19,7 @@ interface Side {
   arm: HTMLSpanElement
   tag: HTMLSpanElement
   caption?: string
+  job?: Job
 }
 
 const views: Record<string, Side> = {}
@@ -56,13 +57,14 @@ function buildSide(side: string): void {
     progress,
   )
   views[side] = { view: new JobView(progress, { compact: true }), frame, arm, tag }
-  zoomable(frame, () => sideOf(side).caption ?? null)
+  zoomable(frame, () => sideOf(side).caption ?? null, () => sideOf(side).job ?? null)
 }
 
 function paint(side: string, job: Job): void {
   const v = sideOf(side)
   v.arm.textContent = job.label || '—'
   v.view.update(job)
+  v.job = job
   const p = job.params || {}
   v.caption = [
     `arm ${job.label}`, `seed ${p.seed}`, `${p.width}×${p.height}`,

@@ -212,3 +212,26 @@ dialog::backdrop { background:rgba(0,0,0,.82); }
   font-size:11.5px; white-space:pre-wrap; color:var(--muted);
   font-family:ui-monospace,SFMono-Regular,Menlo,monospace;
 }
+
+/* Zoom toolbar and the Retouch editor. */
+.zoombar { display:flex; justify-content:center; gap:8px; margin-top:8px; }
+dialog.retouch { width:min(1500px, 96vw); max-height:96vh; background:var(--panel);
+  border:1px solid var(--line); border-radius:10px; padding:14px; color:var(--ink); }
+.rt-body { display:grid; grid-template-columns:minmax(0,1fr) 320px; gap:16px; }
+.rt-left { min-width:0; display:flex; flex-direction:column; }
+.rt-tools { display:flex; flex-wrap:wrap; align-items:center; gap:6px; margin-bottom:10px; }
+.rt-tools button, .rt-actions button, .zoombar button { width:auto; margin-top:0; padding:6px 12px; font-size:12.5px; }
+.rt-actions button { padding:9px 18px; font-size:14px; }
+.rt-tool { background:#232834; color:var(--ink); border:1px solid var(--line); }
+.rt-tool.on { background:var(--accent); border-color:var(--accent); color:#0f1115; }
+.rt-tools input[type=range] { width:120px; }
+.rt-tools output { font-size:12px; color:var(--muted); min-width:2.5em; }
+.rt-inline { display:inline; margin:0 0 0 2px; }
+.rt-sep { width:1px; height:22px; background:var(--line); margin:0 4px; }
+.rt-stage { position:relative; align-self:center; line-height:0; user-select:none; }
+.rt-stage img { display:block; max-width:100%; max-height:calc(96vh - 140px); border-radius:6px; }
+.rt-stage canvas { position:absolute; inset:0; width:100%; height:100%; touch-action:none; }
+.rt-form { overflow:auto; max-height:calc(96vh - 30px); }
+.rt-form label output { color:var(--ink); margin-left:4px; }
+.rt-actions { display:flex; justify-content:flex-end; gap:8px; margin-top:14px; }
+@media (max-width: 900px) { .rt-body { grid-template-columns:1fr; } }
