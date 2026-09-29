@@ -1,8 +1,8 @@
 // The header strip: what is rented right now and what it has cost.
 
 import { $, el, fmt } from './dom'
-import type { Worker } from '../lib/types'
-import { getStatus, rebootWorker } from './api'
+import type { LocalComfy, StatusResponse, Worker } from '../lib/types'
+import { getStatus, rebootWorker, setBackend } from './api'
 
 /**
  * GPU load, VRAM and temperature, when the host reports them.
@@ -49,21 +49,30 @@ function load(w: Worker): HTMLElement[] {
 
 async function poll(): Promise<void> {
   const host = $('worker')
-  let w
+  let status: StatusResponse
   try {
-    w = (await getStatus()).worker
+    status = await getStatus()
   } catch {
     host.replaceChildren(el('span', { class: 'dot off' }), 'local server unreachable')
     return
   }
+  const toggle = backendToggle(status)
+  if (status.backend === 'local') {
+    host.replaceChildren(toggle, ...localStatus(status.local))
+    return
+  }
+  const w = status.worker
   if (!w) {
     host.replaceChildren(
-      el('span', { class: 'dot off' }),
-      'no machine rented — nothing is being charged',
+      toggle,
+      el('span', {},
+        el('span', { class: 'dot off' }),
+        'no machine rented — nothing is being charged'),
     )
     return
   }
   host.replaceChildren(
+    toggle,
     el('span', {},
       el('span', { class: 'dot on' }),
       el('b', {}, w.gpu ?? 'worker'),
@@ -75,6 +84,54 @@ async function poll(): Promise<void> {
     el('span', {}, `machine ${w.machine ?? '?'}`),
     rebootButton(w),
   )
+}
+
+/**
+ * Vast / Local switch. It sets where *new* jobs render: the choice lives on
+ * the API, so every open tab and ``cv job submit`` follow it, and a job that
+ * is already running finishes where it started.
+ */
+function backendToggle(status: StatusResponse): HTMLElement {
+  const wrap = el('span', { class: 'backend-toggle', title: 'Where new renders run' })
+  for (const b of ['vast', 'local'] as const) {
+    const btn = el('button', {
+      class: b === status.backend ? 'active' : '',
+      title: b === 'local'
+        ? `ComfyUI container at ${status.local.url}`
+        : 'Rent a Vast worker',
+    }, b === 'vast' ? 'Vast' : 'Local')
+    btn.onclick = async () => {
+      if (b === status.backend) return
+      if (b === 'local' && !status.local.ready
+          && !window.confirm('The local ComfyUI is not answering right now. '
+            + 'Switch anyway? Jobs will fail until it is up.')) return
+      try {
+        await setBackend(b)
+      } catch (e) {
+        window.alert(String(e instanceof Error ? e.message : e))
+      }
+      void poll()
+    }
+    wrap.append(btn)
+  }
+  return wrap
+}
+
+/** The local card: no rent, no cost, just whether ComfyUI answers. */
+function localStatus(l: LocalComfy): HTMLElement[] {
+  if (!l.ready) {
+    return [el('span', { title: l.detail ?? '' },
+      el('span', { class: 'dot off' }),
+      `local ComfyUI down at ${l.url} — start the comfy-local container`)]
+  }
+  const out: HTMLElement[] = [
+    el('span', {}, el('span', { class: 'dot on' }), el('b', {}, l.gpu ?? 'local GPU'), ' · local'),
+  ]
+  if (l.vram != null && l.vram_total != null) {
+    out.push(el('span', {}, 'vram ', el('b', {}, `${l.vram.toFixed(1)} / ${l.vram_total.toFixed(1)} GB`)))
+  }
+  out.push(el('span', {}, 'free'))
+  return out
 }
 
 /**

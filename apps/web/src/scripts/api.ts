@@ -4,6 +4,8 @@
 // itself is never exposed.
 
 import type {
+  Backend,
+  BackendResponse,
   CompareRequest,
   CompareResponse,
   HistoryResponse,
@@ -90,6 +92,10 @@ export const cancelJob = (jobId: string): Promise<Job> =>
  */
 export const rebootWorker = (): Promise<{ ok: boolean; instance?: string; detail?: string; hazard?: string }> =>
   post('/api/worker/reboot', {})
+
+/** Flip where new jobs render. Jobs already running keep their backend. */
+export const setBackend = (backend: Backend): Promise<BackendResponse> =>
+  post('/api/backend', { backend })
 
 export const getHistory = (limit = 200): Promise<HistoryResponse> =>
   get(`/api/history?limit=${limit}`)

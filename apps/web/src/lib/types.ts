@@ -151,8 +151,30 @@ export interface Worker {
   reachable?: boolean | null
 }
 
+/** 'vast' rents a worker; 'local' renders on the ComfyUI container on the API's machine. */
+export type Backend = 'vast' | 'local'
+
+/** What the API sees at LOCAL_COMFY_URL. VRAM in GB. */
+export interface LocalComfy {
+  ready: boolean
+  url: string
+  detail?: string
+  gpu?: string
+  vram?: number | null
+  vram_total?: number | null
+  comfyui?: string | null
+}
+
+export interface BackendResponse {
+  backend: Backend
+  local: LocalComfy
+}
+
 export interface StatusResponse {
   worker: Worker | null
+  /** Where new jobs go unless a request says otherwise. */
+  backend: Backend
+  local: LocalComfy
 }
 
 export interface SceneRequest {

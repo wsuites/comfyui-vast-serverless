@@ -49,6 +49,7 @@ from pydantic import BaseModel, Field
 
 import config
 import fleet
+import local_comfy
 
 from ab_modelo import ANIMA_UNET, ARMS
 from ab_modelo import build as build_arm_workflow
@@ -117,6 +118,21 @@ INPUTS_MB = float(setting("WEB_INPUTS_MB", "512"))
 # Per-file ceiling on an upload. Generous for a photo, far under the point
 # where holding the body in memory on a 2 GB VPS matters.
 MAX_UPLOAD_MB = float(setting("WEB_MAX_UPLOAD_MB", "24"))
+
+
+# Where renders go when a request does not say: "vast" rents a worker through
+# ``fleet``, "local" posts straight to the ComfyUI container on this machine
+# (``scripts/local_comfy.py``). Starts from COMFY_BACKEND and is flipped at
+# runtime from the page header; a request's own ``backend`` field wins over it.
+BACKEND = {"current": local_comfy.default_backend()}
+
+
+def _resolve_backend(value: str | None) -> str:
+    value = (value or BACKEND["current"]).strip().lower()
+    if value not in local_comfy.BACKENDS:
+        raise HTTPException(400, f"backend must be one of {local_comfy.BACKENDS}, "
+                                 f"not {value!r}")
+    return value
 
 
 async def _vast_state() -> dict:
@@ -479,13 +495,35 @@ def _build_arm(job: Job) -> dict:
     return wf
 
 
+async def _rent_worker(job: Job) -> dict:
+    """Bring a Vast worker up for ``job``. Returns fleet's state record."""
+    job.emit("renting", "Bringing up a worker")
+    # boot_cap is left at fleet's own (FLEET_BOOT_CAP, the ten-minute cold
+    # start goal). The job's ``timeout`` is a render budget and is orders
+    # of magnitude smaller; passing it here would abandon every cold start.
+    inst = await asyncio.to_thread(fleet.up)
+    if not inst:
+        raise RuntimeError("Could not bring a worker up: no offer under "
+                           f"{fleet.DPH_CEILING:.3f}/h passed the probe")
+    # ``up`` hands back fleet's own state record, not a Vast instance dict:
+    # it has already resolved and probed the URL, and re-deriving it here
+    # would be a second, less informed guess at the same thing.
+    if not inst.get("url"):
+        raise RuntimeError(f"Worker {inst.get('instance')} is up but its "
+                           "ComfyUI port is not published")
+    return inst
+
+
 async def _run_job(job: Job) -> None:
     args = Namespace(
         workflow=str(ROOT / "workflows" / "wf.json"),
         **{k: v for k, v in job.params.items()
-           if k not in ("cost", "timeout", "arm")},
+           if k not in ("cost", "timeout", "arm", "backend")},
     )
-    watcher = asyncio.create_task(_watch_infra(job))
+    local = job.params.get("backend") == "local"
+    # The watcher narrates the rented instance's state. A local render has no
+    # instance, and its phases would overwrite the ones emitted below.
+    watcher = None if local else asyncio.create_task(_watch_infra(job))
     raw: Any = None
     url: str | None = None
     try:
@@ -503,21 +541,21 @@ async def _run_job(job: Job) -> None:
         # machine that refuses the booking - and only returns once we have
         # personally fetched /object_info off it, so a wedged host is rejected
         # at rent time instead of ten minutes into a timeout.
-        job.emit("renting", "Bringing up a worker")
-        # boot_cap is left at fleet's own (FLEET_BOOT_CAP, the ten-minute cold
-        # start goal). The job's ``timeout`` is a render budget and is orders
-        # of magnitude smaller; passing it here would abandon every cold start.
-        inst = await asyncio.to_thread(fleet.up)
-        if not inst:
-            raise RuntimeError("Could not bring a worker up: no offer under "
-                               f"{fleet.DPH_CEILING:.3f}/h passed the probe")
-        # ``up`` hands back fleet's own state record, not a Vast instance dict:
-        # it has already resolved and probed the URL, and re-deriving it here
-        # would be a second, less informed guess at the same thing.
-        url = inst.get("url")
-        if not url:
-            raise RuntimeError(f"Worker {inst.get('instance')} is up but its "
-                               "ComfyUI port is not published")
+        if local:
+            job.emit("renting", f"Using the local ComfyUI at {local_comfy.LOCAL_URL}")
+            state = await asyncio.to_thread(local_comfy.probe)
+            if not state["ready"]:
+                raise RuntimeError(
+                    f"Local ComfyUI is not answering at {state['url']}: "
+                    f"{state.get('detail')}. Start it with: "
+                    "wsl -d Debian -u root -- docker start comfy-local")
+            inst = {"instance": "local", "gpu": state["gpu"], "url": state["url"]}
+            job.worker = {"id": "local", "gpu": state["gpu"], "status": "local",
+                          "dph": 0.0, "vram": state["vram"],
+                          "vram_total": state["vram_total"]}
+        else:
+            inst = await _rent_worker(job)
+        url = inst["url"]
 
         # The init image can only be uploaded now: it goes to the worker's own
         # input/ dir over its own HTTP API, so it needs a worker that exists.
@@ -553,7 +591,8 @@ async def _run_job(job: Job) -> None:
             # single job to touch(), and it is the daemon's own tick that would
             # collect it - the two only run side by side now that both live on
             # the server.
-            await asyncio.to_thread(fleet.lease, inst.get("instance") or "")
+            if not local:
+                await asyncio.to_thread(fleet.lease, inst.get("instance") or "")
             missing = await asyncio.to_thread(fleet.missing_inputs, url, workflow)
             if not missing:
                 break
@@ -579,12 +618,15 @@ async def _run_job(job: Job) -> None:
         # serving the page - mid-render, ten minutes after it came ready.
         # Once on either side of the wait: the first claims the worker before
         # a long batch starts, the second resets the clock once it is served.
-        await asyncio.to_thread(fleet.touch)
+        if not local:
+            await asyncio.to_thread(fleet.touch)
         prompt_id = await asyncio.to_thread(fleet.submit, url, workflow, "web")
         raw = await asyncio.to_thread(
             fleet.wait_job, url, prompt_id, float(job.params["timeout"]),
+            not local,
         )
-        await asyncio.to_thread(fleet.touch)
+        if not local:
+            await asyncio.to_thread(fleet.touch)
         job.latency = time.time() - started
 
         blobs = await asyncio.to_thread(fleet.images, url, raw)
@@ -629,7 +671,8 @@ async def _run_job(job: Job) -> None:
         if isinstance(exc, (KeyboardInterrupt, asyncio.CancelledError)):
             raise
     finally:
-        watcher.cancel()
+        if watcher is not None:
+            watcher.cancel()
         try:
             (OUT_DIR / job.id).mkdir(parents=True, exist_ok=True)
             (OUT_DIR / job.id / "raw.json").write_text(
@@ -706,6 +749,8 @@ class JobRequest(BaseModel):
     pose: dict | None = None
     pose_strength: float | None = Field(None, ge=0.0, le=2.0)
     pose_style: str | None = None
+    # "vast" | "local". None follows the console's toggle (GET /api/backend).
+    backend: str | None = None
     cost: int = 100
     timeout: float = 900.0
 
@@ -722,6 +767,8 @@ class CompareRequest(BaseModel):
     steps: int | None = None         # None = each arm's own recommended value
     cfg: float | None = None
     anima_model: str | None = None
+    # "vast" | "local". None follows the console's toggle (GET /api/backend).
+    backend: str | None = None
     cost: int = 100
     timeout: float = 900.0
 
@@ -737,6 +784,9 @@ async def create_job(req: JobRequest) -> dict:
         raise HTTPException(400, f"remove_bg must be one of {sorted(RMBG_MODELS)}")
 
     params = req.model_dump()
+    # Resolved now so the history records where it actually ran, even if the
+    # toggle is flipped while it waits.
+    params["backend"] = _resolve_backend(req.backend)
     # Size is resolved here, not in the job, so that what got rendered is a
     # concrete number in run_info.json and the gallery rather than a null that
     # meant something at the time. An init image with no explicit size takes
@@ -907,7 +957,8 @@ async def create_compare(req: CompareRequest) -> dict:
         seed = int(uuid.uuid4().int % (2 ** 53))
 
     pair = uuid.uuid4().hex[:8]
-    base = req.model_dump(exclude={"arm_a", "arm_b"}) | {"seed": seed}
+    base = req.model_dump(exclude={"arm_a", "arm_b"}) | {
+        "seed": seed, "backend": _resolve_backend(req.backend)}
     sides = []
     for side, arm in (("A", req.arm_a), ("B", req.arm_b)):
         job = Job(id=uuid.uuid4().hex[:12], params=dict(base, arm=arm),
@@ -1030,10 +1081,30 @@ async def reboot_worker() -> dict:
     return report
 
 
+class BackendRequest(BaseModel):
+    backend: str
+
+
+@app.get("/api/backend")
+async def get_backend() -> dict:
+    """Which backend new jobs use, and whether the local container answers."""
+    return {"backend": BACKEND["current"],
+            "local": await asyncio.to_thread(local_comfy.probe)}
+
+
+@app.post("/api/backend")
+async def set_backend(req: BackendRequest) -> dict:
+    """Flip the default for new jobs. Jobs already running keep theirs."""
+    BACKEND["current"] = _resolve_backend(req.backend)
+    return await get_backend()
+
+
 @app.get("/api/status")
 async def status() -> dict:
     """Live worker + cost, independent of any job."""
     info = await _vast_state()
+    info["backend"] = BACKEND["current"]
+    info["local"] = await asyncio.to_thread(local_comfy.probe)
     if info["worker"] and info["worker"].get("start"):
         hours = max(0.0, (time.time() - float(info["worker"]["start"])) / 3600)
         info["worker"]["hours"] = hours

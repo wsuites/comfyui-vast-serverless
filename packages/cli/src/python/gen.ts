@@ -39,6 +39,8 @@ export interface GenCliOptions {
   bgOffset?: number
   cost?: number
   timeout?: number
+  /** --local / --vast. Undefined follows COMFY_BACKEND (CLI) or the console toggle (web). */
+  backend?: 'vast' | 'local'
   workflow?: string
   init?: string
   denoise?: number
@@ -46,6 +48,8 @@ export interface GenCliOptions {
 
 export function genOptions(cmd: Command): Command {
   return cmd
+    .option('--local', 'render on the local ComfyUI container (WSL) instead of Vast')
+    .option('--vast', 'render on Vast even when COMFY_BACKEND=local')
     .option('-n, --negative <text>', 'negative prompt; blank keeps the workflow default')
     .option('-s, --seed <n>', 'seed; omit for a random one', (v) => int(v, '--seed'))
     .option('-W, --width <px>', 'width', (v) => int(v, '--width'))
@@ -73,8 +77,18 @@ export function genOptions(cmd: Command): Command {
 }
 
 /** Validate the enum-shaped flags before anything is submitted. */
+/** --local / --vast into one value; commander leaves them as separate booleans. */
+export function resolveBackend(o: GenCliOptions & { local?: boolean; vast?: boolean }): 'vast' | 'local' | undefined {
+  if (o.backend) return o.backend
+  if (o.local) return 'local'
+  if (o.vast) return 'vast'
+  return undefined
+}
+
 export function validateGenOptions(o: GenCliOptions): string[] {
   const problems: string[] = []
+  const flags = o as { local?: boolean; vast?: boolean }
+  if (flags.local && flags.vast) problems.push('--local and --vast are mutually exclusive')
   if (o.family !== undefined && o.family !== 'wai' && o.family !== 'anima') {
     problems.push(`--family must be wai or anima, not ${JSON.stringify(o.family)}`)
   }
@@ -127,6 +141,8 @@ export function callEndpointArgs(o: GenCliOptions, prompt: string | undefined): 
   push('--cost', o.cost)
   push('--timeout', o.timeout)
   push('--workflow', o.workflow)
+  const backend = resolveBackend(o)
+  if (backend) args.push(`--${backend}`)
 
   if (o.upscale !== true) args.push('--no-upscale')
   if (o.face !== true) args.push('--no-face')
@@ -166,6 +182,7 @@ export function jobParamsFromOptions(o: GenCliOptions, prompt: string | undefine
   set('face_cap', o.faceCap)
   set('cost', o.cost)
   set('timeout', o.timeout)
+  set('backend', resolveBackend(o))
 
   p['no_upscale'] = o.upscale !== true
   p['no_face'] = o.face !== true

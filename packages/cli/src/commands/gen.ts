@@ -12,7 +12,7 @@ import { c, err, fmtBytes, json, out } from '../lib/output.ts'
 import { assertOwnsFleet, common, ctx, float, int, type CommonOptions } from '../lib/program.ts'
 import { ROOT, fromRoot } from '../lib/paths.ts'
 import { runPython } from '../python/bridge.ts'
-import { ARMS, callEndpointArgs, genOptions, validateGenOptions, type GenCliOptions } from '../python/gen.ts'
+import { ARMS, callEndpointArgs, genOptions, resolveBackend, validateGenOptions, type GenCliOptions } from '../python/gen.ts'
 import { extractImageUrls } from '../python/urls.ts'
 
 interface DiscordOptions {
@@ -161,7 +161,8 @@ export function genCommand(): Command {
       // The Python engine calls the Vast endpoint itself, on this machine's
       // key. With a fleet elsewhere that is a second spender: render through
       // `cv job submit`, which goes to the API that owns the workers.
-      assertOwnsFleet(cfg, 'cv gen')
+      // A local render spends nothing on Vast, so a fleet elsewhere is no reason to refuse it.
+      if ((resolveBackend(o) ?? cfg.comfyBackend) !== 'local') assertOwnsFleet(cfg, 'cv gen')
 
       const problems = validateGenOptions(o)
       if (problems.length) throw new CliError(problems.join('\n'), { code: EXIT.USAGE })
@@ -265,7 +266,9 @@ export function genCommand(): Command {
       }
       out('')
       out(c.green(`${saved.length} image(s) in ${relative(ROOT, dest) || dest}`))
-      out(c.dim('the presigned R2 links in raw.json expire in 7 days'))
+      if ((resolveBackend(o) ?? cfg.comfyBackend) !== 'local') {
+        out(c.dim('the presigned R2 links in raw.json expire in 7 days'))
+      }
     },
   )
 

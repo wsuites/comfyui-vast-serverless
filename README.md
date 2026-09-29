@@ -186,6 +186,55 @@ model failure rather than a framing one.
 
 ---
 
+## Rendering on your own GPU (local backend)
+
+The same `vastai/comfy` image, provisioned by the same
+`scripts/serverless_provision.sh`, runs in Docker inside WSL2 with the GPU
+passed through. Jobs sent there skip everything that exists because the GPU is
+rented - no offer search, no boot, no lease, no cost - and post the unchanged
+graph straight to that ComfyUI (`scripts/local_comfy.py`).
+
+| Where | How to pick it |
+|---|---|
+| CLI | `cv gen --local ...` / `--vast`; `COMFY_BACKEND=local` makes it the default |
+| `call_endpoint.py` | `--local` / `--vast`, same default |
+| Web console | the Vast / Local switch in the header; a job keeps the backend it started on |
+
+```powershell
+wsl -d Debian -u root -- docker start comfy-local     # ComfyUI on 127.0.0.1:18188
+cv gen --local --family anima "aetherion, solo, 1girl"
+```
+
+### Reaching it from the VPS
+
+The console on the VPS cannot see this machine's loopback, so the path is a
+named Cloudflare tunnel (`comfy-local`, `https://comfy-local.whitesu.dev`) that
+ends at `scripts/local_gate.py`, never at ComfyUI: ComfyUI has no
+authentication. The gate checks `Authorization: Bearer $LOCAL_COMFY_TOKEN` and
+forwards only what the render path calls (`/system_stats`, `/object_info`,
+`/prompt`, `/history/<id>`, `/view`, `/interrupt`, `/upload/image`); the
+editor, the manager and the websocket stay unreachable.
+
+On the workstation (`.env` holds `LOCAL_COMFY_TOKEN`):
+
+```powershell
+python scripts\local_gate.py                                      # 127.0.0.1:18189
+cloudflared --config $HOME\.cloudflared\comfy-local.yml tunnel run comfy-local
+```
+
+On the VPS `.env`:
+
+```
+LOCAL_COMFY_URL=https://comfy-local.whitesu.dev
+LOCAL_COMFY_TOKEN=<same value as the workstation>
+```
+
+`scripts/fleet.py` attaches the token to every request under
+`LOCAL_COMFY_URL`, so submit, polling, image download and cancel all go
+through the gate. If the workstation is off, the header shows the local card
+as down and a local job fails at submit with that reason; Vast jobs are
+unaffected.
+
 ## From your own code
 
 ```python

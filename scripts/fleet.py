@@ -429,13 +429,26 @@ def comfy_url(inst: dict) -> str | None:
     return f"http://{str(ip).strip()}:{port}"
 
 
+# Base URL -> extra headers. Rented workers answer on a bare port; the local
+# ComfyUI reached through its tunnel sits behind a token gate
+# (scripts/local_gate.py), and scripts/local_comfy.py registers that token here
+# so every helper below - submit, wait_job, images, interrupt - carries it.
+AUTH_HEADERS: dict[str, dict[str, str]] = {}
+
+
 def http(url: str, payload: Any = None, timeout: float = PROBE_TIMEOUT,
          raw: bool = False) -> Any:
     data = json.dumps(payload).encode() if payload is not None else None
-    req = urllib.request.Request(
-        url, data=data,
-        headers={"Content-Type": "application/json"} if data else {},
-    )
+    # A User-Agent of our own: Cloudflare answers urllib's default one with a
+    # 403 (error 1010), which is what the tunnel to the local ComfyUI sits behind.
+    headers = {"User-Agent": "comfy-vast-fleet/1.0"}
+    if data:
+        headers["Content-Type"] = "application/json"
+    for base, extra in AUTH_HEADERS.items():
+        if url == base or url.startswith(base + "/"):
+            headers.update(extra)
+            break
+    req = urllib.request.Request(url, data=data, headers=headers)
     try:
         with urllib.request.urlopen(req, timeout=timeout) as resp:
             body = resp.read()
@@ -911,11 +924,14 @@ def submit(url: str, workflow: dict, client_id: str = "fleet") -> str:
     return str(pid)
 
 
-def wait_job(url: str, prompt_id: str, timeout: float = 300.0) -> dict:
+def wait_job(url: str, prompt_id: str, timeout: float = 300.0,
+             hold_lease: bool = True) -> dict:
     """Block until the prompt leaves the history as finished. Raises on timeout.
 
     Holds the lease while it waits. This loop is the one place that reliably
     knows a render is still running, and a long one outlives IDLE_AFTER.
+    ``hold_lease=False`` is for the local backend: that render is not on a
+    rented worker, and leasing would keep an idle Vast instance alive.
     """
     deadline = time.time() + timeout
     last_held = 0.0
@@ -925,7 +941,7 @@ def wait_job(url: str, prompt_id: str, timeout: float = 300.0) -> dict:
         except (urllib.error.URLError, OSError, ValueError):
             time.sleep(1.0)
             continue
-        if time.time() - last_held > LEASE_TTL / 4:
+        if hold_lease and time.time() - last_held > LEASE_TTL / 4:
             lease(load_state().get("instance") or "")
             last_held = time.time()
         entry = (hist or {}).get(prompt_id)

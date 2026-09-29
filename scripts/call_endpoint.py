@@ -8,6 +8,10 @@ the presigned URLs returned by the api-wrapper.
 Usage:
     python scripts/call_endpoint.py --prompt "aetherion, solo, 1girl, ..." --seed 123
     python scripts/call_endpoint.py --workflow workflows/wf.json --no-upscale
+    python scripts/call_endpoint.py --local --prompt "..."   # the WSL container
+
+--local (or COMFY_BACKEND=local) posts the same graph straight to the ComfyUI
+in the local container; see scripts/local_comfy.py.
 """
 from __future__ import annotations
 
@@ -724,6 +728,11 @@ async def main() -> int:
     p.add_argument("--no-unstick", action="store_true",
                    help="skip the pre-flight check for a stranded worker")
     p.add_argument("--out", default=str(ROOT / "output" / "general" / "last_response.json"))
+    backend = p.add_mutually_exclusive_group()
+    backend.add_argument("--local", dest="backend", action="store_const", const="local",
+                         help="render on the local ComfyUI container instead of Vast")
+    backend.add_argument("--vast", dest="backend", action="store_const", const="vast",
+                         help="render on Vast even when COMFY_BACKEND=local")
     args = p.parse_args()
 
     workflow = build_workflow(args)
@@ -734,19 +743,24 @@ async def main() -> int:
         }
     }
 
-    if not args.no_unstick:
-        preflight()
+    import local_comfy
+    if (args.backend or local_comfy.default_backend()) == "local":
+        print(f"backend=local {local_comfy.LOCAL_URL}", file=sys.stderr)
+        result = await asyncio.to_thread(local_comfy.render, workflow, args.timeout)
+    else:
+        if not args.no_unstick:
+            preflight()
 
-    client = Serverless(api_key=resolve_api_key())
-    try:
-        endpoint = await client.get_endpoint(name=ENDPOINT_NAME)
-        # No get_workers() here: the API is limited to ~1 req/s and chained
-        # calls return HTTP 429 before even reaching generation.
-        result = await endpoint.request(
-            "/generate/sync", payload, cost=args.cost, timeout=args.timeout
-        )
-    finally:
-        await client.close()
+        client = Serverless(api_key=resolve_api_key())
+        try:
+            endpoint = await client.get_endpoint(name=ENDPOINT_NAME)
+            # No get_workers() here: the API is limited to ~1 req/s and chained
+            # calls return HTTP 429 before even reaching generation.
+            result = await endpoint.request(
+                "/generate/sync", payload, cost=args.cost, timeout=args.timeout
+            )
+        finally:
+            await client.close()
 
     out = Path(args.out)
     out.parent.mkdir(parents=True, exist_ok=True)

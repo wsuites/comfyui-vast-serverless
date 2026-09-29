@@ -31,12 +31,22 @@ function* walk(node: unknown): Generator<Record<string, unknown>> {
   }
 }
 
+/**
+ * The file name a URL serves, lowercased. ComfyUI's own `/view` (what the local
+ * backend hands back) carries it in the query instead of the path.
+ */
+function imageName(url: string): string {
+  const [path = '', query = ''] = url.split('?', 2)
+  if (path.endsWith('/view')) return (new URLSearchParams(query).get('filename') ?? '').toLowerCase()
+  return path.toLowerCase()
+}
+
 export function extractImageUrls(result: unknown): string[] {
   const urls: string[] = []
   for (const entry of walk(result)) {
     const url = entry['url']
     if (typeof url !== 'string' || !url.startsWith('http')) continue
-    const name = url.split('?', 1)[0]?.toLowerCase() ?? ''
+    const name = imageName(url)
     if (IMAGE_SUFFIX.some((s) => name.endsWith(s)) && !urls.includes(url)) urls.push(url)
   }
   return urls

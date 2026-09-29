@@ -41,6 +41,8 @@ export interface Config {
   apiOrigin: string
   apiOriginUser: string
   apiOriginPass: string
+  /** Default render backend: 'vast' rents a worker, 'local' is the WSL ComfyUI container. */
+  comfyBackend: 'vast' | 'local'
   webHost: string
   webPort: number
   webappAuth: boolean
@@ -109,6 +111,7 @@ export function loadConfig(): Config {
     apiOrigin: str(raw, 'API_ORIGIN').trim().replace(/\/+$/, ''),
     apiOriginUser: str(raw, 'API_ORIGIN_USER').trim(),
     apiOriginPass: str(raw, 'API_ORIGIN_PASS'),
+    comfyBackend: str(raw, 'COMFY_BACKEND', 'vast').trim().toLowerCase() === 'local' ? 'local' : 'vast',
     webHost: str(raw, 'WEB_HOST', '127.0.0.1'),
     webPort: int(raw, 'WEB_PORT', 4321),
     webappAuth: authOn(raw),
