@@ -57,6 +57,12 @@ async function poll(): Promise<void> {
     return
   }
   const toggle = backendToggle(status)
+  if (!status.backend || !status.local) {
+    // An API from before the local backend existed: say so instead of throwing
+    // on status.local and leaving the header frozen without the toggle.
+    toggle.title = 'The API behind this page predates the local backend; redeploy it'
+    for (const b of toggle.querySelectorAll('button')) b.disabled = true
+  }
   if (status.backend === 'local') {
     host.replaceChildren(toggle, ...localStatus(status.local))
     return
@@ -97,12 +103,12 @@ function backendToggle(status: StatusResponse): HTMLElement {
     const btn = el('button', {
       class: b === status.backend ? 'active' : '',
       title: b === 'local'
-        ? `ComfyUI container at ${status.local.url}`
+        ? `ComfyUI container at ${status.local?.url ?? '(unknown)'}`
         : 'Rent a Vast worker',
     }, b === 'vast' ? 'Vast' : 'Local')
     btn.onclick = async () => {
       if (b === status.backend) return
-      if (b === 'local' && !status.local.ready
+      if (b === 'local' && !status.local?.ready
           && !window.confirm('The local ComfyUI is not answering right now. '
             + 'Switch anyway? Jobs will fail until it is up.')) return
       try {
