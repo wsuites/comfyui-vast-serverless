@@ -47,6 +47,21 @@ function asText(it: Job): string {
   return details(it).map(([k, v]) => `${k}: ${v}`).join('\n')
 }
 
+/**
+ * One prompt under a card, clamped to a few lines; a click toggles the full
+ * text. A blank negative is stored as null and means the request used the
+ * workflow's own negative, so say that rather than show nothing.
+ */
+function promptBlock(label: string, text: string | null | undefined): HTMLElement {
+  const blank = !text?.trim()
+  const body = el('span', { class: blank ? 'gp-text gp-default' : 'gp-text' },
+    blank ? (label === 'negative' ? 'workflow default' : '—') : text)
+  const box = el('div', { class: 'gprompt', title: blank ? '' : 'Click to expand' },
+    el('span', { class: 'gp-label' }, label), body)
+  if (!blank) box.addEventListener('click', () => box.classList.toggle('open'))
+  return box
+}
+
 function card(it: Job, url: string | null, index: number): HTMLElement {
   const p = it.params || {}
   const badges = [
@@ -65,7 +80,9 @@ function card(it: Job, url: string | null, index: number): HTMLElement {
         el('dt', {}, 'size'), el('dd', {}, `${p.width}×${p.height}`),
         el('dt', {}, 'worker'), el('dd', {}, it.latency ? `${it.latency.toFixed(1)} s` : '—'),
         el('dt', {}, 'when'), el('dd', {}, when(it.created)),
-      )),
+      ),
+      promptBlock('prompt', p.prompt),
+      promptBlock('negative', p.negative)),
   )
   fig.dataset['index'] = String(index)
   return fig
@@ -78,7 +95,7 @@ function matches(it: Job): boolean {
   if (kind && it.kind !== kind) return false
   if (arm && it.label !== arm) return false
   if (!q) return true
-  const hay = `${it.params?.prompt ?? ''} ${it.params?.seed ?? ''} ${it.label ?? ''}`
+  const hay = `${it.params?.prompt ?? ''} ${it.params?.negative ?? ''} ${it.params?.seed ?? ''} ${it.label ?? ''}`
   return hay.toLowerCase().includes(q)
 }
 
