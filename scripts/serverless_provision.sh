@@ -581,9 +581,28 @@ def probe_speed(url, offset=0):
         return 0.0
 
 def fetch(item):
+    """One downloader per file on this machine, whoever started it.
+
+    Observed 2026-09-29 on instance 53340617: the first provisioning run
+    aborted on a failed git clone, but its deferred downloader - a forked
+    subshell - kept running. Vast re-ran the script, which started a second
+    downloader on the same .part files. Both ran `curl -C -` into them at once
+    and appended over each other: anima grew to 5.6 GB for a 4.18 GB object,
+    and all three deferred files ended as WRONG SIZE. An exclusive lock next
+    to the destination makes the second run wait, then find the file done
+    (or resume from a .part only one writer ever touched).
+    """
+    import fcntl
+    dst = Path(item[1])
+    dst.parent.mkdir(parents=True, exist_ok=True)
+    with open(str(dst) + ".lock", "w") as lock:
+        fcntl.flock(lock, fcntl.LOCK_EX)
+        return _fetch(item)
+
+
+def _fetch(item):
     key, rel = item
     dst = Path(rel)          # bash already resolves the absolute path
-    dst.parent.mkdir(parents=True, exist_ok=True)
     try:
         remote = s3.head_object(Bucket=bucket, Key=key)["ContentLength"]
     except Exception as e:
