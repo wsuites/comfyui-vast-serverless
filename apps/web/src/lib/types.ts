@@ -26,8 +26,22 @@ export interface Options {
   remove_bg: string[]
   detail?: DetailDefaults
   init?: InitLimits
+  /** Anima pose control; absent on servers without it. */
+  pose?: PoseOptions
   /** Commit the API process started from; null or absent on older servers. */
   version?: string | null
+}
+
+/** Skeleton styles and defaults for Anima pose control. */
+export interface PoseOptions {
+  styles: string[]
+  style_default: string
+  strength_default: number
+}
+
+/** 17 COCO body joints in scene pixels, [x, y, score]; score 0 = not drawn. */
+export interface PoseSpec {
+  points: [number, number, number][]
 }
 
 /** img2img limits, served so the page enforces the API's numbers, not a copy. */
@@ -174,6 +188,12 @@ export interface SceneRequest {
   mask_pad?: number
   /** Feather of the paste seam, 0-31 px. */
   mask_blur?: number
+  /** Anima only: skeleton the render follows. */
+  pose?: PoseSpec | null
+  /** Control strength, 0-2. */
+  pose_strength?: number | null
+  /** How the skeleton is drawn for the control image. */
+  pose_style?: string | null
 }
 
 export interface MaskBox {

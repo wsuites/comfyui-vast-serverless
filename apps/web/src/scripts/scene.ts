@@ -6,6 +6,7 @@ import { cancelJob, follow, submitScene, uploadInput } from './api'
 import { JobView } from './progress'
 import { markActive, refreshJobs } from './jobs'
 import { zoomable } from './zoom'
+import { initPose, posePayload, poseStrength, poseStyle, showPose } from './pose'
 
 let view: JobView
 let finished: (() => void) | undefined
@@ -145,6 +146,9 @@ function body(): SceneRequest {
     bg_offset: num(input('bg_offset')) ?? 0,
     cost: num(input('cost')) ?? 100,
     timeout: num(input('timeout')) ?? 900,
+    pose: posePayload(),
+    pose_strength: poseStrength(),
+    pose_style: poseStyle(),
   }
 }
 
@@ -166,6 +170,7 @@ function showFamily(): void {
   const wai = fam === 'wai'
   $('lora-cell').hidden = !wai
   $('family-note').textContent = FAMILY_NOTE[fam] ?? ''
+  if (document.getElementById('pose-block')) showPose()
 }
 
 /** The job whose images the result panel is showing, for Retouch. */
@@ -229,6 +234,7 @@ export function initScene(options: Options, onFinished?: () => void): void {
   area('detail_prompt').placeholder = options.detail?.prompt ?? ''
   area('detail_negative').placeholder = options.detail?.negative ?? ''
   initImageControls(options)
+  initPose(options)
   showFamily()
   showFace()
   select('family').addEventListener('change', showFamily)
