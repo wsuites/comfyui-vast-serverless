@@ -793,12 +793,48 @@ url_fetch() {
     log "[ERROR] could not download $url"
     return 1
 }
+# Claquasse's anima_control_lora moves its ControlEmbedder to the DiT's device
+# once, when the node runs. ComfyUI loads models lazily, so on a card that is
+# not holding the DiT yet (a 12 GB local GPU, any cold start) that device is
+# the CPU and stays the CPU; sampling then feeds it a cuda latent and dies with
+# "Expected all tensors to be on the same device". The patch moves it, once, to
+# wherever the latent is on the first call. Idempotent, and it refuses rather
+# than half-patching if the upstream line ever changes.
+ANIMA_CONTROL_INIT="custom_nodes/anima_control_lora/__init__.py"
+patch_anima_control() {
+    python3 - "$1" <<'PY' && log "  ok (patched) $ANIMA_CONTROL_INIT" \
+        || log "[WARN] anima_control_lora not patched: pose renders may fail on a cold GPU"
+import sys
+path = sys.argv[1]
+MARK = "# comfy-vast: follow the input device"
+OLD = "            control_tokens = strength * embedder(ctrl.to(p.device, p.dtype))\n"
+NEW = (
+    f"            {MARK}\n"
+    "            x = args[0] if args and hasattr(args[0], \"device\") else None\n"
+    "            dev = x.device if x is not None else p.device\n"
+    "            w = next(embedder.parameters())\n"
+    "            if w.device != dev:\n"
+    "                embedder.to(dev)\n"
+    "            control_tokens = strength * embedder(ctrl.to(dev, w.dtype))\n"
+)
+src = open(path, encoding="utf-8").read()
+if MARK in src:
+    sys.exit(0)
+if src.count(OLD) != 1:
+    sys.exit(1)
+open(path, "w", encoding="utf-8").write(src.replace(OLD, NEW))
+PY
+}
 URL_PIDS=()
 URL_RELS=()
 for e in "${URL_FILES[@]:-}"; do
     IFS='|' read -r url rel <<< "$e"
     [ -n "$url" ] || continue
-    url_fetch "$url" "$rel" &
+    if [ "$rel" = "$ANIMA_CONTROL_INIT" ]; then
+        { url_fetch "$url" "$rel" && patch_anima_control "$COMFY_DIR/$rel"; } &
+    else
+        url_fetch "$url" "$rel" &
+    fi
     URL_PIDS+=($!)
     URL_RELS+=("$rel")
 done
