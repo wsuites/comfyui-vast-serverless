@@ -78,6 +78,22 @@ NODE_BLEND_BLUR = "914"
 NODE_BLEND_MASK = "915"
 NODE_BASE_BATCH = "916"
 NODE_STITCH = "917"
+NODE_POSE_LORA = "918"      # Anima pose: LoraLoaderModelOnly (the lora.* keys)
+NODE_POSE_RENDER = "919"    #   AnimaPoseControl: pose JSON -> skeleton image
+NODE_POSE_CROP = "920"      #   square render cropped to the scene size
+NODE_POSE_ENCODE = "921"    #   VAEEncode: skeleton -> control latent
+NODE_POSE_APPLY = "922"     #   AnimaControlApply (the control_embedder.* keys)
+
+# Claquasse/Anima-Control-Pose Preview-2, installed by serverless_provision.sh
+# (FEAT_ANIMA_POSE). One file carries both halves of the adapter.
+POSE_LORA = "anima_pose_preview2.safetensors"
+# Measured 2026-09-29 on an arm-angle sweep (5 angles x 2 seeds, no arm words
+# in the prompt): arm at the drawn angle R0_thin 1/10, R1_thick 6/10,
+# R2_puppet 8/10. The README recommends thin; on this sweep it barely reads.
+POSE_STYLES = ("R0_thin", "R1_thick", "R2_puppet")
+POSE_STYLE_DEFAULT = "R2_puppet"
+# Above 1.0 it got worse on the same sweep (figure flipped to a back view).
+POSE_STRENGTH_DEFAULT = 1.0
 
 # How many faces the detailer is allowed to repaint per image.
 #
@@ -167,6 +183,82 @@ def to_anima(wf: dict, unet: str | None = None) -> dict:
         if "sampler_name" in node["inputs"]:
             node["inputs"]["sampler_name"] = cfg["sampler"]
             node["inputs"]["scheduler"] = cfg["scheduler"]
+    return wf
+
+
+def set_pose(wf: dict, pose: dict, width: int, height: int,
+             strength: float = POSE_STRENGTH_DEFAULT,
+             style: str = POSE_STYLE_DEFAULT) -> dict:
+    """Condition the main Anima sampler on a body skeleton.
+
+    ``pose`` is ``{"points": [[x, y, score], ...]}`` in pixels of the
+    width x height scene: 17 COCO body points (nose, eyes, ears, shoulders,
+    elbows, wrists, hips, knees, ankles), or the full 133 Wholebody set. A
+    score of 0 leaves the point, and every limb touching it, undrawn.
+
+    AnimaPoseControl only renders square canvases, so the skeleton is drawn on
+    the smallest 64-multiple square that holds the scene and cropped from the
+    top-left corner - the coordinates are already in scene pixels, so nothing
+    moves. Only the first sampler gets the control: the face pass works on a
+    crop of its own, where a full-frame skeleton would land in the wrong place.
+    """
+    if NODE_ANIMA_CLIP not in wf:
+        raise ValueError("pose control is Anima-only; call to_anima first")
+    if style not in POSE_STYLES:
+        raise ValueError(f"unknown pose style {style!r}: {', '.join(POSE_STYLES)}")
+    if not 0.0 <= strength <= 2.0:
+        raise ValueError(f"pose strength must be in [0, 2], not {strength}")
+    # The control latent is patchified 2x2 on top of the VAE's 8x: anything
+    # that is not a multiple of 16 leaves a half patch and the fusion fails.
+    if width % 16 or height % 16:
+        raise ValueError(f"pose control needs width/height in multiples of 16, "
+                         f"not {width}x{height}")
+    pts = [[float(v) for v in p[:3]] + [1.0] * (3 - len(p[:3]))
+           for p in pose.get("points", [])]
+    if len(pts) not in (17, 133):
+        raise ValueError(f"pose needs 17 or 133 points, got {len(pts)}")
+    if not any(p[2] > 0 for p in pts):
+        raise ValueError("pose has no visible point")
+    pts += [[0.0, 0.0, 0.0]] * (133 - len(pts))
+
+    side = -(-max(width, height) // 64) * 64
+    if not 256 <= side <= 2048:
+        raise ValueError(f"pose canvas {side}px is outside the node's 256-2048")
+
+    wf[NODE_POSE_LORA] = {
+        "class_type": "LoraLoaderModelOnly",
+        "inputs": {"model": [NODE_CHECKPOINT, 0], "lora_name": POSE_LORA,
+                   "strength_model": 1.0},
+        "_meta": {"title": "Anima pose LoRA"},
+    }
+    # redetect off and no image: the node draws the JSON and never loads the
+    # photo detector (rtmlib), which the worker does not install.
+    wf[NODE_POSE_RENDER] = {
+        "class_type": "AnimaPoseControl",
+        "inputs": {"style": style, "hands": False, "face": False, "feet": False,
+                   "redetect": False, "resolution": side,
+                   "pose_json": json.dumps({"canvas": side, "points": pts})},
+        "_meta": {"title": "Pose skeleton"},
+    }
+    wf[NODE_POSE_CROP] = {
+        "class_type": "ImageCrop",
+        "inputs": {"image": [NODE_POSE_RENDER, 0], "width": width,
+                   "height": height, "x": 0, "y": 0},
+        "_meta": {"title": "Skeleton to scene size"},
+    }
+    wf[NODE_POSE_ENCODE] = {
+        "class_type": "VAEEncode",
+        "inputs": {"pixels": [NODE_POSE_CROP, 0], "vae": [NODE_ANIMA_VAE, 0]},
+        "_meta": {"title": "Encode skeleton"},
+    }
+    wf[NODE_POSE_APPLY] = {
+        "class_type": "AnimaControlApply",
+        "inputs": {"model": [NODE_POSE_LORA, 0],
+                   "control_latent": [NODE_POSE_ENCODE, 0],
+                   "control_embedder_path": POSE_LORA, "strength": strength},
+        "_meta": {"title": "Anima pose control"},
+    }
+    wf[NODE_SAMPLER]["inputs"]["model"] = [NODE_POSE_APPLY, 0]
     return wf
 
 
@@ -458,6 +550,22 @@ def build_workflow(args) -> dict:
     if init:
         to_img2img(wf, str(init), float(getattr(args, "denoise", None) or 0.6))
 
+    # Pose: Anima only, and not with an inpaint mask - the masked sampler runs
+    # on a crop, so a full-frame skeleton would not line up with it.
+    pose = getattr(args, "pose", None)
+    if pose:
+        if getattr(args, "family", "wai") != "anima":
+            raise ValueError("pose control needs --family anima")
+        if getattr(args, "mask_image", None):
+            raise ValueError("pose control does not apply to an inpaint")
+        if isinstance(pose, str):
+            pose = json.loads(Path(pose).read_text(encoding="utf-8")
+                              if not pose.lstrip().startswith("{") else pose)
+        ps = getattr(args, "pose_strength", None)
+        set_pose(wf, pose, args.width, args.height,
+                 POSE_STRENGTH_DEFAULT if ps is None else float(ps),
+                 getattr(args, "pose_style", None) or POSE_STYLE_DEFAULT)
+
     # without upscale: SaveImage hangs directly off the FaceDetailer and the
     # upscaler nodes are pruned so ComfyUI does not execute them
     if args.no_upscale:
@@ -536,6 +644,9 @@ def build_workflow(args) -> dict:
             c = args.crop
             mode = (f"inpaint(start={start}/{steps_now} crop={c['width']}x"
                     f"{c['height']}+{c['x']}+{c['y']})")
+    if pose:
+        mode += (f" pose({wf[NODE_POSE_RENDER]['inputs']['style']}"
+                 f"@{wf[NODE_POSE_APPLY]['inputs']['strength']})")
     print(f"seed={seed} size={args.width}x{args.height} batch={args.batch} "
           f"{mode} upscale={'no' if args.no_upscale else 'yes'} faces={face} "
           f"nodes={len(wf)}", file=sys.stderr)
@@ -580,6 +691,13 @@ async def main() -> int:
                    help="model family of the scene graph; anima swaps the "
                         "checkpoint loader for its three separate loaders")
     p.add_argument("--anima-model", help="UNET file, with --family anima")
+    p.add_argument("--pose", metavar="JSON|FILE",
+                   help='anima only: skeleton to follow, {"points": [[x,y,score]'
+                        ' x17 or x133]} in pixels of --width x --height')
+    p.add_argument("--pose-strength", type=float,
+                   help=f"0-2 (default {POSE_STRENGTH_DEFAULT})")
+    p.add_argument("--pose-style", choices=POSE_STYLES,
+                   help=f"skeleton drawing (default {POSE_STYLE_DEFAULT})")
     p.add_argument("--lora", type=float,
                    help="style LoRA strength (wai only); 0 removes the node")
     p.add_argument("--detail-prompt",

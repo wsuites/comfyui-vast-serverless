@@ -35,6 +35,7 @@ FEAT_FACE=true             # --face (FaceDetailer)                   52 MB
 FEAT_HANDS_YOLO=true       # --hands yolo                            22 MB
 FEAT_HANDS_MESH=true       # --hands mesh (MeshGraphormer)         1.37 GB
 FEAT_ANIMA=true            # Anima (ab_modelo.py A/B)               ~5.6 GB
+FEAT_ANIMA_POSE=true       # Anima pose control-LoRA + its 2 nodes    75 MB
 
 on() { [ "${1:-false}" = "true" ]; }
 
@@ -140,6 +141,24 @@ if on "$FEAT_HANDS_MESH"; then
     "https://huggingface.co/hr16/ControlNet-HandRefiner-pruned/resolve/main/graphormer_hand_state_dict.bin|$AUX_CKPTS/hr16/ControlNet-HandRefiner-pruned/graphormer_hand_state_dict.bin"
     "https://huggingface.co/hr16/ControlNet-HandRefiner-pruned/resolve/main/hrnetv2_w64_imagenet_pretrained.pth|$AUX_CKPTS/hr16/ControlNet-HandRefiner-pruned/hrnetv2_w64_imagenet_pretrained.pth"
   )
+fi
+
+if on "$FEAT_ANIMA" && on "$FEAT_ANIMA_POSE"; then
+  # Claquasse/Anima-Control-Pose (Preview-2): a channel-concat control-LoRA
+  # for Anima plus two ComfyUI nodes. The nodes are subfolders of a HF model
+  # repo, not a git repo, so they come file by file, pinned to one revision.
+  # BLOCKING on purpose: the nodes must be on disk before ComfyUI starts or
+  # they do not register. rtmlib (the photo pose detector) is not installed:
+  # the web always sends pose_json, so the detector never runs.
+  # Non-commercial licence (CircleStone Labs), same as Anima itself.
+  ACP="https://huggingface.co/Claquasse/Anima-Control-Pose/resolve/8f559771d5a49a02fa03f7df2a05ccb7eecb3a2a"
+  URL_FILES+=("$ACP/anima_pose_preview2.safetensors|models/loras/anima_pose_preview2.safetensors")
+  for f in anima_control_lora/__init__.py anima_control_lora/control_embedder.py \
+           ComfyUI-anima-pose-control/__init__.py ComfyUI-anima-pose-control/node.py \
+           ComfyUI-anima-pose-control/pose_render.py ComfyUI-anima-pose-control/keypoints.py \
+           ComfyUI-anima-pose-control/detect.py ComfyUI-anima-pose-control/js/anima_pose_control.js; do
+    URL_FILES+=("$ACP/comfyui/$f|custom_nodes/$f")
+  done
 fi
 
 # --- Custom nodes.  "<git repo>|<directory>|<recursive>|<norequirements>" ----

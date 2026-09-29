@@ -52,8 +52,10 @@ import fleet
 
 from ab_modelo import ANIMA_UNET, ARMS
 from ab_modelo import build as build_arm_workflow
-from call_endpoint import (RMBG_MODELS, build_workflow, fit_dims, set_init_image,
-                           set_mask_image)
+from call_endpoint import (NODE_ANIMA_CLIP, NODE_SAMPLER, POSE_STRENGTH_DEFAULT,
+                           POSE_STYLE_DEFAULT, POSE_STYLES, RMBG_MODELS,
+                           build_workflow, fit_dims, set_init_image,
+                           set_mask_image, set_pose)
 from vast_state import describe, goes_backwards, instances, workers
 from vast_state import reboot as _vast_reboot
 
@@ -697,6 +699,13 @@ class JobRequest(BaseModel):
     bg_sensitivity: float = 1.0
     bg_blur: int = 0
     bg_offset: int = 0
+    # Anima pose control: {"points": [[x, y, score], ...]}, 17 COCO body
+    # points (or 133 Wholebody) in pixels of the final width x height. The
+    # skeleton editor on the page is the usual source. Strength and style
+    # left unset take call_endpoint's measured defaults.
+    pose: dict | None = None
+    pose_strength: float | None = Field(None, ge=0.0, le=2.0)
+    pose_style: str | None = None
     cost: int = 100
     timeout: float = 900.0
 
@@ -760,6 +769,23 @@ async def create_job(req: JobRequest) -> dict:
         params["crop"] = crop
         params["width"] = width
         params["height"] = height
+
+    if req.pose is not None:
+        # Checked here so a bad skeleton is a 400 on submit, not a job that
+        # fails after renting a worker. set_pose owns the rules; this runs it
+        # against a throwaway graph with just the nodes it reads.
+        if req.family != "anima":
+            raise HTTPException(400, "pose control is Anima-only (family=anima)")
+        if req.mask_image:
+            raise HTTPException(400, "pose control does not apply to an inpaint")
+        probe = {NODE_ANIMA_CLIP: {}, NODE_SAMPLER: {"inputs": {}}}
+        try:
+            set_pose(probe, req.pose, params["width"], params["height"],
+                     POSE_STRENGTH_DEFAULT if req.pose_strength is None
+                     else req.pose_strength,
+                     req.pose_style or POSE_STYLE_DEFAULT)
+        except (ValueError, TypeError, IndexError) as exc:
+            raise HTTPException(400, f"bad pose: {exc}") from exc
 
     job = Job(id=uuid.uuid4().hex[:12], params=params)
     JOBS[job.id] = job
@@ -844,6 +870,12 @@ async def list_options() -> dict:
         "anima_model": ANIMA_UNET,
         "remove_bg": sorted(RMBG_MODELS),
         "detail": _detail_defaults(),
+        # Anima pose control: the skeleton editor's style select and default.
+        "pose": {
+            "styles": list(POSE_STYLES),
+            "style_default": POSE_STYLE_DEFAULT,
+            "strength_default": POSE_STRENGTH_DEFAULT,
+        },
         # The page compares this with its own build commit and warns when
         # the two halves were deployed from different checkouts.
         "version": VERSION,
