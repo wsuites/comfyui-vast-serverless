@@ -884,7 +884,8 @@ def missing_inputs(url: str, workflow: dict, timeout: float = 20.0) -> list[str]
             # would report the image as a missing model and hold the job for
             # MODEL_WAIT against a worker that has the file. ComfyUI validates
             # it again at submit anyway, with the same answer and no cache.
-            if cls == "LoadImage" and field == "image":
+            # Same for the inpaint mask, which rides the same upload.
+            if (cls, field) in (("LoadImage", "image"), ("LoadImageMask", "image")):
                 continue
             spec = specs[cls].get(field)
             # A combo input is declared as [[option, ...], {...}].

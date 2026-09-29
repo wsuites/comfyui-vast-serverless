@@ -68,6 +68,16 @@ NODE_INIT_IMAGE = "904"   # img2img: LoadImage -> scale -> encode -> repeat
 NODE_INIT_SCALE = "905"
 NODE_INIT_ENCODE = "906"
 NODE_INIT_BATCH = "907"
+NODE_MASK_IMAGE = "908"   # inpaint: LoadImageMask, then crop -> sample -> paste
+NODE_INIT_CROP = "909"
+NODE_MASK_CROP = "910"
+NODE_NOISE_MASK = "911"
+NODE_PATCH_SCALE = "912"
+NODE_BLEND_IMAGE = "913"
+NODE_BLEND_BLUR = "914"
+NODE_BLEND_MASK = "915"
+NODE_BASE_BATCH = "916"
+NODE_STITCH = "917"
 
 # How many faces the detailer is allowed to repaint per image.
 #
@@ -256,6 +266,115 @@ def set_init_image(wf: dict, name: str) -> dict:
     return wf
 
 
+def to_inpaint(wf: dict, mask: str, crop: dict, blur: int = 8) -> dict:
+    """Repaint only the masked part of the init image, and paste it back.
+
+    Runs on a graph ``to_img2img`` has already converted, after every other
+    pass is settled, because it takes over whatever SaveImage was about to
+    save. What it does is what "inpaint only masked" does elsewhere:
+
+    * The init image and the mask are cropped to ``crop`` - the mask's
+      bounding box plus context, computed by the page - before the existing
+      ImageScale. So the sampler works on the region at the full ~1 MP
+      budget. A hand that is 150 px wide in the source gets redrawn at
+      latent resolution rather than at 150 px.
+    * SetLatentNoiseMask limits sampling to the painted area. Outside it, the
+      latent is the encoded original at every step.
+    * The decoded patch (after the face pass, if that is on) is scaled back
+      to the crop's pixel size. It is composited onto the untouched original
+      through the same mask, blurred by ``blur`` px, so the seam fades
+      instead of cutting. Pixels outside the mask never go through the VAE:
+      the saved image is the original file with a patch on it.
+
+    Only core nodes, so there is nothing for a worker to be missing. The
+    mask is read from its red channel: the page paints white on black.
+    """
+    x, y = int(crop["x"]), int(crop["y"])
+    w, h = int(crop["width"]), int(crop["height"])
+    generated = wf[NODE_SAVE]["inputs"]["images"]
+
+    wf[NODE_MASK_IMAGE] = {
+        "class_type": "LoadImageMask",
+        "inputs": {"image": mask, "channel": "red"},
+        "_meta": {"title": "Inpaint mask"},
+    }
+    wf[NODE_INIT_CROP] = {
+        "class_type": "ImageCrop",
+        "inputs": {"image": [NODE_INIT_IMAGE, 0],
+                   "width": w, "height": h, "x": x, "y": y},
+        "_meta": {"title": "Crop to the masked region"},
+    }
+    wf[NODE_INIT_SCALE]["inputs"]["image"] = [NODE_INIT_CROP, 0]
+    wf[NODE_MASK_CROP] = {
+        "class_type": "CropMask",
+        "inputs": {"mask": [NODE_MASK_IMAGE, 0],
+                   "x": x, "y": y, "width": w, "height": h},
+        "_meta": {"title": "Crop the mask"},
+    }
+    # Set after the batch repeat, not before: this way every latent in the
+    # batch carries the mask, whatever RepeatLatentBatch does with one. The
+    # sampler resizes the mask to the latent, so it can stay at crop size.
+    wf[NODE_NOISE_MASK] = {
+        "class_type": "SetLatentNoiseMask",
+        "inputs": {"samples": [NODE_INIT_BATCH, 0], "mask": [NODE_MASK_CROP, 0]},
+        "_meta": {"title": "Sample inside the mask only"},
+    }
+    wf[NODE_SAMPLER]["inputs"]["latent_image"] = [NODE_NOISE_MASK, 0]
+
+    wf[NODE_PATCH_SCALE] = {
+        "class_type": "ImageScale",
+        "inputs": {"image": generated, "upscale_method": "lanczos",
+                   "width": w, "height": h, "crop": "disabled"},
+        "_meta": {"title": "Patch back to crop size"},
+    }
+    blend = [NODE_MASK_CROP, 0]
+    if blur > 0:
+        # Core ComfyUI has no mask blur, so the mask goes through an image and
+        # comes back. ImageBlur caps the radius at 31 px.
+        radius = max(1, min(int(blur), 31))
+        wf[NODE_BLEND_IMAGE] = {
+            "class_type": "MaskToImage",
+            "inputs": {"mask": [NODE_MASK_CROP, 0]},
+            "_meta": {"title": "Blend mask as image"},
+        }
+        wf[NODE_BLEND_BLUR] = {
+            "class_type": "ImageBlur",
+            "inputs": {"image": [NODE_BLEND_IMAGE, 0], "blur_radius": radius,
+                       "sigma": max(0.1, min(radius / 2.0, 10.0))},
+            "_meta": {"title": "Feather the seam"},
+        }
+        wf[NODE_BLEND_MASK] = {
+            "class_type": "ImageToMask",
+            "inputs": {"image": [NODE_BLEND_BLUR, 0], "channel": "red"},
+            "_meta": {"title": "Blend mask"},
+        }
+        blend = [NODE_BLEND_MASK, 0]
+
+    # ImageCompositeMasked resizes the source batch to the destination's
+    # batch, so a single original would keep only the first of N patches.
+    wf[NODE_BASE_BATCH] = {
+        "class_type": "RepeatImageBatch",
+        "inputs": {"image": [NODE_INIT_IMAGE, 0], "amount": [NODE_BATCH, 0]},
+        "_meta": {"title": "One original per patch"},
+    }
+    wf[NODE_STITCH] = {
+        "class_type": "ImageCompositeMasked",
+        "inputs": {"destination": [NODE_BASE_BATCH, 0],
+                   "source": [NODE_PATCH_SCALE, 0],
+                   "x": x, "y": y, "resize_source": False, "mask": blend},
+        "_meta": {"title": "Paste the patch into the original"},
+    }
+    wf[NODE_SAVE]["inputs"]["images"] = [NODE_STITCH, 0]
+    return wf
+
+
+def set_mask_image(wf: dict, name: str) -> dict:
+    """``set_init_image`` for the inpaint mask: the name the worker stored."""
+    if NODE_MASK_IMAGE in wf:
+        wf[NODE_MASK_IMAGE]["inputs"]["image"] = name
+    return wf
+
+
 def fit_dims(width: int, height: int, area: int = 1024 * 1024,
              multiple: int = 64) -> tuple[int, int]:
     """The SDXL-native box closest to this image's aspect ratio.
@@ -395,6 +514,17 @@ def build_workflow(args) -> dict:
         print(f"background removal: {cls} / {model} (refine={args.bg_refine})",
               file=sys.stderr)
 
+    # Inpaint last: it takes over whatever SaveImage ended up consuming.
+    mask = getattr(args, "mask_image", None)
+    if mask:
+        if not init:
+            raise ValueError("an inpaint mask needs an init image to paint into")
+        if args.remove_bg:
+            raise ValueError("inpainting pastes into an opaque original; "
+                             "background removal does not apply")
+        to_inpaint(wf, str(mask), dict(args.crop),
+                   int(getattr(args, "mask_blur", None) or 0))
+
     face = ("off" if getattr(args, "no_face", False)
             else "uncapped" if cap <= 0 else f"<={cap}")
     mode = "txt2img"
@@ -402,6 +532,10 @@ def build_workflow(args) -> dict:
         start = wf[NODE_SAMPLER]["inputs"]["start_at_step"]
         steps_now = wf[NODE_SAMPLER]["inputs"]["steps"]
         mode = f"img2img(start={start}/{steps_now})"
+        if mask:
+            c = args.crop
+            mode = (f"inpaint(start={start}/{steps_now} crop={c['width']}x"
+                    f"{c['height']}+{c['x']}+{c['y']})")
     print(f"seed={seed} size={args.width}x{args.height} batch={args.batch} "
           f"{mode} upscale={'no' if args.no_upscale else 'yes'} faces={face} "
           f"nodes={len(wf)}", file=sys.stderr)

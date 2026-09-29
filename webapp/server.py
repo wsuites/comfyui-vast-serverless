@@ -52,11 +52,13 @@ import fleet
 
 from ab_modelo import ANIMA_UNET, ARMS
 from ab_modelo import build as build_arm_workflow
-from call_endpoint import RMBG_MODELS, build_workflow, fit_dims, set_init_image
+from call_endpoint import (RMBG_MODELS, build_workflow, fit_dims, set_init_image,
+                           set_mask_image)
 from vast_state import describe, goes_backwards, instances, workers
 from vast_state import reboot as _vast_reboot
 
 OUT_DIR = ROOT / "output" / "web"
+
 HISTORY = OUT_DIR / "index.jsonl"
 POLL_SECONDS = 5
 # How long a request waits for a model that is still downloading behind the
@@ -364,6 +366,39 @@ def _reap_inputs() -> int:
     return freed
 
 
+def _inpaint_crop(req: "JobRequest", width: int | None,
+                  height: int | None) -> tuple[dict, tuple[int, int]]:
+    """Where to cut the init image for an inpaint, and what size to sample it.
+
+    The box is the mask's painted pixels plus ``mask_pad`` of context,
+    clamped to the image. The size defaults to that box's own aspect at the
+    SDXL budget, so a small region gets the full resolution. Pillow is not
+    in this venv; the page ships the box and we only check it against the
+    image, since the page has the pixels and already knows where it painted.
+    """
+    box = req.mask_box
+    if box is None:
+        raise HTTPException(400, "mask_box is required with mask_image")
+    try:
+        _, iw, ih = _sniff_image(_input_path(req.init_image).read_bytes()[:65536])
+        _, mw, mh = _sniff_image(_input_path(req.mask_image).read_bytes()[:65536])
+    except (OSError, ValueError) as exc:
+        raise HTTPException(400, f"unreadable inpaint input: {exc}") from exc
+    if (mw, mh) != (iw, ih):
+        raise HTTPException(400, f"mask is {mw}x{mh}, image is {iw}x{ih}")
+    x0, y0 = max(0, box.x - req.mask_pad), max(0, box.y - req.mask_pad)
+    x1 = min(iw, box.x + box.width + req.mask_pad)
+    y1 = min(ih, box.y + box.height + req.mask_pad)
+    # ImageCrop and CropMask cut to multiples of 8 at the latent anyway; do it
+    # here so the paste lands exactly where the patch came from.
+    w, h = (x1 - x0) // 8 * 8, (y1 - y0) // 8 * 8
+    if box.width <= 0 or box.height <= 0 or w < 64 or h < 64:
+        raise HTTPException(400, "the painted area is empty or too small")
+    fit = fit_dims(w, h)
+    return ({"x": x0, "y": y0, "width": w, "height": h},
+            (width or fit[0], height or fit[1]))
+
+
 def _input_path(input_id: str) -> Path:
     """Resolve an input id to a file, refusing anything that escapes the dir.
 
@@ -475,6 +510,13 @@ async def _run_job(job: Job) -> None:
             stored = await asyncio.to_thread(
                 fleet.upload_image, url, blob, job.params["init_image"])
             set_init_image(workflow, stored)
+        if job.params.get("mask_image"):
+            job.emit("renting", "Uploading the inpaint mask")
+            blob = await asyncio.to_thread(
+                _input_path(job.params["mask_image"]).read_bytes)
+            stored = await asyncio.to_thread(
+                fleet.upload_image, url, blob, job.params["mask_image"])
+            set_mask_image(workflow, stored)
 
         # A worker can come ready with the deferred half of its models still
         # landing: provisioning signals ready on the blocking set and keeps
@@ -583,6 +625,14 @@ async def _run_job(job: Job) -> None:
 # --------------------------------------------------------------------- api
 
 
+class MaskBox(BaseModel):
+    """Bounding box of the painted pixels, in the init image's coordinates."""
+    x: int = Field(ge=0)
+    y: int = Field(ge=0)
+    width: int
+    height: int
+
+
 class JobRequest(BaseModel):
     prompt: str = Field(min_length=1)
     negative: str | None = None
@@ -598,6 +648,14 @@ class JobRequest(BaseModel):
     # 1.0 ignores the input entirely, below ~0.3 returns it nearly untouched.
     init_image: str | None = None
     denoise: float = 0.6
+    # Inpaint. ``mask_image`` is another /api/inputs id: white = repaint, the
+    # same size as the init image. Only that region is resampled; the rest of
+    # the saved image is the original. ``mask_pad`` is the context kept around
+    # the painted area, in source pixels; ``mask_blur`` feathers the seam.
+    mask_image: str | None = None
+    mask_pad: int = Field(64, ge=0, le=512)
+    mask_blur: int = Field(8, ge=0, le=31)
+    mask_box: MaskBox | None = None
     # The scene graph is SDXL-wired; "anima" swaps its loading subgraph for
     # the three-loader set. The LoRA and the face pass are levers of the SDXL
     # side: the LoRA file does not apply to a DiT, and the face pass is the
@@ -672,6 +730,17 @@ async def create_job(req: JobRequest) -> dict:
             height = height or fit[1]
     params["width"] = width or 1024
     params["height"] = height or 1024
+    if req.mask_image:
+        if not req.init_image:
+            raise HTTPException(400, "mask_image needs an init_image to paint into")
+        if req.remove_bg:
+            raise HTTPException(400, "remove_bg does not apply to an inpaint")
+        # The request's own size, not the one fitted above to the whole image:
+        # the sampler sees the crop, so the crop's aspect is what matters.
+        crop, (width, height) = _inpaint_crop(req, req.width, req.height)
+        params["crop"] = crop
+        params["width"] = width
+        params["height"] = height
 
     job = Job(id=uuid.uuid4().hex[:12], params=params)
     JOBS[job.id] = job
